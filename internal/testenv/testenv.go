@@ -1,0 +1,378 @@
+// Package testenv starts the container stack used by the test suites in this
+// repository: one Redpanda broker and one Redpanda Console, wired together on
+// a dedicated Docker network.
+//
+// The package is test-only infrastructure. Its entrypoint takes nothing but a
+// *testing.T, so suites do not have to know about Docker, networks, images or
+// wait strategies:
+//
+//	func (s *MySuite) SetupSuite() {
+//	    s.env = testenv.Start(s.T())
+//	}
+//
+//	func (s *MySuite) TearDownSuite() {
+//	    s.env.Stop()
+//	}
+//
+// If the containers cannot be started, the reason is logged and the test is
+// failed, so a broken Docker setup can never be mistaken for passing tests.
+// When the containers do start, the connection details are logged so a human
+// can attach to the same broker or open the Console while the suite runs.
+package testenv
+
+import (
+	"context"
+	"fmt"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/testcontainers/testcontainers-go"
+	"github.com/testcontainers/testcontainers-go/modules/redpanda"
+	"github.com/testcontainers/testcontainers-go/network"
+	"github.com/testcontainers/testcontainers-go/wait"
+	"github.com/twmb/franz-go/pkg/kadm"
+	"github.com/twmb/franz-go/pkg/kgo"
+)
+
+const (
+	// BrokerImage is the Redpanda broker image started for tests.
+	BrokerImage = "redpandadata/redpanda:v25.3.1"
+
+	// ConsoleImage is the Redpanda Console image started for tests.
+	ConsoleImage = "redpandadata/console:v3.3.0"
+
+	// networkAlias is the hostname the broker gets on the test network, so the
+	// Console can reach it without going through the host.
+	networkAlias = "redpanda"
+
+	// internalListener is the broker listener the Console connects to. It is
+	// only reachable from inside the Docker network.
+	internalListener = "redpanda:29092"
+
+	startTimeout = 3 * time.Minute
+
+	// metadataMinAge bounds how stale franz-go's cached metadata may be. See
+	// the comment where the client is built for why the default is unusable in
+	// tests.
+	metadataMinAge = 50 * time.Millisecond
+)
+
+// Environment is a running Redpanda broker plus Console. Create it with Start
+// and release it with Stop.
+type Environment struct {
+	t *testing.T
+
+	network *testcontainers.DockerNetwork
+	broker  *redpanda.Container
+	console testcontainers.Container
+	client  *kgo.Client
+	admin   *kadm.Client
+
+	mu     sync.Mutex
+	topics []string
+
+	seed           string
+	consoleURL     string
+	schemaRegistry string
+	adminAPI       string
+}
+
+// Start brings up a Redpanda broker and a Redpanda Console and connects a
+// Kafka client to the broker.
+//
+// Start fails the test if anything in that chain fails, after logging the
+// reason. Any containers that did start are torn down first, so a failure
+// never leaks containers. On success the connection details are logged.
+func Start(t *testing.T) *Environment {
+	t.Helper()
+
+	if testing.Short() {
+		t.Skip("skipping container test in short mode")
+	}
+
+	// The start context is derived from the test's own context, so abandoning
+	// the test also abandons container startup.
+	ctx, cancel := context.WithTimeout(t.Context(), startTimeout)
+	defer cancel()
+
+	env := &Environment{t: t}
+
+	if err := env.start(ctx); err != nil {
+		t.Logf("test environment did not start: %v", err)
+
+		env.Stop()
+
+		t.Fatalf("start test environment: %v", err)
+	}
+
+	env.logConnectionDetails()
+
+	return env
+}
+
+func (e *Environment) start(ctx context.Context) error {
+	var err error
+
+	e.network, err = network.New(ctx)
+	if err != nil {
+		return fmt.Errorf("create docker network: %w", err)
+	}
+
+	e.broker, err = redpanda.Run(
+		ctx,
+		BrokerImage,
+		redpanda.WithListener(internalListener),
+		network.WithNetwork([]string{networkAlias}, e.network),
+	)
+	if err != nil {
+		return fmt.Errorf("start broker %s: %w", BrokerImage, err)
+	}
+
+	e.seed, err = e.broker.KafkaSeedBroker(ctx)
+	if err != nil {
+		return fmt.Errorf("resolve kafka seed broker: %w", err)
+	}
+
+	e.schemaRegistry, err = e.broker.SchemaRegistryAddress(ctx)
+	if err != nil {
+		return fmt.Errorf("resolve schema registry address: %w", err)
+	}
+
+	e.adminAPI, err = e.broker.AdminAPIAddress(ctx)
+	if err != nil {
+		return fmt.Errorf("resolve admin api address: %w", err)
+	}
+
+	if err := e.startConsole(ctx); err != nil {
+		return err
+	}
+
+	// kadm.ListTopics answers unfiltered listings from franz-go's metadata
+	// cache, which is MetadataMinAge (5s) old by default. A topic created by a
+	// test would then be invisible to the code under test for several seconds.
+	// Tests need to observe writes immediately, so shrink the cache window.
+	e.client, err = kgo.NewClient(
+		kgo.SeedBrokers(e.seed),
+		kgo.MetadataMinAge(metadataMinAge),
+	)
+	if err != nil {
+		return fmt.Errorf("connect kafka client to %s: %w", e.seed, err)
+	}
+
+	e.admin = kadm.NewClient(e.client)
+
+	if _, err := e.admin.ListTopics(ctx); err != nil {
+		return fmt.Errorf("broker %s did not answer metadata request: %w", e.seed, err)
+	}
+
+	return nil
+}
+
+func (e *Environment) startConsole(ctx context.Context) error {
+	console, err := testcontainers.Run(
+		ctx,
+		ConsoleImage,
+		testcontainers.WithEnv(map[string]string{
+			"KAFKA_BROKERS":                internalListener,
+			"KAFKA_SCHEMAREGISTRY_ENABLED": "true",
+			"KAFKA_SCHEMAREGISTRY_URLS":    "http://" + networkAlias + ":8081",
+		}),
+		testcontainers.WithExposedPorts("8080/tcp"),
+		network.WithNetwork([]string{"console"}, e.network),
+		testcontainers.WithWaitStrategy(
+			wait.ForHTTP("/admin/health").
+				WithPort("8080/tcp").
+				WithStartupTimeout(time.Minute),
+		),
+	)
+	if err != nil {
+		return fmt.Errorf("start console %s: %w", ConsoleImage, err)
+	}
+
+	e.console = console
+
+	endpoint, err := console.PortEndpoint(ctx, "8080/tcp", "http")
+	if err != nil {
+		return fmt.Errorf("resolve console endpoint: %w", err)
+	}
+
+	e.consoleURL = endpoint
+
+	return nil
+}
+
+func (e *Environment) logConnectionDetails() {
+	e.t.Helper()
+
+	e.t.Logf(
+		"test environment ready: kafka broker %s, schema registry %s, admin api %s, console %s",
+		e.seed,
+		e.schemaRegistry,
+		e.adminAPI,
+		e.consoleURL,
+	)
+}
+
+// Stop releases everything Start created: the Kafka client, the Console, the
+// broker and the network. It is safe to call on a partially started
+// environment and safe to call more than once.
+//
+// Failures during teardown are logged rather than failing the test, since a
+// test that already passed should not be turned red by a slow container.
+func (e *Environment) Stop() {
+	e.t.Helper()
+
+	// Teardown deliberately does not use t.Context: that context is canceled
+	// as the test finishes, which would abort the cleanup it is meant to do.
+	ctx := context.Background()
+
+	e.deleteTrackedTopics(ctx)
+
+	if e.client != nil {
+		e.client.Close()
+		e.client = nil
+		e.admin = nil
+	}
+
+	if e.console != nil {
+		if err := e.console.Terminate(ctx); err != nil {
+			e.t.Logf("terminate console: %v", err)
+		}
+
+		e.console = nil
+	}
+
+	if e.broker != nil {
+		if err := e.broker.Terminate(ctx); err != nil {
+			e.t.Logf("terminate broker: %v", err)
+		}
+
+		e.broker = nil
+	}
+
+	if e.network != nil {
+		if err := e.network.Remove(ctx); err != nil {
+			e.t.Logf("remove network: %v", err)
+		}
+
+		e.network = nil
+	}
+}
+
+// Admin returns the Kafka admin client connected to the running broker.
+func (e *Environment) Admin() *kadm.Client {
+	return e.admin
+}
+
+// Kafka returns the record-level client connected to the running broker.
+func (e *Environment) Kafka() *kgo.Client {
+	return e.client
+}
+
+// Broker returns the host address of the Kafka listener, suitable for
+// kgo.SeedBrokers.
+func (e *Environment) Broker() string {
+	return e.seed
+}
+
+// SchemaRegistry returns the host address of the Schema Registry.
+func (e *Environment) SchemaRegistry() string {
+	return e.schemaRegistry
+}
+
+// AdminAPI returns the host address of the Redpanda Admin API.
+func (e *Environment) AdminAPI() string {
+	return e.adminAPI
+}
+
+// ConsoleURL returns the browser URL of the Redpanda Console attached to the
+// broker.
+func (e *Environment) ConsoleURL() string {
+	return e.consoleURL
+}
+
+// CreateTopic creates a single-partition topic whose name starts with prefix
+// and ends with a unique suffix, and returns the generated name.
+//
+// The unique suffix matters because suites share one broker across their test
+// cases: reusing a fixed name would let one case see another's topics. The
+// topic is deleted by Stop.
+//
+// Pass the running test's own *testing.T, not the suite's, so a creation
+// failure aborts the test that is actually running.
+func (e *Environment) CreateTopic(t *testing.T, prefix string) string {
+	t.Helper()
+
+	return e.CreateTopics(t, prefix)[0]
+}
+
+// CreateTopics creates one single-partition topic per prefix and returns the
+// generated names in the same order. The topics are deleted by Stop.
+//
+// Cleanup is deferred to Stop rather than registered with t.Cleanup because a
+// suite's Stop runs in TearDownSuite, before the cleanups of the suite-level
+// *testing.T. Deleting there would use a client Stop has already closed.
+func (e *Environment) CreateTopics(t *testing.T, prefixes ...string) []string {
+	t.Helper()
+
+	names := make([]string, 0, len(prefixes))
+
+	for _, prefix := range prefixes {
+		names = append(names, e.UniqueName(prefix))
+	}
+
+	responses, err := e.admin.CreateTopics(t.Context(), 1, 1, nil, names...)
+	if err != nil {
+		t.Fatalf("create topics %v: %v", names, err)
+	}
+
+	for _, response := range responses {
+		if response.Err != nil {
+			t.Fatalf("create topic %s: %v", response.Topic, response.Err)
+		}
+	}
+
+	e.mu.Lock()
+	e.topics = append(e.topics, names...)
+	e.mu.Unlock()
+
+	return names
+}
+
+// DeleteTopics removes the given topics. Deletion failures are logged, not
+// fatal, so cleanup never masks the real assertion failure of a test.
+func (e *Environment) DeleteTopics(t *testing.T, topics ...string) {
+	t.Helper()
+
+	e.deleteTopics(t.Context(), topics...)
+}
+
+func (e *Environment) deleteTopics(ctx context.Context, topics ...string) {
+	e.t.Helper()
+
+	if len(topics) == 0 || e.admin == nil {
+		return
+	}
+
+	if _, err := e.admin.DeleteTopics(ctx, topics...); err != nil {
+		e.t.Logf("delete topics %v: %v", topics, err)
+	}
+}
+
+func (e *Environment) deleteTrackedTopics(ctx context.Context) {
+	e.t.Helper()
+
+	e.mu.Lock()
+	topics := e.topics
+	e.topics = nil
+	e.mu.Unlock()
+
+	e.deleteTopics(ctx, topics...)
+}
+
+// UniqueName appends a unique suffix to prefix, for naming topics or groups
+// that must not collide with other test cases sharing the broker.
+func (e *Environment) UniqueName(prefix string) string {
+	return fmt.Sprintf("%s-%d", prefix, time.Now().UnixNano())
+}
