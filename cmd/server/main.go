@@ -7,8 +7,12 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
-	kafkaclient "github.com/denizgursoy/kafka-mcp/internal/kafka"
-	"github.com/denizgursoy/kafka-mcp/internal/kafka/listtopics"
+	"github.com/denizgursoy/kafka-mcp/internal/domain/kafkaclient"
+	"github.com/denizgursoy/kafka-mcp/internal/tools/describetopic"
+	"github.com/denizgursoy/kafka-mcp/internal/tools/getmessage"
+	"github.com/denizgursoy/kafka-mcp/internal/tools/listtopics"
+	"github.com/denizgursoy/kafka-mcp/internal/tools/samplemessages"
+	"github.com/denizgursoy/kafka-mcp/internal/tools/searchmessages"
 )
 
 func main() {
@@ -18,7 +22,7 @@ func main() {
 		broker = "localhost:9092"
 	}
 
-	kafka, err := kafkaclient.NewClient(broker)
+	kafka, err := kafkaclient.New(broker)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -36,6 +40,10 @@ func main() {
 	// Every tool registers itself: one call per tool, no Kafka logic and no
 	// tool schema here.
 	listtopics.Register(server, kafka.Admin())
+	describetopic.Register(server, kafka.Admin(), kafka.Reader())
+	samplemessages.Register(server, kafka.Admin(), kafka.Reader())
+	searchmessages.Register(server, kafka.Admin(), kafka.Reader())
+	getmessage.Register(server, kafka.Reader())
 
 	log.Println("Kafka MCP server started")
 

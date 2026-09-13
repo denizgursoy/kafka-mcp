@@ -15,12 +15,83 @@ Layout:
 
 ```
 cmd/server/main.go        MCP server entrypoint, tool registration
-internal/kafka/           Kafka packages, one per tool
-internal/testenv/         Shared test container environment (broker + Console)
-skills/kafka-debugger/    Skills describing how tools are used together
+internal/tools/           One package per MCP tool, and nothing else
+internal/domain/          Everything shared by more than one tool
+  kafkaclient/            The Kafka connection the tools are given
+  records/                Reading and rendering Kafka records
+  testenv/                Test container environment (broker + Console)
+internal/skills/          Skills describing how tools are used together
 docker-compose.yml        Local Redpanda + Redpanda Console
 Makefile                  Build, run and compose targets
 ```
+
+## Where code lives
+
+There are three places code can go, and which one is decided by how many tools
+use it.
+
+`internal/tools` holds tools and nothing else. Every directory under it is one
+MCP tool, so the list of directories is the list of tools the server exposes.
+
+- **Used by one tool** — keep it in that tool's own package, as another file in
+  the same directory. Do not give it a package of its own: a package used from
+  exactly one place is indirection without a reader.
+- **Used by more than one tool** — give it its own package under
+  `internal/domain`, named for what it does (`internal/domain/records`,
+  `internal/domain/kafkaclient`).
+
+Nothing else belongs at the top of `internal`: shared code goes in
+`internal/domain`, tools in `internal/tools`, skills in `internal/skills`.
+
+Move a helper out of a tool package the moment a second tool needs it, and move
+it back if it ever drops to one caller again. **Ask the user for approval
+before performing that move**, since it changes the layout other work depends
+on.
+
+## Skill-driven development
+
+Tools exist to serve skills. A skill in `internal/skills/` describes a real debugging
+scenario, and the tools are whatever that scenario needs — not a wishlist of
+Kafka features. So development starts from the skill, never from the tool.
+
+When asked to build or extend a skill, work in this order and **do not write
+code before step 4**.
+
+### 1. Understand the scenario
+
+Read the skill and restate what the user is actually trying to do: what they
+have at the start, what they need at the end, and what decisions happen in
+between. Ask about anything ambiguous. A tool built for a misunderstood
+scenario is wasted work no matter how well it is written.
+
+### 2. Work out which existing tools already cover it
+
+List the tools the server already exposes and map each step of the scenario to
+one. Reuse beats addition: a parameter on an existing tool is usually better
+than a new tool. Check `cmd/server/main.go` for what is actually registered,
+not what a skill file claims — skills may name tools that do not exist yet.
+
+### 3. State the gap and get approval
+
+For every step no existing tool covers, tell the user, before implementing:
+
+- the tool name,
+- what it does and what it returns,
+- its parameters and which are optional,
+- which step of the skill needs it and why an existing tool cannot serve it.
+
+Then **wait for approval**. Do not start implementing tools that have not been
+agreed. If the scenario turns out to need no new tools, say so instead of
+inventing work.
+
+### 4. Build what was agreed
+
+Implement the approved tools with the per-tool workflow below, then update the
+skill so its steps name the tools that now exist, and update `README.md`.
+
+A skill must never reference a tool the server does not expose. If a skill
+names a missing tool, that is a gap to raise in step 3, not something to leave
+in place.
 
 ## Workflow for adding a new tool
 
@@ -36,14 +107,14 @@ failing test.
 - Run the test and confirm it fails for the right reason (missing behaviour,
   not a compile error in unrelated code) before writing any implementation.
 
-### 2. Create a new package under `internal/kafka` for each tool
+### 2. Create a new package under `internal/tools` for each tool
 
 Each tool gets its own package. Do not add new tools to an existing package.
 
 ```
-internal/kafka/listtopics/
-internal/kafka/getmessage/
-internal/kafka/topicmetadata/
+internal/tools/listtopics/
+internal/tools/getmessage/
+internal/tools/topicmetadata/
 ```
 
 Each package contains:
@@ -66,11 +137,11 @@ Rules:
 - Return an empty slice rather than `nil` for "no results", so the JSON output
   is `[]` instead of `null`.
 
-### 3. Write tests against real containers, using `internal/testenv`
+### 3. Write tests against real containers, using `internal/domain/testenv`
 
 Tests must run against a real Kafka broker and a real Redpanda Console. Do not
 mock the Kafka client, and do not start containers yourself: every suite starts
-its environment through `internal/testenv`.
+its environment through `internal/domain/testenv`.
 
 `testenv.Start` takes nothing but a `*testing.T`. It creates a Docker network,
 starts a Redpanda broker and a Redpanda Console attached to that broker,
@@ -121,12 +192,15 @@ far too slow.
 | ----------------------------- | ---------------------------------------------- |
 | `Admin()`                     | `*kadm.Client` connected to the broker         |
 | `Kafka()`                     | `*kgo.Client` for record-level operations      |
+| `Reader()`                    | `*records.Reader` for tools that read messages |
 | `Broker()`                    | Host address for `kgo.SeedBrokers`             |
 | `SchemaRegistry()`            | Schema Registry host address                   |
 | `AdminAPI()`                  | Redpanda Admin API host address                |
 | `ConsoleURL()`                | Redpanda Console browser URL                   |
 | `CreateTopic(t, prefix)`      | Uniquely named topic, deleted by `Stop`        |
 | `CreateTopics(t, prefixes...)`| Same, for several topics at once               |
+| `CreateTopicWithPartitions(t, prefix, n)` | Topic with a chosen partition count |
+| `Produce(t, topic, messages...)` | Produce records, returns their offsets      |
 | `DeleteTopics(t, topics...)`  | Delete topics early                            |
 | `UniqueName(prefix)`          | Unique name for topics, groups, and so on      |
 
@@ -147,6 +221,23 @@ Test rules:
 - Assert with `s.Require()`, never `s.Assert()` or the bare `s.Equal` forms. A
   failed expectation means the rest of the case is testing garbage, so stop
   there.
+- Write every case out in full with its own `s.Run("name", func() { ... })`.
+  Do not build a slice of cases and iterate over it: a table hides what each
+  case actually asserts, and a failure points at the loop rather than at the
+  behaviour that broke.
+
+  ```go
+  s.Run("is_null matches an explicit null", func() {
+      s.Require().True(s.match(`{"field":"payload.cancelledAt","op":"is_null"}`),
+          "a field present and set to null must match, because that is the state is_null names")
+  })
+
+  s.Run("is_null does not match a missing field", func() {
+      s.Require().False(s.match(`{"field":"payload.missing","op":"is_null"}`),
+          "a field that is absent is a different state from one set to null, and conflating them hides schema drift")
+  })
+  ```
+
 - Every assertion carries a message explaining what the failure means. Not
   "topics must contain x", but why that matters:
 
@@ -188,7 +279,7 @@ Each tool package registers itself. The package exposes a `Register` function
 that owns the tool's name, description, schema and handler:
 
 ```go
-// internal/kafka/listtopics/listtopics.go
+// internal/tools/listtopics/listtopics.go
 func Register(server *mcp.Server, admin *kadm.Client) {
     mcp.AddTool(
         server,
@@ -274,7 +365,7 @@ when running against local compose.
   tools.
 - Prefer editing existing files over creating new ones. The exception is the
   per-tool package structure above, which requires new files.
-- Shared test utilities belong in `internal/testenv`, never duplicated across
+- Shared test utilities belong in `internal/domain/testenv`, never duplicated across
   test files. Ask for approval before refactoring call sites to move one there.
 - Do not add a dependency without checking that it exists and that the API used
   is real. Verify with `go doc` after adding it.

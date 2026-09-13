@@ -7,8 +7,8 @@ import (
 	"github.com/twmb/franz-go/pkg/kadm"
 	"github.com/twmb/franz-go/pkg/kgo"
 
-	"github.com/denizgursoy/kafka-mcp/internal/kafka/listtopics"
-	"github.com/denizgursoy/kafka-mcp/internal/testenv"
+	"github.com/denizgursoy/kafka-mcp/internal/domain/testenv"
+	"github.com/denizgursoy/kafka-mcp/internal/tools/listtopics"
 )
 
 type ListTopicsSuite struct {

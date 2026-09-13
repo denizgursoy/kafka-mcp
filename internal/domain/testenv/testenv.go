@@ -23,6 +23,7 @@ package testenv
 import (
 	"context"
 	"fmt"
+	"sort"
 	"sync"
 	"testing"
 	"time"
@@ -33,6 +34,8 @@ import (
 	"github.com/testcontainers/testcontainers-go/wait"
 	"github.com/twmb/franz-go/pkg/kadm"
 	"github.com/twmb/franz-go/pkg/kgo"
+
+	"github.com/denizgursoy/kafka-mcp/internal/domain/records"
 )
 
 const (
@@ -152,9 +155,14 @@ func (e *Environment) start(ctx context.Context) error {
 	// cache, which is MetadataMinAge (5s) old by default. A topic created by a
 	// test would then be invisible to the code under test for several seconds.
 	// Tests need to observe writes immediately, so shrink the cache window.
+	//
+	// ManualPartitioner makes Record.Partition authoritative. Without it
+	// franz-go ignores that field and balances records itself, so a test that
+	// produces to a named partition would silently land somewhere else.
 	e.client, err = kgo.NewClient(
 		kgo.SeedBrokers(e.seed),
 		kgo.MetadataMinAge(metadataMinAge),
+		kgo.RecordPartitioner(kgo.ManualPartitioner()),
 	)
 	if err != nil {
 		return fmt.Errorf("connect kafka client to %s: %w", e.seed, err)
@@ -276,6 +284,12 @@ func (e *Environment) Broker() string {
 	return e.seed
 }
 
+// Reader returns a record reader pointed at the running broker, for tools that
+// read message content rather than metadata.
+func (e *Environment) Reader() *records.Reader {
+	return records.NewReader(e.seed)
+}
+
 // SchemaRegistry returns the host address of the Schema Registry.
 func (e *Environment) SchemaRegistry() string {
 	return e.schemaRegistry
@@ -375,4 +389,94 @@ func (e *Environment) deleteTrackedTopics(ctx context.Context) {
 // that must not collide with other test cases sharing the broker.
 func (e *Environment) UniqueName(prefix string) string {
 	return fmt.Sprintf("%s-%d", prefix, time.Now().UnixNano())
+}
+
+// Message describes a record to produce in a test. Every field is optional
+// except Value, so a test only states what it actually cares about.
+type Message struct {
+	Key       string
+	Value     string
+	Headers   map[string]string
+	Partition int32
+	Timestamp time.Time
+}
+
+// Produce writes the given messages to a topic and waits for the broker to
+// acknowledge them, so a test that produces then searches cannot race.
+//
+// It returns the offset assigned to each message, in the order given, because
+// tests assert on the exact offsets a tool reports back.
+func (e *Environment) Produce(t *testing.T, topic string, messages ...Message) []int64 {
+	t.Helper()
+
+	records := make([]*kgo.Record, 0, len(messages))
+
+	for _, message := range messages {
+		record := &kgo.Record{
+			Topic:     topic,
+			Partition: message.Partition,
+			Value:     []byte(message.Value),
+		}
+
+		if message.Key != "" {
+			record.Key = []byte(message.Key)
+		}
+
+		if !message.Timestamp.IsZero() {
+			record.Timestamp = message.Timestamp
+		}
+
+		for key, value := range message.Headers {
+			record.Headers = append(record.Headers, kgo.RecordHeader{
+				Key:   key,
+				Value: []byte(value),
+			})
+		}
+
+		// Headers come from a map, so sort them to keep produced records
+		// byte-identical across runs.
+		sort.Slice(record.Headers, func(i, j int) bool {
+			return record.Headers[i].Key < record.Headers[j].Key
+		})
+
+		records = append(records, record)
+	}
+
+	results := e.client.ProduceSync(t.Context(), records...)
+	if err := results.FirstErr(); err != nil {
+		t.Fatalf("produce %d messages to %s: %v", len(messages), topic, err)
+	}
+
+	offsets := make([]int64, 0, len(records))
+
+	for _, record := range records {
+		offsets = append(offsets, record.Offset)
+	}
+
+	return offsets
+}
+
+// CreateTopicWithPartitions creates a topic with the given partition count and
+// returns its generated name, for tests that need to assert across partitions.
+func (e *Environment) CreateTopicWithPartitions(t *testing.T, prefix string, partitions int32) string {
+	t.Helper()
+
+	name := e.UniqueName(prefix)
+
+	responses, err := e.admin.CreateTopics(t.Context(), partitions, 1, nil, name)
+	if err != nil {
+		t.Fatalf("create topic %s with %d partitions: %v", name, partitions, err)
+	}
+
+	for _, response := range responses {
+		if response.Err != nil {
+			t.Fatalf("create topic %s: %v", response.Topic, response.Err)
+		}
+	}
+
+	e.mu.Lock()
+	e.topics = append(e.topics, name)
+	e.mu.Unlock()
+
+	return name
 }
