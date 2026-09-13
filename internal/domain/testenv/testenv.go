@@ -480,3 +480,44 @@ func (e *Environment) CreateTopicWithPartitions(t *testing.T, prefix string, par
 
 	return name
 }
+
+// CreateTopicWithConfig creates a single-partition topic carrying the given
+// topic-level configuration, and returns its generated name.
+//
+// Tests need this to tell a config set on the topic apart from one inherited
+// from the cluster: the two look identical in a config listing except for the
+// source Kafka reports.
+func (e *Environment) CreateTopicWithConfig(
+	t *testing.T,
+	prefix string,
+	configs map[string]string,
+) string {
+	t.Helper()
+
+	name := e.UniqueName(prefix)
+
+	// kadm takes pointers so that a nil value can mean "delete this config",
+	// which is why the values cannot be passed as a plain string map.
+	values := make(map[string]*string, len(configs))
+
+	for key, value := range configs {
+		values[key] = kadm.StringPtr(value)
+	}
+
+	responses, err := e.admin.CreateTopics(t.Context(), 1, 1, values, name)
+	if err != nil {
+		t.Fatalf("create topic %s with config %v: %v", name, configs, err)
+	}
+
+	for _, response := range responses {
+		if response.Err != nil {
+			t.Fatalf("create topic %s: %v", response.Topic, response.Err)
+		}
+	}
+
+	e.mu.Lock()
+	e.topics = append(e.topics, name)
+	e.mu.Unlock()
+
+	return name
+}

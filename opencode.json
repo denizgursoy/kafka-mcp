@@ -1,0 +1,19 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "instructions": ["AGENTS.md"],
+  "skills": {
+    "paths": ["internal/skills"]
+  },
+  "mcp": {
+    "kafka": {
+      "type": "local",
+      "command": ["go", "run", "./cmd/server"],
+      "cwd": ".",
+      "enabled": true,
+      "environment": {
+        "KAFKA_BROKER": "localhost:19092",
+        "KAFKA_MCP_OUTPUT_DIR": "/tmp/kafka-mcp-exports"
+      }
+    }
+  }
+}

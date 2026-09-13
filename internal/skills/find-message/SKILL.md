@@ -1,3 +1,8 @@
+---
+name: find-message
+description: Use when locating Kafka messages by their content — finding a message by order id, correlation id, customer id or message key, or selecting messages by a field condition such as event type or amount. Covers searching a topic, reading the scan report before answering, and handling large result sets. Use for requests like "find the message for order 12345", "which message had this correlation id", or "show me the failed payments over 500".
+---
+
 # Find a message
 
 Locate Kafka messages by their content, when the user knows something about a
@@ -87,6 +92,17 @@ constraints, because each one removes messages that must otherwise be read:
 - a time ("this morning", "last Tuesday") → `from_timestamp` / `to_timestamp`
 - a known offset neighbourhood → `from_offset` / `to_offset`
 - a known partition → `partitions`
+
+`describe_topic` also returns the topic's configuration, and two entries decide
+whether the message can still exist at all:
+
+- **`retention.ms`** — messages older than this are gone. If the user asks
+  about something older, say so instead of scanning: no search can find it.
+  Retention is enforced per log segment, so messages may survive somewhat
+  longer than the setting suggests.
+- **`cleanup.policy`** — `compact` means Kafka keeps only the most recent
+  message per key. Earlier values of a key are gone even inside the retention
+  window, so "not found" for a superseded message is expected, not a failure.
 
 **Never infer a partition from a key.** Producers may set the partition
 explicitly when producing, so the key does not determine it. Guessing wrong

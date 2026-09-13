@@ -184,3 +184,107 @@ func (s *DescribeTopicSuite) TestErrorsWhenBrokerUnreachable() {
 	s.Require().Error(err,
 		"an unreachable broker must surface as an error, not as an empty description")
 }
+
+func (s *DescribeTopicSuite) configs(out describetopic.Output) map[string]describetopic.Config {
+	s.T().Helper()
+
+	byKey := make(map[string]describetopic.Config, len(out.Configs))
+
+	for _, config := range out.Configs {
+		byKey[config.Key] = config
+	}
+
+	return byKey
+}
+
+func (s *DescribeTopicSuite) TestReportsInheritedRetention() {
+	topic := s.env.CreateTopic(s.T(), "describe-config-default")
+
+	out, err := describetopic.Run(
+		s.T().Context(),
+		s.env.Admin(),
+		s.env.Reader(),
+		describetopic.Input{Topic: topic},
+	)
+
+	s.Require().NoError(err, "describing a topic must also report its configuration")
+
+	byKey := s.configs(out)
+
+	s.Run("retention is reported", func() {
+		retention, ok := byKey["retention.ms"]
+
+		s.Require().True(ok,
+			"retention.ms must be reported, because it is what decides how far back a search can possibly find anything")
+		s.Require().NotEmpty(retention.Value,
+			"a reported config must carry its value, or the caller learns nothing from it")
+	})
+
+	s.Run("an inherited config is marked as a default", func() {
+		retention := byKey["retention.ms"]
+
+		s.Require().True(retention.IsDefault,
+			"this topic sets no retention of its own, so the value must be marked inherited rather than deliberate")
+		s.Require().Equal("DEFAULT_CONFIG", retention.Source,
+			"the source must be named, not returned as a bare enum number that no caller can interpret")
+	})
+
+	s.Run("the configs that change how a topic is searched are present", func() {
+		for _, key := range []string{
+			"cleanup.policy",
+			"max.message.bytes",
+			"retention.bytes",
+			"segment.bytes",
+		} {
+			s.Require().Contains(byKey, key,
+				"every config key must be returned, since the caller asked for the complete configuration")
+		}
+	})
+
+	s.Run("configs are sorted by key", func() {
+		keys := make([]string, 0, len(out.Configs))
+		for _, config := range out.Configs {
+			keys = append(keys, config.Key)
+		}
+
+		s.Require().IsIncreasing(keys,
+			"configs must be sorted, because kadm returns them in no guaranteed order and unstable output confuses MCP clients")
+	})
+}
+
+func (s *DescribeTopicSuite) TestReportsExplicitlySetRetention() {
+	topic := s.env.CreateTopicWithConfig(s.T(), "describe-config-set", map[string]string{
+		"retention.ms":   "60000",
+		"cleanup.policy": "compact",
+	})
+
+	out, err := describetopic.Run(
+		s.T().Context(),
+		s.env.Admin(),
+		s.env.Reader(),
+		describetopic.Input{Topic: topic},
+	)
+
+	s.Require().NoError(err, "describing a topic with its own configuration must succeed")
+
+	byKey := s.configs(out)
+
+	s.Run("the set value is reported", func() {
+		s.Require().Equal("60000", byKey["retention.ms"].Value,
+			"the value set on the topic must be reported, not the cluster default it overrides")
+	})
+
+	s.Run("a deliberately set config is not marked as a default", func() {
+		retention := byKey["retention.ms"]
+
+		s.Require().False(retention.IsDefault,
+			"a config set on the topic is a deliberate choice, and reporting it as inherited would hide that")
+		s.Require().Equal("DYNAMIC_TOPIC_CONFIG", retention.Source,
+			"a topic-level config must be named as such, which is what distinguishes it from an inherited value")
+	})
+
+	s.Run("cleanup policy is reported", func() {
+		s.Require().Equal("compact", byKey["cleanup.policy"].Value,
+			"a compacted topic keeps only the latest value per key, so a caller must see this before concluding a message is missing")
+	})
+}

@@ -47,8 +47,9 @@ Lists the topics on the cluster, sorted alphabetically, with their count.
 
 ### `describe_topic`
 
-Reports a topic's partitions, offset ranges, message count and time span. Use
-it before searching to see how much data a search would read.
+Reports a topic's partitions, offset ranges, message count, time span and full
+configuration. Use it before searching to see how much data a search would read
+and how far back the topic can hold data at all.
 
 | Parameter | Type   | Required | Meaning              |
 | --------- | ------ | -------- | -------------------- |
@@ -56,8 +57,16 @@ it before searching to see how much data a search would read.
 
 ```json
 {"topic": "orders", "partition_count": 1, "message_count": 3,
- "partitions": [{"partition": 0, "start_offset": 0, "end_offset": 3, "message_count": 3}]}
+ "partitions": [{"partition": 0, "start_offset": 0, "end_offset": 3, "message_count": 3}],
+ "configs": [{"key": "cleanup.policy", "value": "delete", "source": "DYNAMIC_TOPIC_CONFIG", "is_default": false},
+             {"key": "retention.ms", "value": "604800000", "source": "DEFAULT_CONFIG", "is_default": true}]}
 ```
+
+`configs` lists every topic config as the string Kafka reports, where `-1`
+means unlimited. `is_default` is true when the value is inherited rather than
+set on the topic. Two entries decide whether a message can still exist at all:
+`retention.ms` (how long messages are kept) and `cleanup.policy` (`compact`
+keeps only the latest message per key).
 
 ### `sample_messages`
 

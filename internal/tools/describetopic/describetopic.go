@@ -9,6 +9,7 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/twmb/franz-go/pkg/kadm"
+	"github.com/twmb/franz-go/pkg/kmsg"
 
 	"github.com/denizgursoy/kafka-mcp/internal/domain/records"
 )
@@ -26,6 +27,19 @@ type Partition struct {
 	MessageCount int64 `json:"message_count"`
 }
 
+// Config is one topic-level configuration entry.
+type Config struct {
+	Key   string `json:"key"`
+	Value string `json:"value"`
+	// Source names where the value comes from, so a caller can tell a
+	// deliberate topic setting from an inherited cluster default.
+	Source    string `json:"source"`
+	IsDefault bool   `json:"is_default"`
+	// Sensitive marks a config whose value the broker refuses to disclose.
+	// The value is then empty because it is hidden, not because it is unset.
+	Sensitive bool `json:"sensitive,omitempty"`
+}
+
 // Output is the result returned by the describe_topic tool.
 type Output struct {
 	Topic           string      `json:"topic"`
@@ -34,20 +48,38 @@ type Output struct {
 	Partitions      []Partition `json:"partitions"`
 	OldestTimestamp *time.Time  `json:"oldest_timestamp,omitempty"`
 	NewestTimestamp *time.Time  `json:"newest_timestamp,omitempty"`
+	Configs         []Config    `json:"configs"`
 }
 
 const description = `
 Describe one Kafka topic: how many partitions it has, the offset range of each
-partition, how many messages it holds, and the timestamps of its oldest and
-newest messages.
+partition, how many messages it holds, the timestamps of its oldest and newest
+messages, and its full configuration.
 
 Use this before searching a topic. It tells you how much data a search would
-have to scan and which partition and offset or time range to narrow it to.
+have to scan, which partition and offset or time range to narrow it to, and how
+far back the topic can hold data at all.
 
 "message_count" per partition is end_offset minus start_offset. It counts
 offsets rather than surviving records, so it can overcount if records were
 deleted by retention or compaction. A partition whose start and end offsets are
 equal is empty. The timestamps are omitted for an empty topic.
+
+"configs" lists every topic configuration entry. Values are returned as the
+strings Kafka reports, and -1 means unlimited for the retention and size
+settings. Two entries matter most when deciding whether a message can still
+exist:
+
+  retention.ms    how long messages are kept, so a search for anything older
+                  than this will find nothing however wide the scan
+  cleanup.policy  "delete" discards old messages, while "compact" keeps only
+                  the most recent message per key, so earlier values of a key
+                  are gone even within the retention window
+
+"source" says where a value comes from, and "is_default" is true when the
+value is inherited rather than set on the topic itself. Retention is enforced
+per log segment, so messages can outlive retention.ms until their segment is
+eligible for deletion.
 
 Fails if the topic does not exist.
 `
@@ -124,6 +156,11 @@ func Run(
 		Topic:          input.Topic,
 		PartitionCount: len(detail.Partitions),
 		Partitions:     make([]Partition, 0, len(detail.Partitions)),
+	}
+
+	out.Configs, err = topicConfigs(ctx, admin, input.Topic)
+	if err != nil {
+		return Output{}, err
 	}
 
 	for id := range detail.Partitions {
@@ -227,4 +264,74 @@ func timestampRange(
 	}
 
 	return oldest, newest, nil
+}
+
+// configSources names the ConfigSource values Kafka can report. The protocol
+// sends a bare integer, which tells a caller nothing, so it is mapped to the
+// name used in Kafka's own documentation and tooling.
+var configSources = map[kmsg.ConfigSource]string{
+	kmsg.ConfigSourceDynamicTopicConfig:         "DYNAMIC_TOPIC_CONFIG",
+	kmsg.ConfigSourceDynamicBrokerConfig:        "DYNAMIC_BROKER_CONFIG",
+	kmsg.ConfigSourceDynamicDefaultBrokerConfig: "DYNAMIC_DEFAULT_BROKER_CONFIG",
+	kmsg.ConfigSourceStaticBrokerConfig:         "STATIC_BROKER_CONFIG",
+	kmsg.ConfigSourceDefaultConfig:              "DEFAULT_CONFIG",
+	kmsg.ConfigSourceDynamicBrokerLoggerConfig:  "DYNAMIC_BROKER_LOGGER_CONFIG",
+}
+
+// topicConfigs returns every configuration entry of a topic, sorted by key.
+func topicConfigs(
+	ctx context.Context,
+	admin *kadm.Client,
+	topic string,
+) ([]Config, error) {
+
+	described, err := admin.DescribeTopicConfigs(ctx, topic)
+	if err != nil {
+		return nil, fmt.Errorf("describe configs for %q: %w", topic, err)
+	}
+
+	resource, err := described.On(topic, nil)
+	if err != nil {
+		return nil, fmt.Errorf("describe configs for %q: %w", topic, err)
+	}
+
+	// A per-resource error would otherwise surface as a topic with no
+	// configuration at all, which reads as "nothing is configured" rather than
+	// "the configuration could not be read".
+	if resource.Err != nil {
+		if resource.ErrMessage != "" {
+			return nil, fmt.Errorf(
+				"describe configs for %q: %w: %s", topic, resource.Err, resource.ErrMessage)
+		}
+
+		return nil, fmt.Errorf("describe configs for %q: %w", topic, resource.Err)
+	}
+
+	configs := make([]Config, 0, len(resource.Configs))
+
+	for _, config := range resource.Configs {
+		source, known := configSources[config.Source]
+		if !known {
+			// Naming an unrecognised source honestly beats reporting one that
+			// the broker did not send.
+			source = fmt.Sprintf("UNKNOWN(%d)", config.Source)
+		}
+
+		configs = append(configs, Config{
+			Key:   config.Key,
+			Value: config.MaybeValue(),
+			// Only a value set on the topic itself is a deliberate choice.
+			// Everything else is inherited, whatever level it comes from.
+			IsDefault: config.Source != kmsg.ConfigSourceDynamicTopicConfig,
+			Source:    source,
+			Sensitive: config.Sensitive,
+		})
+	}
+
+	// kadm returns configs in no guaranteed order, so sort for a stable report.
+	sort.Slice(configs, func(i, j int) bool {
+		return configs[i].Key < configs[j].Key
+	})
+
+	return configs, nil
 }
