@@ -184,10 +184,64 @@ Reads one message at an exact offset, plus optional neighbours.
 Values that are not valid UTF-8 are base64 encoded, with `encoding` set to
 `base64`.
 
+### `list_consumer_groups`
+
+Lists consumer groups with their state, member count and the topics they
+consume.
+
+| Parameter | Type     | Required | Meaning                                        |
+| --------- | -------- | -------- | ---------------------------------------------- |
+| `topic`   | string   | no       | Only groups consuming or committed to this topic |
+| `states`  | string[] | no       | Filter by state, e.g. `Stable`, `Empty`        |
+
+```json
+{"groups": [{"group": "payments", "state": "Stable", "members": 2, "topics": ["orders"]}], "count": 1}
+```
+
+A group in state `Empty` can still report lag: committed offsets outlive the
+consumers that made them. Kafka has no topic-to-group index, so filtering by
+`topic` describes every group on the cluster.
+
+### `consumer_lag`
+
+Measures how far behind a topic's consumers are, how fast messages are produced
+and consumed, and when the backlog will clear.
+
+| Parameter            | Type   | Required | Meaning                                                     |
+| -------------------- | ------ | -------- | ----------------------------------------------------------- |
+| `topic`              | string | yes      | Topic to measure                                             |
+| `group`              | string | no       | Defaults to every group consuming the topic                  |
+| `sample_seconds`     | int    | no       | Consume-rate sample window. Default 5. **The call blocks**   |
+| `skip_consume_rate`  | bool   | no       | Return immediately, without a rate or estimate               |
+
+```json
+{"topic": "orders", "total_lag": 4200,
+ "produce_rate": {"last_minute": {"messages": 3000, "per_second": 50, "per_minute": 3000, "per_hour": 180000}},
+ "groups": [{"group": "payments", "state": "Stable", "members": 2, "lag": 4200,
+             "consume_rate": {"per_second": 120, "sampled_seconds": 5},
+             "drain_per_second": 70, "eta_seconds": 60, "eta_human": "1m 0s",
+             "status": "draining"}]}
+```
+
+The two rates are measured differently, and the output says so:
+
+- **`produce_rate`** — historical fact, from message timestamps, over the last
+  second, minute and hour. `window_truncated` marks a topic younger than the
+  window.
+- **`consume_rate`** — a sample: the committed offset is read, then read again
+  `sample_seconds` later. `sample_inconclusive` means nothing moved.
+
+The backlog drains at the consume rate **minus** the produce rate. `status`
+says what the numbers mean: `caught_up`, `draining` (with an ETA), `growing`
+(never clears, with `growing_by_per_minute`), `stalled`, `no_active_consumers`,
+or `not_measured`. An ETA is only given when the lag is genuinely shrinking.
+
 ## Skills
 
-`internal/skills/find-message` describes how these tools are combined to
-locate a message from something the user knows about it.
+- `internal/skills/find-message` — locating a message from something the user
+  knows about it.
+- `internal/skills/check-lag` — measuring lag and throughput, and judging when
+  a backlog will clear.
 
 ## Development
 

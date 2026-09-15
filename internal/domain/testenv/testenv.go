@@ -74,6 +74,7 @@ type Environment struct {
 
 	mu     sync.Mutex
 	topics []string
+	groups []string
 
 	seed           string
 	consoleURL     string
@@ -235,6 +236,7 @@ func (e *Environment) Stop() {
 	// as the test finishes, which would abort the cleanup it is meant to do.
 	ctx := context.Background()
 
+	e.deleteTrackedGroups(ctx)
 	e.deleteTrackedTopics(ctx)
 
 	if e.client != nil {
@@ -374,6 +376,26 @@ func (e *Environment) deleteTopics(ctx context.Context, topics ...string) {
 	}
 }
 
+// deleteTrackedGroups removes the consumer groups the tests created. Groups
+// are deleted before topics, because deleting a topic a group still has
+// commits for leaves those commits behind on the cluster.
+func (e *Environment) deleteTrackedGroups(ctx context.Context) {
+	e.t.Helper()
+
+	e.mu.Lock()
+	groups := e.groups
+	e.groups = nil
+	e.mu.Unlock()
+
+	if len(groups) == 0 || e.admin == nil {
+		return
+	}
+
+	if _, err := e.admin.DeleteGroups(ctx, groups...); err != nil {
+		e.t.Logf("delete groups %v: %v", groups, err)
+	}
+}
+
 func (e *Environment) deleteTrackedTopics(ctx context.Context) {
 	e.t.Helper()
 
@@ -479,6 +501,64 @@ func (e *Environment) CreateTopicWithPartitions(t *testing.T, prefix string, par
 	e.mu.Unlock()
 
 	return name
+}
+
+// ConsumeAndCommit consumes exactly count records from a topic as a member of
+// the given consumer group, commits them, and returns the group name.
+//
+// It uses a real consumer rather than writing offsets directly, so the group
+// exists the way a production group does. Autocommit is disabled and the
+// commit is synchronous, so when this returns the committed offset is exactly
+// count and the lag is exactly whatever remains: no waiting on a timer, and
+// nothing timing-dependent for a test to race against.
+//
+// The client is closed before returning, which leaves the group in the Empty
+// state with its commits intact. That is the same state a group reaches when
+// its consumers stop, so a test can assert on lag without an active member.
+func (e *Environment) ConsumeAndCommit(
+	t *testing.T,
+	topic string,
+	group string,
+	count int,
+) {
+	t.Helper()
+
+	client, err := kgo.NewClient(
+		kgo.SeedBrokers(e.seed),
+		kgo.ConsumerGroup(group),
+		kgo.ConsumeTopics(topic),
+		kgo.ConsumeResetOffset(kgo.NewOffset().AtStart()),
+		kgo.DisableAutoCommit(),
+	)
+	if err != nil {
+		t.Fatalf("connect consumer for group %s: %v", group, err)
+	}
+
+	defer client.Close()
+
+	consumed := make([]*kgo.Record, 0, count)
+
+	for len(consumed) < count {
+		fetches := client.PollRecords(t.Context(), count-len(consumed))
+
+		if err := fetches.Err0(); err != nil {
+			t.Fatalf("consume from %s as group %s: %v", topic, group, err)
+		}
+
+		fetches.EachRecord(func(record *kgo.Record) {
+			if len(consumed) < count {
+				consumed = append(consumed, record)
+			}
+		})
+	}
+
+	if err := client.CommitRecords(t.Context(), consumed...); err != nil {
+		t.Fatalf("commit %d records for group %s: %v", len(consumed), group, err)
+	}
+
+	e.mu.Lock()
+	e.groups = append(e.groups, group)
+	e.mu.Unlock()
 }
 
 // CreateTopicWithConfig creates a single-partition topic carrying the given

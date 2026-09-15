@@ -202,6 +202,7 @@ far too slow.
 | `CreateTopicWithPartitions(t, prefix, n)` | Topic with a chosen partition count |
 | `CreateTopicWithConfig(t, prefix, configs)` | Topic with topic-level configs   |
 | `Produce(t, topic, messages...)` | Produce records, returns their offsets      |
+| `ConsumeAndCommit(t, topic, group, n)` | Consume and commit n records as a real group member |
 | `DeleteTopics(t, topics...)`  | Delete topics early                            |
 | `UniqueName(prefix)`          | Unique name for topics, groups, and so on      |
 
