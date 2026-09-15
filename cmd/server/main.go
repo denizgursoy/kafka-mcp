@@ -8,8 +8,10 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/denizgursoy/kafka-mcp/internal/domain/kafkaclient"
+	"github.com/denizgursoy/kafka-mcp/internal/tools/consumerlag"
 	"github.com/denizgursoy/kafka-mcp/internal/tools/describetopic"
 	"github.com/denizgursoy/kafka-mcp/internal/tools/getmessage"
+	"github.com/denizgursoy/kafka-mcp/internal/tools/listconsumergroups"
 	"github.com/denizgursoy/kafka-mcp/internal/tools/listtopics"
 	"github.com/denizgursoy/kafka-mcp/internal/tools/samplemessages"
 	"github.com/denizgursoy/kafka-mcp/internal/tools/searchmessages"
@@ -40,6 +42,8 @@ func main() {
 	// Every tool registers itself: one call per tool, no Kafka logic and no
 	// tool schema here.
 	listtopics.Register(server, kafka.Admin())
+	listconsumergroups.Register(server, kafka.Admin())
+	consumerlag.Register(server, kafka.Admin())
 	describetopic.Register(server, kafka.Admin(), kafka.Reader())
 	samplemessages.Register(server, kafka.Admin(), kafka.Reader())
 	searchmessages.Register(server, kafka.Admin(), kafka.Reader())
