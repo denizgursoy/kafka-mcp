@@ -17,6 +17,7 @@ Layout:
 cmd/server/main.go        MCP server entrypoint, tool registration
 internal/tools/           One package per MCP tool, and nothing else
 internal/domain/          Everything shared by more than one tool
+  config/                 The server's own configuration
   kafkaclient/            The Kafka connection the tools are given
   records/                Reading and rendering Kafka records
   testenv/                Test container environment (broker + Console)
@@ -327,7 +328,7 @@ go build -o bin/kafka-debugger ./cmd/server
   '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
   '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' \
   '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"list_topics","arguments":{}}}'; sleep 5; } \
-  | KAFKA_BROKER=localhost:19092 ./bin/kafka-debugger
+  | KAFKA_MCP_CONFIG=kafka-mcp.local.json ./bin/kafka-debugger
 ```
 
 The `sleep` matters: the server exits when stdin closes, so piping input without
@@ -353,12 +354,18 @@ Local endpoints from `docker-compose.yml`:
 - Schema Registry: `localhost:18081`
 - Redpanda Console: <http://localhost:8080>
 
-The server reads `KAFKA_BROKER` and defaults to `localhost:9092`. That default
-does not match the compose file's host port, so set `KAFKA_BROKER=localhost:19092`
-when running against local compose.
+The server is configured by a JSON file named by `KAFKA_MCP_CONFIG`, which is
+the only environment variable it reads. It refuses to start without one.
+`kafka-mcp.local.json` in the repository root points at the compose broker and
+is what the tests and local runs use.
 
 ## Conventions
 
+- A tool that changes the cluster must call `kafkaclient.RequireWritable` before
+  the call that mutates, so a read-only server refuses it. Put the check
+  immediately before the mutation, so every other refusal is reported on its
+  own terms. Destructive changes also take a `confirm` parameter and do nothing
+  without it.
 - Never commit unless the user explicitly asks.
 - Keep `README.md` current. Any new tool, changed flag, changed environment
   variable or changed startup step must be reflected there in the same change.

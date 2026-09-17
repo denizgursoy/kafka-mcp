@@ -6,26 +6,137 @@ MCP over stdio and talks to Kafka with [franz-go](https://github.com/twmb/franz-
 
 ## Start the server
 
-The server reads the `KAFKA_BROKER` environment variable and defaults to
-`localhost:9092`.
+The server is configured by a JSON file, named by `KAFKA_MCP_CONFIG`. That is
+the only environment variable it reads.
 
 ```sh
-make up                                  # local Redpanda + Console (optional)
+make up                                  # local Redpanda + Console
 make build                               # builds bin/kafka-debugger
-KAFKA_BROKER=localhost:19092 ./bin/kafka-debugger
+KAFKA_MCP_CONFIG=kafka-mcp.local.json ./bin/kafka-debugger
 ```
 
-`make up` publishes the broker on `localhost:19092`, the Schema Registry on
-`localhost:18081` and the Redpanda Console on <http://localhost:8080>. The
-default `localhost:9092` does not match that broker port, so set
-`KAFKA_BROKER` as shown when running against local compose.
+`kafka-mcp.local.json` is committed and points at the compose broker, so a
+clone works without writing any configuration. `make up` publishes the broker
+on `localhost:19092`, the Schema Registry on `localhost:18081` and the Redpanda
+Console on <http://localhost:8080>.
 
-`KAFKA_MCP_OUTPUT_DIR` chooses where `search_messages` writes exported results.
-It defaults to the system temp directory. Exports are confined to that
-directory: `output_file` takes a file name, never a path.
+A relative path is resolved from the working directory, so a config file kept
+beside the code needs no absolute path.
 
-To register it with an MCP client, run the binary as the client's stdio server
-command with `KAFKA_BROKER` set in its environment.
+## Configuration
+
+```jsonc
+{
+  "environment": "production",          // free-form label, informational only
+  "broker": "kafka-1:9093,kafka-2:9093",
+  "read_only": true,
+  "output_dir": "/var/tmp/kafka-mcp",
+  "tls": { "enabled": true, "ca_file": "/etc/kafka/ca.pem" },
+  "sasl": {
+    "mechanism": "scram-sha-256",       // plain, scram-sha-256, scram-sha-512
+    "user": "kafka-mcp-readonly",
+    "password": "{env:KAFKA_PASSWORD}"  // or "password_file": "/run/secrets/kafka"
+  }
+}
+```
+
+Every field is optional except `broker`. A minimal local file:
+
+```json
+{ "environment": "local", "broker": "localhost:19092" }
+```
+
+The file is the only source of configuration. The server refuses to start
+without one rather than guessing a broker address, and `output_dir` defaults to
+the system temp directory when omitted. Exports are confined to that directory:
+`output_file` takes a file name, never a path.
+
+Keep secrets out of the file with `{env:VAR}` or `password_file`. Unknown keys
+are rejected, so a typo like `"readonly"` fails at startup rather than silently
+leaving writes enabled.
+
+`server_config` reports the effective configuration at runtime. It never
+reports the password.
+
+## Permissions
+
+Three layers, and only one of them is real security:
+
+| Layer | Protects against | Real security? |
+| ----- | ---------------- | -------------- |
+| `confirm: true` on writes | An LLM changing things on one ambiguous request | No — a guardrail |
+| `read_only: true` | Accidental writes to a cluster with no ACLs | No — anyone who can edit the config can turn it off |
+| **Kafka ACLs on the SASL principal** | **An unauthorised person** | **Yes — the broker decides** |
+
+### Giving two people different permissions
+
+Kafka enforces permissions against the SASL principal, so two people running
+the same server with different credentials get different rights. Adding
+partitions requires `ALTER` on the topic:
+
+```sh
+# ali may read but not reshape topics
+rpk acl create --allow-principal User:ali \
+  --operation read,describe --topic orders
+
+# deniz may also add partitions
+rpk acl create --allow-principal User:deniz \
+  --operation read,describe,alter --topic orders
+```
+
+Each points `KAFKA_MCP_CONFIG` at their own file, differing only in `sasl.user`
+and the password. When ali calls `add_partitions`, the broker refuses:
+
+```
+not authorized to add partitions to "orders": the broker refused this request.
+Adding partitions requires ALTER permission on the topic for the principal
+this server connects as
+```
+
+ali cannot bypass that by editing config or rebuilding the binary, because the
+decision is made by Kafka rather than by this server. On a cluster without
+ACLs, `read_only: true` is the available protection.
+
+## Running against several environments
+
+Register one MCP server per cluster, each with its own config file:
+
+```jsonc
+{
+  "mcp": {
+    "kafka-local": {
+      "type": "local",
+      "command": ["kafka-mcp"],
+      "environment": { "KAFKA_MCP_CONFIG": "kafka-mcp.local.json" }
+    },
+    "kafka-prod": {
+      "type": "local",
+      "command": ["kafka-mcp"],
+      "enabled": false,
+      "environment": { "KAFKA_MCP_CONFIG": "/etc/kafka-mcp/prod.json" }
+    }
+  }
+}
+```
+
+The server name becomes part of every tool name, so `kafka-prod_describe_topic`
+is visibly different from `kafka-local_describe_topic`.
+
+Each enabled server costs context: these tools are roughly 8k tokens of
+definitions. Enabling three environments spends about 24k tokens before you
+type anything, so enable only what you need and put production behind an agent:
+
+```jsonc
+{
+  "tools": { "kafka-prod*": false },
+  "agent": {
+    "kafka-prod": {
+      "description": "Debugging against production Kafka.",
+      "tools": { "kafka-prod*": true }
+    }
+  }
+}
+```
 
 ## Tools
 
@@ -236,12 +347,44 @@ says what the numbers mean: `caught_up`, `draining` (with an ETA), `growing`
 (never clears, with `growing_by_per_minute`), `stalled`, `no_active_consumers`,
 or `not_measured`. An ETA is only given when the lag is genuinely shrinking.
 
+### `server_config`
+
+Reports the effective configuration: brokers, environment label, authentication
+mechanism and principal, TLS, read-only state, export directory and the tools
+this server exposes. Takes no parameters. The password is never reported.
+
+Use it when a result is surprising: an empty topic list means something very
+different on a local broker than on production.
+
+### `add_partitions`
+
+Adds partitions to a topic. **Irreversible** — Kafka cannot reduce a partition
+count.
+
+| Parameter | Type | Required | Meaning |
+| --------- | ---- | -------- | ------- |
+| `topic` | string | yes | Topic to change |
+| `partitions` | int | yes | Final total, not the number to add. Repeating a call is safe |
+| `confirm` | bool | no | Default false: preview only, nothing changes |
+| `acknowledge_key_ordering` | bool | no | Required when messages are keyed |
+| `sample_size` | int | no | Messages inspected for keys. Default 20 |
+
+Without `confirm` it reports what would happen: current and target counts,
+whether messages are keyed, which consumer groups will rebalance, and warnings.
+
+Adding partitions changes which partition a key hashes to, so existing keys
+lose their ordering guarantee. A keyed topic therefore requires
+`acknowledge_key_ordering` as well. Requesting fewer partitions than the topic
+has is refused with an explanation rather than attempted.
+
 ## Skills
 
 - `internal/skills/find-message` — locating a message from something the user
   knows about it.
 - `internal/skills/check-lag` — measuring lag and throughput, and judging when
   a backlog will clear.
+- `internal/skills/scale-partitions` — deciding whether more partitions will
+  help, and adding them safely.
 
 ## Development
 

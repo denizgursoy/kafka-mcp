@@ -105,6 +105,7 @@ func (s *HighVolumeSuite) TestFindsEveryMatchAcrossAThousandMessages() {
 		s.T().Context(),
 		s.env.Admin(),
 		s.env.Reader(),
+		"",
 		searchmessages.Input{
 			Topic:      s.topic,
 			Query:      "NEW",
@@ -130,6 +131,7 @@ func (s *HighVolumeSuite) TestNewestFirstStopsAfterTheNewestChunk() {
 		s.T().Context(),
 		s.env.Admin(),
 		s.env.Reader(),
+		"",
 		searchmessages.Input{
 			Topic:      s.topic,
 			Query:      "NEW",
@@ -157,6 +159,7 @@ func (s *HighVolumeSuite) TestOldestFirstStopsAtTheSecondMatch() {
 		s.T().Context(),
 		s.env.Admin(),
 		s.env.Reader(),
+		"",
 		searchmessages.Input{
 			Topic:      s.topic,
 			Query:      "NEW",
@@ -181,6 +184,7 @@ func (s *HighVolumeSuite) TestMatchExactlyOnTheChunkBoundary() {
 		s.T().Context(),
 		s.env.Admin(),
 		s.env.Reader(),
+		"",
 		searchmessages.Input{
 			Topic:    s.topic,
 			Query:    "order-500",
@@ -202,6 +206,7 @@ func (s *HighVolumeSuite) TestExactKeySearchIgnoresSubstringsInValues() {
 		s.T().Context(),
 		s.env.Admin(),
 		s.env.Reader(),
+		"",
 		searchmessages.Input{
 			Topic:    s.topic,
 			Query:    "order-7",
@@ -223,6 +228,7 @@ func (s *HighVolumeSuite) TestCountOnlyReportsTotalsWithoutBodies() {
 		s.T().Context(),
 		s.env.Admin(),
 		s.env.Reader(),
+		"",
 		searchmessages.Input{
 			Topic:     s.topic,
 			Query:     "NEW",
@@ -249,6 +255,7 @@ func (s *HighVolumeSuite) TestJSONFilterSelectsByFieldValue() {
 		s.T().Context(),
 		s.env.Admin(),
 		s.env.Reader(),
+		"",
 		searchmessages.Input{
 			Topic: s.topic,
 			Filter: filter(s.T(), `{"and":[
@@ -274,6 +281,7 @@ func (s *HighVolumeSuite) TestFilterOnNullField() {
 		s.T().Context(),
 		s.env.Admin(),
 		s.env.Reader(),
+		"",
 		searchmessages.Input{
 			Topic:      s.topic,
 			Filter:     filter(s.T(), `{"field":"payload.cancelledAt","op":"is_null"}`),
@@ -294,6 +302,7 @@ func (s *HighVolumeSuite) TestQueryAndFilterMustBothHold() {
 		s.T().Context(),
 		s.env.Admin(),
 		s.env.Reader(),
+		"",
 		searchmessages.Input{
 			Topic:      s.topic,
 			Query:      "order-493",
@@ -317,6 +326,7 @@ func (s *HighVolumeSuite) TestScanCeilingReportsAnIncompleteSearch() {
 		s.T().Context(),
 		s.env.Admin(),
 		s.env.Reader(),
+		"",
 		searchmessages.Input{
 			Topic:      s.topic,
 			Query:      "NEW",
@@ -342,12 +352,12 @@ func (s *HighVolumeSuite) TestScanCeilingReportsAnIncompleteSearch() {
 
 func (s *HighVolumeSuite) TestWritesEveryMatchToFile() {
 	dir := s.T().TempDir()
-	s.T().Setenv(searchmessages.OutputDirEnv, dir)
 
 	out, err := searchmessages.Run(
 		s.T().Context(),
 		s.env.Admin(),
 		s.env.Reader(),
+		dir,
 		searchmessages.Input{
 			Topic:      s.topic,
 			Query:      "NEW",
@@ -383,12 +393,12 @@ func (s *HighVolumeSuite) TestWritesEveryMatchToFile() {
 
 func (s *HighVolumeSuite) TestRejectsWritingOutsideTheOutputDirectory() {
 	dir := s.T().TempDir()
-	s.T().Setenv(searchmessages.OutputDirEnv, dir)
 
 	_, err := searchmessages.Run(
 		s.T().Context(),
 		s.env.Admin(),
 		s.env.Reader(),
+		dir,
 		searchmessages.Input{
 			Topic:      s.topic,
 			Query:      "NEW",

@@ -10,24 +10,13 @@ import (
 	"github.com/denizgursoy/kafka-mcp/internal/domain/records"
 )
 
-// OutputDirEnv names the environment variable that chooses where exported
-// results are written.
-const OutputDirEnv = "KAFKA_MCP_OUTPUT_DIR"
-
-// outputDir returns the directory exports are written to. Writing is confined
-// to this one directory: the caller supplies a file name, never a path, so an
-// MCP client cannot make the server write wherever it likes.
-func outputDir() string {
-	if dir := os.Getenv(OutputDirEnv); dir != "" {
-		return dir
-	}
-
-	return os.TempDir()
-}
-
 // exportPath validates a caller-supplied file name and returns the absolute
 // path to write it to.
-func exportPath(name string) (string, error) {
+//
+// Writing is confined to the configured directory: the caller supplies a file
+// name, never a path, so an MCP client cannot make the server write wherever
+// it likes.
+func exportPath(dir string, name string) (string, error) {
 	if strings.TrimSpace(name) == "" {
 		return "", fmt.Errorf("output_file is empty")
 	}
@@ -39,7 +28,9 @@ func exportPath(name string) (string, error) {
 			"output_file %q must be a file name, not a path: the server chooses the directory", name)
 	}
 
-	dir := outputDir()
+	if dir == "" {
+		dir = os.TempDir()
+	}
 
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return "", fmt.Errorf("create output directory %s: %w", dir, err)
@@ -51,14 +42,18 @@ func exportPath(name string) (string, error) {
 // exporter writes matches to a file as they are found, one JSON message per
 // line, so a search that matches a great many messages never has to hold them
 // all in memory or return them to the caller.
+//
+// A large result set cannot be returned inline: ten thousand matches is
+// megabytes of JSON, far beyond what an MCP client will accept in one tool
+// result, so it would be truncated and silently incomplete.
 type exporter struct {
 	file    *os.File
 	encoder *json.Encoder
 	written int
 }
 
-func newExporter(name string) (*exporter, error) {
-	path, err := exportPath(name)
+func newExporter(dir string, name string) (*exporter, error) {
+	path, err := exportPath(dir, name)
 	if err != nil {
 		return nil, err
 	}

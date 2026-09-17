@@ -42,6 +42,7 @@ func (s *SearchMessagesSuite) TestFindsMatchInValue() {
 		s.T().Context(),
 		s.env.Admin(),
 		s.env.Reader(),
+		"",
 		searchmessages.Input{Topic: topic, Query: "222"},
 	)
 
@@ -70,6 +71,7 @@ func (s *SearchMessagesSuite) TestMatchesAreCaseInsensitiveByDefault() {
 		s.T().Context(),
 		s.env.Admin(),
 		s.env.Reader(),
+		"",
 		searchmessages.Input{Topic: topic, Query: "alice"},
 	)
 
@@ -90,6 +92,7 @@ func (s *SearchMessagesSuite) TestSearchesKeyByDefault() {
 		s.T().Context(),
 		s.env.Admin(),
 		s.env.Reader(),
+		"",
 		searchmessages.Input{Topic: topic, Query: "777"},
 	)
 
@@ -118,6 +121,7 @@ func (s *SearchMessagesSuite) TestSearchInHeadersOnly() {
 		s.T().Context(),
 		s.env.Admin(),
 		s.env.Reader(),
+		"",
 		searchmessages.Input{
 			Topic:    topic,
 			Query:    "corr-999",
@@ -144,6 +148,7 @@ func (s *SearchMessagesSuite) TestExactMatchDoesNotMatchSubstrings() {
 		s.T().Context(),
 		s.env.Admin(),
 		s.env.Reader(),
+		"",
 		searchmessages.Input{
 			Topic:    topic,
 			Query:    "42",
@@ -171,6 +176,7 @@ func (s *SearchMessagesSuite) TestRegexMatch() {
 		s.T().Context(),
 		s.env.Admin(),
 		s.env.Reader(),
+		"",
 		searchmessages.Input{
 			Topic: topic,
 			Query: `ORD-\d{4}-\d{3}`,
@@ -192,6 +198,7 @@ func (s *SearchMessagesSuite) TestInvalidRegexIsAnError() {
 		s.T().Context(),
 		s.env.Admin(),
 		s.env.Reader(),
+		"",
 		searchmessages.Input{Topic: topic, Query: "ORD-[", Match: "regex"},
 	)
 
@@ -208,6 +215,7 @@ func (s *SearchMessagesSuite) TestNoMatchReturnsEmptyListNotError() {
 		s.T().Context(),
 		s.env.Admin(),
 		s.env.Reader(),
+		"",
 		searchmessages.Input{Topic: topic, Query: "absent-value"},
 	)
 
@@ -234,6 +242,7 @@ func (s *SearchMessagesSuite) TestStopsAtMaxMatches() {
 		s.T().Context(),
 		s.env.Admin(),
 		s.env.Reader(),
+		"",
 		searchmessages.Input{
 			Topic:      topic,
 			Query:      "hit",
@@ -262,6 +271,7 @@ func (s *SearchMessagesSuite) TestNewestFirstReturnsMostRecentMatches() {
 		s.T().Context(),
 		s.env.Admin(),
 		s.env.Reader(),
+		"",
 		searchmessages.Input{Topic: topic, Query: "hit", MaxMatches: 1},
 	)
 
@@ -284,6 +294,7 @@ func (s *SearchMessagesSuite) TestRestrictsToRequestedPartitions() {
 		s.T().Context(),
 		s.env.Admin(),
 		s.env.Reader(),
+		"",
 		searchmessages.Input{
 			Topic:      topic,
 			Query:      "hit",
@@ -317,6 +328,7 @@ func (s *SearchMessagesSuite) TestRestrictsToOffsetRange() {
 		s.T().Context(),
 		s.env.Admin(),
 		s.env.Reader(),
+		"",
 		searchmessages.Input{
 			Topic:      topic,
 			Query:      "hit",
@@ -352,6 +364,7 @@ func (s *SearchMessagesSuite) TestRestrictsToTimeRange() {
 		s.T().Context(),
 		s.env.Admin(),
 		s.env.Reader(),
+		"",
 		searchmessages.Input{
 			Topic:         topic,
 			Query:         "hit",
@@ -378,6 +391,7 @@ func (s *SearchMessagesSuite) TestReportsScannedRange() {
 		s.T().Context(),
 		s.env.Admin(),
 		s.env.Reader(),
+		"",
 		searchmessages.Input{Topic: topic, Query: "nothing-matches"},
 	)
 
@@ -395,6 +409,7 @@ func (s *SearchMessagesSuite) TestErrorsOnUnknownTopic() {
 		s.T().Context(),
 		s.env.Admin(),
 		s.env.Reader(),
+		"",
 		searchmessages.Input{Topic: s.env.UniqueName("missing"), Query: "anything"},
 	)
 
@@ -409,6 +424,7 @@ func (s *SearchMessagesSuite) TestErrorsOnEmptyQuery() {
 		s.T().Context(),
 		s.env.Admin(),
 		s.env.Reader(),
+		"",
 		searchmessages.Input{Topic: topic, Query: ""},
 	)
 
@@ -421,6 +437,7 @@ func (s *SearchMessagesSuite) TestErrorsWhenBrokerUnreachable() {
 		s.T().Context(),
 		s.env.Admin(),
 		records.NewReader("127.0.0.1:1"),
+		"",
 		searchmessages.Input{Topic: "anything", Query: "anything"},
 	)
 

@@ -11,8 +11,7 @@
       "cwd": ".",
       "enabled": true,
       "environment": {
-        "KAFKA_BROKER": "localhost:19092",
-        "KAFKA_MCP_OUTPUT_DIR": "/tmp/kafka-mcp-exports"
+        "KAFKA_MCP_CONFIG": "kafka-mcp.local.json"
       }
     }
   }

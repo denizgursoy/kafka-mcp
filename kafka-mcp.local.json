@@ -1,0 +1,5 @@
+{
+  "environment": "local",
+  "broker": "localhost:19092",
+  "output_dir": "/tmp/kafka-mcp-exports"
+}

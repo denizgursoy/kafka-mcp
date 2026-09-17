@@ -137,7 +137,12 @@ max_value_bytes.
 `
 
 // Register adds the search_messages tool to the MCP server.
-func Register(server *mcp.Server, admin *kadm.Client, reader *records.Reader) {
+func Register(
+	server *mcp.Server,
+	admin *kadm.Client,
+	reader *records.Reader,
+	outputDir string,
+) {
 	mcp.AddTool(
 		server,
 		&mcp.Tool{
@@ -150,7 +155,7 @@ func Register(server *mcp.Server, admin *kadm.Client, reader *records.Reader) {
 			input Input,
 		) (*mcp.CallToolResult, Output, error) {
 
-			out, err := Run(ctx, admin, reader, input)
+			out, err := Run(ctx, admin, reader, outputDir, input)
 			if err != nil {
 				return nil, Output{}, fmt.Errorf("search messages: %w", err)
 			}
@@ -165,6 +170,7 @@ func Run(
 	ctx context.Context,
 	admin *kadm.Client,
 	reader *records.Reader,
+	outputDir string,
 	input Input,
 ) (Output, error) {
 
@@ -200,7 +206,7 @@ func Run(
 	var export *exporter
 
 	if options.outputFile != "" {
-		export, err = newExporter(options.outputFile)
+		export, err = newExporter(outputDir, options.outputFile)
 		if err != nil {
 			return Output{}, err
 		}

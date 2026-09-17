@@ -3,11 +3,12 @@ package main
 import (
 	"context"
 	"log"
-	"os"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"github.com/denizgursoy/kafka-mcp/internal/domain/config"
 	"github.com/denizgursoy/kafka-mcp/internal/domain/kafkaclient"
+	"github.com/denizgursoy/kafka-mcp/internal/tools/addpartitions"
 	"github.com/denizgursoy/kafka-mcp/internal/tools/consumerlag"
 	"github.com/denizgursoy/kafka-mcp/internal/tools/describetopic"
 	"github.com/denizgursoy/kafka-mcp/internal/tools/getmessage"
@@ -15,16 +16,16 @@ import (
 	"github.com/denizgursoy/kafka-mcp/internal/tools/listtopics"
 	"github.com/denizgursoy/kafka-mcp/internal/tools/samplemessages"
 	"github.com/denizgursoy/kafka-mcp/internal/tools/searchmessages"
+	"github.com/denizgursoy/kafka-mcp/internal/tools/serverconfig"
 )
 
 func main() {
-	broker := os.Getenv("KAFKA_BROKER")
-
-	if broker == "" {
-		broker = "localhost:9092"
+	cfg, err := config.LoadDefault()
+	if err != nil {
+		log.Fatal(err)
 	}
 
-	kafka, err := kafkaclient.New(broker)
+	kafka, err := kafkaclient.New(cfg)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -46,10 +47,27 @@ func main() {
 	consumerlag.Register(server, kafka.Admin())
 	describetopic.Register(server, kafka.Admin(), kafka.Reader())
 	samplemessages.Register(server, kafka.Admin(), kafka.Reader())
-	searchmessages.Register(server, kafka.Admin(), kafka.Reader())
+	searchmessages.Register(server, kafka.Admin(), kafka.Reader(), cfg.OutputDir)
 	getmessage.Register(server, kafka.Reader())
+	addpartitions.Register(server, kafka, kafka.Reader())
 
-	log.Println("Kafka MCP server started")
+	// server_config reports what this server exposes, and the MCP server
+	// offers no way to read that back, so the names are listed here beside
+	// the registrations they describe.
+	serverconfig.Register(server, kafka, []string{
+		"add_partitions",
+		"consumer_lag",
+		"describe_topic",
+		"get_message",
+		"list_consumer_groups",
+		"list_topics",
+		"sample_messages",
+		"search_messages",
+		"server_config",
+	})
+
+	log.Printf("Kafka MCP server started: brokers %v, read_only %t",
+		cfg.Brokers, cfg.ReadOnly)
 
 	if err := server.Run(
 		context.Background(),
