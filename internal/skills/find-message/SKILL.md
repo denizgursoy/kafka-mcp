@@ -49,40 +49,49 @@ newest messages, so a topic whose format changed over time may hold older
 messages of a different shape. Bear that in mind if a search of older data
 finds nothing.
 
-### 3. Choose the narrowest query
+### 3. Write the narrowest script
 
-**If the identifier is the key**, search the key alone:
+Filtering is a JavaScript expression. In scope are `value` (the parsed JSON
+document, or the raw text when the message is not JSON), `key`, `headers`,
+`partition`, `offset` and `timestamp`. Return true to keep a message.
 
-```json
-{"topic": "orders", "query": "order-123", "search_in": ["key"], "match": "exact"}
+**If the identifier is the key**, compare it exactly:
+
+```js
+return key === 'order-123'
 ```
 
-This matters more than it looks. With the default search over the value, a bare
-id like `123` also matches `"amount": 1123` and `"ts": "...T01:23"`. Those false
-positives fill up `max_matches` and the message actually wanted is never
-reached — a confident wrong answer, not merely a slow one.
+This matters more than it looks. Searching the body for a bare id like `123`
+also matches `"amount": 1123` and `"ts": "...T01:23"`. Those false positives
+fill up `max_matches` and the message actually wanted is never reached — a
+confident wrong answer, not merely a slow one.
 
-**If the user describes a condition rather than an id**, use a `filter`. For
-"event type NEW and amount at least 500":
+**If the user describes a condition**, read the fields directly:
 
-```json
-{"and": [
-  {"field": "eventType", "op": "eq", "value": "NEW"},
-  {"field": "payload.amount", "op": "gte", "value": 500}
-]}
+```js
+return value.eventType === 'NEW' && value.payload.amount >= 500
 ```
 
-Operators: `eq ne gt gte lt lte contains starts_with ends_with regex in exists
-is_null is_not_null is_true is_false`. The last five take no `value`.
+Useful things the script can do that a fixed filter grammar cannot:
 
-Two traps to respect:
+```js
+return value.payload.items.some(function (i) { return i.qty > 100 })
+return value.payload.amount > value.payload.refunded
+return timestamp.getUTCHours() < 6
+return /ORD-\d{4}/.test(value.payload.orderId)
+```
 
-- A missing field never matches. `is_null` needs the field to be present and
-  null; `{"not": {... "is_null"}}` also matches messages lacking the field.
-- `non_json_skipped` counts messages a filter could not apply to. If it is high,
-  the topic is not the JSON you assumed.
+Two traps worth respecting:
 
-`query` and `filter` may be combined, and a message must then satisfy both.
+- A missing field is `undefined`, a field set to null is `null`. Use
+  `=== null` for "present and empty" and `=== undefined` for "absent". They
+  are different states and conflating them hides schema drift.
+- On a topic that is not JSON, `value` is a **string**, so use string methods:
+  `return value.indexOf('ERROR') >= 0`.
+
+Check `script_errors` in the result. A high count means the script is throwing
+on messages it did not expect, which is a broken filter rather than an absence
+of matches.
 
 ### 4. Narrow the range
 
@@ -119,7 +128,17 @@ Never report "not found" from an empty match list alone. Check `complete`:
 Treating an incomplete scan as proof of absence is the main way this
 investigation goes wrong.
 
-### 6. Handle large result sets deliberately
+### 6. Consider parallelism for large scans
+
+`parallelism` splits each partition's offsets between that many readers, so
+even a single-partition topic is scanned concurrently. It is worth setting for
+`count_only`, `output_file` or a full-range search.
+
+It is usually **not** worth it for a narrow newest-first lookup: a sequential
+scan reads the newest chunk and stops, while parallel readers have already read
+the older ranges that sequential scanning would never have touched.
+
+### 7. Handle large result sets deliberately
 
 If the query may match many messages, do not fetch bodies first. Call
 `search_messages` with `count_only: true` to learn how many there are, then
@@ -133,7 +152,7 @@ If the query may match many messages, do not fetch bodies first. Call
 
 Never print thousands of messages into the chat.
 
-### 7. Show the message
+### 8. Show the message
 
 Search results truncate values. Once a match is located, call `get_message`
 with its topic, partition and offset for the full message, and set `context` to

@@ -206,59 +206,71 @@ the key alone is the precise, cheap lookup.
 
 ### `search_messages`
 
-Scans a bounded range of a topic and returns messages matching a text query, a
-structured filter over JSON values, or both. Kafka has no server-side search,
-so this reads messages and filters them client-side; the result reports what
-was covered.
+Scans a bounded range of a topic, filtering messages with a JavaScript
+expression. Kafka has no server-side search, so this reads messages and filters
+them client-side; the result reports what was covered.
 
-| Parameter              | Type     | Required | Meaning                                                             |
-| ---------------------- | -------- | -------- | ------------------------------------------------------------------- |
-| `topic`                | string   | yes      | Topic to search                                                      |
-| `query`                | string   | no\*     | Text to look for                                                     |
-| `filter`               | object   | no\*     | Structured filter over JSON values                                   |
-| `search_in`            | string[] | no       | `value`, `key`, `headers`. Default value and key                     |
-| `match`                | string   | no       | `contains` (default, case-insensitive), `exact`, `regex`             |
-| `partitions`           | int[]    | no       | Restrict to these partitions                                         |
-| `from_offset` / `to_offset` | int | no       | Offset window, end exclusive                                         |
-| `from_timestamp` / `to_timestamp` | string | no | RFC3339 time window                                             |
-| `direction`            | string   | no       | `newest_first` (default) or `oldest_first`                           |
-| `max_matches`          | int      | no       | Stop after this many matches. Default 10                             |
-| `max_messages_scanned` | int      | no       | Read at most this many messages. Default 10000                       |
-| `max_value_bytes`      | int      | no       | Value bytes per match. Default 512                                   |
-| `timeout_seconds`      | int      | no       | Wall-clock limit. Default 30                                         |
-| `count_only`           | bool     | no       | Return counts only, no message bodies                                |
-| `output_file`          | string   | no       | Write every match to this file as JSONL, return the path             |
+| Parameter | Type | Required | Meaning |
+| --------- | ---- | -------- | ------- |
+| `topic` | string | yes | Topic to search |
+| `script` | string | no | JavaScript filter. Omit to match every message |
+| `parallelism` | int | no | Concurrent readers, 1–16. Default 1 |
+| `partitions` | int[] | no | Restrict to these partitions |
+| `from_offset` / `to_offset` | int | no | Offset window, end exclusive |
+| `from_timestamp` / `to_timestamp` | string | no | RFC3339 time window |
+| `direction` | string | no | `newest_first` (default) or `oldest_first` |
+| `max_matches` | int | no | Stop after this many matches. Default 10 |
+| `max_messages_scanned` | int | no | Read at most this many. Default 10000 |
+| `max_value_bytes` | int | no | Value bytes per match. Default 512 |
+| `timeout_seconds` | int | no | Wall-clock limit. Default 30 |
+| `count_only` | bool | no | Return counts only, no message bodies |
+| `output_file` | string | no | Write every match to this file as JSONL |
 
-\* at least one of `query` or `filter` is required. Given both, a message must
-satisfy both.
+#### The script
 
-Searching by key is far more precise when the key is the identifier:
+Return true to keep a message. In scope:
 
-```json
-{"topic": "orders", "query": "order-123", "search_in": ["key"], "match": "exact"}
+| Name | Value |
+| ---- | ----- |
+| `value` | parsed JSON document, or the raw text when the message is not JSON |
+| `key` | string, or `null` when absent |
+| `headers` | object of header name to string |
+| `partition`, `offset` | numbers |
+| `timestamp` | a `Date` |
+
+```js
+return key === 'order-123'
+return value.eventType === 'NEW' && value.payload.amount >= 500
+return value.payload.cancelledAt === null      // present and null
+return value.payload.cancelledAt === undefined // field absent
+return headers['correlation-id'] === 'corr-999'
+return /ORD-\d{4}/.test(value.payload.orderId)
+return value.indexOf('ERROR') >= 0             // non-JSON topic: value is a string
 ```
 
-With the default value search, `123` would also match `"amount": 1123`.
+Searching by key exactly is far more precise than searching the body: `123`
+also appears inside `"amount": 1123`, and those false positives can fill
+`max_matches` and hide the message wanted.
 
-#### Filter grammar
+A script that throws on a message is counted in `script_errors` and the scan
+continues, so a broken script is distinguishable from a genuine absence of
+matches. Scripts run in a sandbox with no filesystem, network or host access,
+and are stopped if they exceed the search timeout. They are **not** bounded by
+memory: something like `'x'.repeat(1e12)` can exhaust the server process.
+Scripts are trusted input; the blast radius is this server, not the cluster.
 
-A node is `{"and":[…]}`, `{"or":[…]}`, `{"not":{…}}`, or a leaf
-`{"field":…, "op":…, "value":…}`.
+#### Parallelism
 
-```json
-{"and": [
-  {"field": "eventType", "op": "eq", "value": "NEW"},
-  {"field": "payload.amount", "op": "gte", "value": 500}
-]}
-```
+`parallelism` splits each partition's offset range between that many readers,
+so a single-partition topic is parallelised too. Partitions are scanned one at
+a time, so the number of connections stays at `parallelism` however many
+partitions the topic has. A partition too small to divide is read by one
+reader.
 
-- **Paths** are dotted, with `items[0]` for an index and `items[*]` for any element
-- **Operators:** `eq ne gt gte lt lte contains starts_with ends_with regex in exists is_null is_not_null is_true is_false`
-- `exists`, `is_null`, `is_not_null`, `is_true`, `is_false` take no `value`
-- A missing field never matches. `is_null` requires the field to be present and
-  null; `{"not": {… "is_null"}}` also matches messages lacking the field
-- `is_true` and `is_false` match only real JSON booleans, never `"true"` or `1`
-- Messages whose value is not JSON are counted in `non_json_skipped`
+It pays off for `count_only`, `output_file` and full scans. A narrow
+newest-first search is usually faster without it, because a sequential scan
+stops after the newest chunk while parallel readers have already read the
+older ranges.
 
 #### Result
 

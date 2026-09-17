@@ -3,12 +3,12 @@ package searchmessages
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"regexp"
 	"sort"
-	"strings"
+	"sync"
 	"time"
+
+	"golang.org/x/sync/errgroup"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/twmb/franz-go/pkg/kadm"
@@ -19,23 +19,21 @@ import (
 
 // Input is the argument set accepted by the search_messages tool.
 type Input struct {
-	Topic         string         `json:"topic" jsonschema:"Topic to search. Matched exactly and case-sensitively."`
-	Query         string         `json:"query,omitempty" jsonschema:"Text to look for, interpreted according to match. Either query or filter is required, and giving both requires a message to satisfy both."`
-	Filter        map[string]any `json:"filter,omitempty" jsonschema:"Optional structured filter over JSON message values. A node is {\"and\":[...]}, {\"or\":[...]}, {\"not\":{...}} or a leaf {\"field\":\"payload.amount\",\"op\":\"gte\",\"value\":500}. Paths are dotted and may index arrays as items[0] or match any element as items[*]. Operators: eq, ne, gt, gte, lt, lte, contains, starts_with, ends_with, regex, in, exists, is_null, is_not_null, is_true, is_false. The last five take no value. Messages whose value is not JSON never match a filter."`
-	SearchIn      []string       `json:"search_in,omitempty" jsonschema:"Optional parts of the message the query searches: value, key, headers. Defaults to value and key. Searching the key alone is far more precise when the key is the identifier, because a bare id also occurs inside unrelated numbers in the value."`
-	Match         string         `json:"match,omitempty" jsonschema:"Optional match mode for query: contains (default, case-insensitive substring), exact (whole field equals the query, case-sensitive), or regex (RE2 pattern)."`
-	Partitions    []int32        `json:"partitions,omitempty" jsonschema:"Optional partitions to restrict the search to. Defaults to every partition. Do not guess a partition from a message key: producers may set the partition explicitly, so the key does not determine it."`
-	FromOffset    *int64         `json:"from_offset,omitempty" jsonschema:"Optional inclusive offset to start scanning from, applied to every searched partition."`
-	ToOffset      *int64         `json:"to_offset,omitempty" jsonschema:"Optional exclusive offset to stop scanning at, applied to every searched partition."`
-	FromTimestamp *time.Time     `json:"from_timestamp,omitempty" jsonschema:"Optional inclusive start time (RFC3339). Resolved to the first offset at or after this time."`
-	ToTimestamp   *time.Time     `json:"to_timestamp,omitempty" jsonschema:"Optional exclusive end time (RFC3339). Resolved to the first offset at or after this time."`
-	Direction     string         `json:"direction,omitempty" jsonschema:"Optional scan direction: newest_first (default) or oldest_first. Decides which matches are found first when max_matches cuts the search short."`
-	MaxMatches    int            `json:"max_matches,omitempty" jsonschema:"Optional maximum number of matches to return. Defaults to 10."`
-	MaxScanned    int            `json:"max_messages_scanned,omitempty" jsonschema:"Optional maximum number of messages to read before giving up. Defaults to 10000."`
-	MaxValueBytes int            `json:"max_value_bytes,omitempty" jsonschema:"Optional maximum value bytes to return per match. Defaults to 512. Longer values are cut and flagged with truncated=true."`
-	TimeoutSecond int            `json:"timeout_seconds,omitempty" jsonschema:"Optional wall-clock limit for the scan in seconds. Defaults to 30."`
-	CountOnly     bool           `json:"count_only,omitempty" jsonschema:"Optional. When true, scan the whole range and return only how many messages matched, with a per-partition breakdown and no message bodies. Use this first when a query may match a great many messages, then ask the user how they want them before fetching any."`
-	OutputFile    string         `json:"output_file,omitempty" jsonschema:"Optional file name to write every match to, as one JSON message per line. Use this instead of returning thousands of messages. A name only, not a path: the server chooses the directory. The response reports the path, the number written and a short preview."`
+	Topic         string     `json:"topic" jsonschema:"Topic to search. Matched exactly and case-sensitively."`
+	Script        string     `json:"script,omitempty" jsonschema:"Optional JavaScript that decides whether a message matches. Return true to keep it. In scope: value (the parsed JSON document, or the raw text when the message is not JSON), key (string or null), headers (object of header name to string), partition, offset and timestamp (a Date). Examples: return key === 'order-123'; return value.eventType === 'NEW' && value.payload.amount >= 500; return value.payload.cancelledAt === null. Omit to match every message."`
+	Parallelism   int        `json:"parallelism,omitempty" jsonschema:"Optional number of concurrent readers, from 1 to 16. Defaults to 1. Each reader takes its own slice of a partition, so a topic with one partition is parallelised too. Worth using for count_only, output_file or a full scan; a narrow newest-first search is usually faster without it, because sequential scanning can stop after the newest chunk."`
+	Partitions    []int32    `json:"partitions,omitempty" jsonschema:"Optional partitions to restrict the search to. Defaults to every partition. Do not guess a partition from a message key: producers may set the partition explicitly, so the key does not determine it."`
+	FromOffset    *int64     `json:"from_offset,omitempty" jsonschema:"Optional inclusive offset to start scanning from, applied to every searched partition."`
+	ToOffset      *int64     `json:"to_offset,omitempty" jsonschema:"Optional exclusive offset to stop scanning at, applied to every searched partition."`
+	FromTimestamp *time.Time `json:"from_timestamp,omitempty" jsonschema:"Optional inclusive start time (RFC3339). Resolved to the first offset at or after this time."`
+	ToTimestamp   *time.Time `json:"to_timestamp,omitempty" jsonschema:"Optional exclusive end time (RFC3339). Resolved to the first offset at or after this time."`
+	Direction     string     `json:"direction,omitempty" jsonschema:"Optional scan direction: newest_first (default) or oldest_first. Decides which matches are found first when max_matches cuts the search short."`
+	MaxMatches    int        `json:"max_matches,omitempty" jsonschema:"Optional maximum number of matches to return. Defaults to 10."`
+	MaxScanned    int        `json:"max_messages_scanned,omitempty" jsonschema:"Optional maximum number of messages to read before giving up. Defaults to 10000."`
+	MaxValueBytes int        `json:"max_value_bytes,omitempty" jsonschema:"Optional maximum value bytes to return per match. Defaults to 512. Longer values are cut and flagged with truncated=true."`
+	TimeoutSecond int        `json:"timeout_seconds,omitempty" jsonschema:"Optional wall-clock limit for the scan in seconds. Defaults to 30."`
+	CountOnly     bool       `json:"count_only,omitempty" jsonschema:"Optional. When true, scan the whole range and return only how many messages matched, with a per-partition breakdown and no message bodies. Use this first when a query may match a great many messages, then ask the user how they want them before fetching any."`
+	OutputFile    string     `json:"output_file,omitempty" jsonschema:"Optional file name to write every match to, as one JSON message per line. Use this instead of returning thousands of messages. A name only, not a path: the server chooses the directory. The response reports the path, the number written and a short preview."`
 }
 
 // ScannedRange reports the offsets actually covered in one partition.
@@ -61,7 +59,7 @@ type Output struct {
 	ScannedRanges   []ScannedRange    `json:"scanned_ranges"`
 	StoppedReason   string            `json:"stopped_reason"`
 	Complete        bool              `json:"complete"`
-	NonJSONSkipped  int               `json:"non_json_skipped,omitempty"`
+	ScriptErrors    int               `json:"script_errors,omitempty"`
 	OutputFile      string            `json:"output_file,omitempty"`
 	WrittenMessages int               `json:"written_messages,omitempty"`
 }
@@ -88,13 +86,38 @@ const (
 )
 
 const description = `
-Search a Kafka topic for messages matching a text query, a structured filter
-over JSON values, or both, and return the matches with their partition, offset,
-timestamp, key, value and headers.
+Search a Kafka topic by running a JavaScript filter over its messages, and
+return the matches with their partition, offset, timestamp, key, value and
+headers.
 
 Kafka cannot search server-side, so this reads messages and filters them
 client-side. Every search is therefore bounded, and the result reports what was
 actually covered: "scanned_messages", "scanned_ranges" and "stopped_reason".
+
+The "script" argument decides what matches. Return true to keep a message:
+
+  return key === 'order-123'
+  return value.eventType === 'NEW' && value.payload.amount >= 500
+  return value.payload.cancelledAt === null
+  return headers['correlation-id'] === 'corr-999'
+  return /ORD-\d{4}/.test(value)
+
+In scope are value, key, headers, partition, offset and timestamp. "value" is
+the parsed JSON document, or the raw text when the message is not JSON, so a
+log topic is searched with ordinary string methods. A missing field is
+undefined while a field set to null is null, so the two can be told apart.
+Omitting the script matches every message, bounded by max_matches.
+
+Prefer the narrowest condition available. When the key identifies the message,
+compare it exactly with "return key === '...'": a bare id such as 123 also
+appears inside unrelated numbers in the value, and those false positives can
+fill max_matches and hide the message actually wanted. Use sample_messages
+first to learn whether the key carries the identifier.
+
+A script that throws on a message is counted in "script_errors" and the scan
+continues, so a broken script is not mistaken for an absence of matches. A
+script is stopped if it exceeds the search timeout, but it is not bounded by
+memory: something like 'x'.repeat(1e12) can exhaust the server process.
 
 "stopped_reason" is one of:
   range_exhausted - the whole requested range was read
@@ -107,24 +130,11 @@ only conclusive when complete is true; otherwise the message may exist outside
 the part that was scanned. Narrow the search with partitions, an offset range
 or a time range and try again.
 
-Prefer the narrowest query available. When the key identifies the message, use
-search_in ["key"] with match "exact": a bare id such as 123 also occurs inside
-unrelated numbers in the value, and those false positives can fill max_matches
-and hide the message actually wanted. Use sample_messages first to learn
-whether the key carries the identifier.
-
-The "filter" argument matches structure rather than text, for example every
-message whose event type is NEW and whose amount is at least 500:
-
-  {"and": [
-    {"field": "eventType", "op": "eq", "value": "NEW"},
-    {"field": "payload.amount", "op": "gte", "value": 500}
-  ]}
-
-A missing field never matches. "is_null" requires the field to be present and
-null, while {"not": {... "is_null"}} also matches messages lacking the field.
-Messages whose value is not JSON are counted in "non_json_skipped", so a zero
-match count over a non-JSON topic is not mistaken for a real answer.
+"parallelism" splits each partition's offsets between that many readers, so a
+topic with a single partition is parallelised too. It is worth setting for
+count_only, output_file or a full scan. A narrow newest-first search is usually
+faster without it, because a sequential scan can stop after the newest chunk
+while parallel readers have already read the older ones.
 
 When a query may match a great many messages, set "count_only" first to learn
 how many there are without fetching any, then ask the user what they want
@@ -187,15 +197,6 @@ func Run(
 	ctx, cancel := context.WithTimeout(ctx, options.timeout)
 	defer cancel()
 
-	// One connection serves every chunk. Opening a client per chunk would cost
-	// a connection per 500 offsets, so a default-sized scan would open twenty.
-	session, err := reader.Session(input.Topic)
-	if err != nil {
-		return Output{}, fmt.Errorf("search %s: %w", input.Topic, err)
-	}
-
-	defer session.Close()
-
 	out := Output{
 		Topic:         input.Topic,
 		Matches:       []records.Message{},
@@ -214,101 +215,35 @@ func Run(
 		defer export.Close()
 	}
 
-	scanned := make(map[int32]*ScannedRange, len(windows))
-	byPartition := make(map[int32]int)
+	state := &scanState{
+		options: options,
+		export:  export,
+		out:     &out,
+		scanned: make(map[int32]*ScannedRange, len(windows)),
+		matches: make(map[int32]int),
+		// Counting and exporting both walk the whole range and keep no
+		// bodies, so the match ceiling does not apply to them.
+		collecting: !options.countOnly && export == nil,
+	}
 
-	// Counting and exporting both walk the whole range and keep no bodies, so
-	// the match ceiling does not apply to them.
-	collecting := !options.countOnly && export == nil
-
-	var exportErr error
-
-	for _, chunk := range chunks(windows, options.newestFirst) {
+	// Partitions are scanned one at a time, with every reader working on the
+	// same partition. That keeps the number of connections at parallelism
+	// regardless of how many partitions the topic has, and it means a
+	// partition is complete before the next begins, so its matches can be
+	// merged without waiting on other partitions.
+	for _, window := range windows {
 		if out.StoppedReason != reasonExhausted {
 			break
 		}
 
-		// Records inside a chunk always arrive oldest first, because Kafka
-		// only reads forward. A newest-first search therefore cannot stop at
-		// the first match in a chunk: that is the chunk's oldest match. It
-		// reads the whole chunk and keeps the newest matches instead, which is
-		// affordable because a chunk is bounded to chunkSize records.
-		found := make([]records.Message, 0, options.maxMatches)
-
-		err := session.Scan(
-			ctx,
-			[]records.Range{chunk},
-			func(record *kgo.Record) bool {
-				out.ScannedMessages++
-
-				track(scanned, record)
-
-				switch options.verdict(record) {
-				case verdictMatch:
-					out.MatchCount++
-					byPartition[record.Partition]++
-
-					switch {
-					case export != nil:
-						if err := export.write(
-							records.Render(record, options.maxValueBytes),
-						); err != nil {
-							exportErr = err
-
-							return false
-						}
-
-					case collecting:
-						found = append(found, records.Render(record, options.maxValueBytes))
-
-						if !options.newestFirst &&
-							len(out.Matches)+len(found) >= options.maxMatches {
-							out.StoppedReason = reasonMaxMatches
-
-							return false
-						}
-					}
-
-				case verdictNonJSON:
-					out.NonJSONSkipped++
-				}
-
-				if out.ScannedMessages >= options.maxScanned {
-					out.StoppedReason = reasonMaxScanned
-
-					return false
-				}
-
-				return true
-			},
-		)
-		if exportErr != nil {
-			return Output{}, exportErr
+		if err := state.scanPartition(ctx, reader, input.Topic, window); err != nil {
+			return Output{}, err
 		}
 
-		if err != nil {
-			// A timeout is a bounded-search outcome, not a failure: the caller
-			// still gets the matches found so far and is told why it stopped.
-			if ctx.Err() != nil {
-				out.StoppedReason = reasonTimeout
-
-				if collecting {
-					out.Matches = append(out.Matches, keep(found, options)...)
-				}
-
-				break
-			}
-
-			return Output{}, fmt.Errorf("search %s: %w", input.Topic, err)
-		}
-
-		if !collecting {
-			continue
-		}
-
-		out.Matches = append(out.Matches, keep(found, options)...)
-
-		if len(out.Matches) >= options.maxMatches {
+		// Stopping here means later partitions go unscanned. That is reported
+		// through stopped_reason and scanned_ranges, so a caller can see the
+		// answer is partial rather than assume the topic was covered.
+		if state.collecting && len(out.Matches) >= options.maxMatches {
 			out.Matches = out.Matches[:options.maxMatches]
 
 			if out.StoppedReason == reasonExhausted {
@@ -326,9 +261,253 @@ func Run(
 		out.WrittenMessages = export.written
 	}
 
-	finish(&out, scanned, byPartition, options)
+	finish(&out, state.scanned, state.matches, options)
 
 	return out, nil
+}
+
+// scanState is everything the readers of one search share.
+type scanState struct {
+	options    *options
+	export     *exporter
+	out        *Output
+	collecting bool
+
+	// mu guards every field below it, because readers run concurrently.
+	mu      sync.Mutex
+	scanned map[int32]*ScannedRange
+	matches map[int32]int
+}
+
+// scanPartition reads one partition, splitting its offset range between the
+// configured number of readers.
+func (s *scanState) scanPartition(
+	ctx context.Context,
+	reader *records.Reader,
+	topic string,
+	window records.Range,
+) error {
+
+	slices := splitRange(window, s.options.parallelism)
+
+	if len(slices) == 1 {
+		return s.scanSlice(ctx, reader, topic, slices[0])
+	}
+
+	group, groupCtx := errgroup.WithContext(ctx)
+
+	for _, slice := range slices {
+		group.Go(func() error {
+			return s.scanSlice(groupCtx, reader, topic, slice)
+		})
+	}
+
+	return group.Wait()
+}
+
+// scanSlice reads one contiguous offset range with a connection and a script
+// of its own, because neither can be shared between goroutines.
+func (s *scanState) scanSlice(
+	ctx context.Context,
+	reader *records.Reader,
+	topic string,
+	slice records.Range,
+) error {
+
+	filter, err := s.options.newScript()
+	if err != nil {
+		return err
+	}
+
+	if filter != nil {
+		defer filter.close()
+	}
+
+	session, err := reader.Session(topic)
+	if err != nil {
+		return fmt.Errorf("search %s: %w", topic, err)
+	}
+
+	defer session.Close()
+
+	for _, chunk := range chunks([]records.Range{slice}, s.options.newestFirst) {
+		if s.stopped() {
+			return nil
+		}
+
+		// Records inside a chunk always arrive oldest first, because Kafka
+		// only reads forward. A newest-first search therefore cannot stop at
+		// the first match in a chunk: that is the chunk's oldest match. It
+		// reads the whole chunk and keeps the newest matches instead, which is
+		// affordable because a chunk is bounded to chunkSize records.
+		found := make([]records.Message, 0, s.options.maxMatches)
+
+		var scanErr error
+
+		err := session.Scan(ctx, []records.Range{chunk}, func(record *kgo.Record) bool {
+			matched, err := s.visit(record, filter, &found)
+			if err != nil {
+				scanErr = err
+
+				return false
+			}
+
+			return matched
+		})
+		if scanErr != nil {
+			return scanErr
+		}
+
+		if err != nil {
+			// A timeout is a bounded-search outcome, not a failure: the caller
+			// still gets the matches found so far and is told why it stopped.
+			if ctx.Err() != nil {
+				s.timedOut(found)
+
+				return nil
+			}
+
+			return fmt.Errorf("search %s: %w", topic, err)
+		}
+
+		s.keep(found)
+	}
+
+	return nil
+}
+
+// visit filters one record and reports whether scanning should continue.
+func (s *scanState) visit(
+	record *kgo.Record,
+	filter *script,
+	found *[]records.Message,
+) (bool, error) {
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.out.ScannedMessages++
+
+	track(s.scanned, record)
+
+	matched := true
+
+	if filter != nil {
+		var err error
+
+		matched, err = filter.match(record)
+		if err != nil {
+			// A script that throws on one message says nothing about the
+			// others, so the message is counted and the scan continues.
+			s.out.ScriptErrors++
+
+			matched = false
+		}
+	}
+
+	if matched {
+		s.out.MatchCount++
+		s.matches[record.Partition]++
+
+		switch {
+		case s.export != nil:
+			if err := s.export.write(
+				records.Render(record, s.options.maxValueBytes),
+			); err != nil {
+				return false, err
+			}
+
+		case s.collecting:
+			*found = append(*found, records.Render(record, s.options.maxValueBytes))
+
+			if !s.options.newestFirst &&
+				len(s.out.Matches)+len(*found) >= s.options.maxMatches {
+				s.out.StoppedReason = reasonMaxMatches
+
+				return false, nil
+			}
+		}
+	}
+
+	if s.out.ScannedMessages >= s.options.maxScanned {
+		s.out.StoppedReason = reasonMaxScanned
+
+		return false, nil
+	}
+
+	return true, nil
+}
+
+func (s *scanState) keep(found []records.Message) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if !s.collecting {
+		return
+	}
+
+	s.out.Matches = append(s.out.Matches, keep(found, s.options)...)
+
+	// Stopping as soon as the limit is met is what keeps a narrow newest-first
+	// search cheap: it reads the newest chunk and goes no further. Without
+	// this the scan would read the whole range to return the same answer.
+	if len(s.out.Matches) >= s.options.maxMatches &&
+		s.out.StoppedReason == reasonExhausted {
+
+		s.out.StoppedReason = reasonMaxMatches
+	}
+}
+
+func (s *scanState) timedOut(found []records.Message) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.out.StoppedReason = reasonTimeout
+
+	if s.collecting {
+		s.out.Matches = append(s.out.Matches, keep(found, s.options)...)
+	}
+}
+
+func (s *scanState) stopped() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.out.StoppedReason != reasonExhausted
+}
+
+// splitRange divides one partition's offsets between readers.
+//
+// A range too small to be worth dividing is left whole: opening several
+// connections to read a handful of messages costs more in setup than the
+// concurrency saves.
+func splitRange(window records.Range, parallelism int) []records.Range {
+	size := window.End - window.Start
+
+	if parallelism <= 1 || size < int64(parallelism)*chunkSize {
+		return []records.Range{window}
+	}
+
+	slices := make([]records.Range, 0, parallelism)
+	per := size / int64(parallelism)
+
+	for i := 0; i < parallelism; i++ {
+		start := window.Start + int64(i)*per
+		end := start + per
+
+		// The last slice takes the remainder, so no offset is left unread.
+		if i == parallelism-1 {
+			end = window.End
+		}
+
+		slices = append(slices, records.Range{
+			Partition: window.Partition,
+			Start:     start,
+			End:       end,
+		})
+	}
+
+	return slices
 }
 
 // keep reduces a chunk's matches to the ones worth returning: the newest when
@@ -438,43 +617,25 @@ type options struct {
 	maxScanned    int
 	maxValueBytes int
 	timeout       time.Duration
+	parallelism   int
 
-	query     string
-	hasQuery  bool
-	lowered   string
-	pattern   *regexp.Regexp
-	exact     bool
-	inValue   bool
-	inKey     bool
-	inHeader  bool
-	filter    *compiledFilter
-	hasFilter bool
+	// source is the user script, empty when every message matches.
+	source string
 }
 
-// verdict is what a scanned record amounted to.
-type verdict int
-
-const (
-	verdictNoMatch verdict = iota
-	verdictMatch
-
-	// verdictNonJSON is a record a filter could not even be applied to,
-	// counted separately so that "no matches" over a non-JSON topic cannot be
-	// mistaken for "no message satisfied the condition".
-	verdictNonJSON
-)
+// maxParallelism bounds how many readers one search may open. Each reader is
+// a separate connection, so an unbounded value would let one call exhaust the
+// broker's connection budget.
+const maxParallelism = 16
 
 func newOptions(input Input) (*options, error) {
 	if input.Topic == "" {
 		return nil, fmt.Errorf("topic is required")
 	}
 
-	hasQuery := input.Query != ""
-	hasFilter := len(input.Filter) > 0
-
-	if !hasQuery && !hasFilter {
+	if input.Parallelism < 0 || input.Parallelism > maxParallelism {
 		return nil, fmt.Errorf(
-			"query or filter is required, because a search with neither would match every message")
+			"parallelism must be between 1 and %d, got %d", maxParallelism, input.Parallelism)
 	}
 
 	if input.CountOnly && input.OutputFile != "" {
@@ -483,33 +644,14 @@ func newOptions(input Input) (*options, error) {
 	}
 
 	o := &options{
-		query:         input.Query,
-		hasQuery:      hasQuery,
-		hasFilter:     hasFilter,
-		lowered:       strings.ToLower(input.Query),
+		source:        input.Script,
 		countOnly:     input.CountOnly,
 		outputFile:    input.OutputFile,
 		maxMatches:    input.MaxMatches,
 		maxScanned:    input.MaxScanned,
 		maxValueBytes: input.MaxValueBytes,
 		timeout:       time.Duration(input.TimeoutSecond) * time.Second,
-	}
-
-	if hasFilter {
-		// The filter arrives as a decoded object so that MCP clients can send
-		// it as JSON rather than as a string. The compiler works on raw JSON,
-		// so encode it back.
-		raw, err := json.Marshal(input.Filter)
-		if err != nil {
-			return nil, fmt.Errorf("filter: %w", err)
-		}
-
-		filter, err := compileFilter(raw)
-		if err != nil {
-			return nil, fmt.Errorf("filter: %w", err)
-		}
-
-		o.filter = filter
+		parallelism:   input.Parallelism,
 	}
 
 	if o.maxMatches <= 0 {
@@ -528,6 +670,10 @@ func newOptions(input Input) (*options, error) {
 		o.timeout = defaultTimeout
 	}
 
+	if o.parallelism <= 0 {
+		o.parallelism = 1
+	}
+
 	switch input.Direction {
 	case "", "newest_first":
 		o.newestFirst = true
@@ -538,106 +684,28 @@ func newOptions(input Input) (*options, error) {
 			"direction must be newest_first or oldest_first, got %q", input.Direction)
 	}
 
-	switch input.Match {
-	case "", "contains":
-	case "exact":
-		o.exact = true
-	case "regex":
-		if !hasQuery {
-			return nil, fmt.Errorf("match regex needs a query")
-		}
-
-		pattern, err := regexp.Compile(input.Query)
+	// Compiling here reports a malformed script before a single message is
+	// read, rather than after a scan that could not have matched anything.
+	if o.source != "" {
+		compiled, err := compileScript(o.source)
 		if err != nil {
-			return nil, fmt.Errorf("query is not a valid regular expression: %w", err)
+			return nil, err
 		}
 
-		o.pattern = pattern
-	default:
-		return nil, fmt.Errorf(
-			"match must be contains, exact or regex, got %q", input.Match)
-	}
-
-	if len(input.SearchIn) == 0 {
-		o.inValue = true
-		o.inKey = true
-
-		return o, nil
-	}
-
-	for _, field := range input.SearchIn {
-		switch strings.ToLower(field) {
-		case "value":
-			o.inValue = true
-		case "key":
-			o.inKey = true
-		case "headers":
-			o.inHeader = true
-		default:
-			return nil, fmt.Errorf(
-				"search_in must contain only value, key or headers, got %q", field)
-		}
+		compiled.close()
 	}
 
 	return o, nil
 }
 
-// verdict decides what one record amounts to. A query and a filter given
-// together must both hold, so a caller can combine a cheap text match with a
-// precise structural one.
-func (o *options) verdict(record *kgo.Record) verdict {
-	if o.hasQuery && !o.matches(record) {
-		return verdictNoMatch
+// newScript builds a script for one reader. Each reader needs its own,
+// because a goja runtime cannot be used from two goroutines at once.
+func (o *options) newScript() (*script, error) {
+	if o.source == "" {
+		return nil, nil
 	}
 
-	if !o.hasFilter {
-		return verdictMatch
-	}
-
-	if !json.Valid(record.Value) {
-		return verdictNonJSON
-	}
-
-	if !o.filter.Match(record.Value) {
-		return verdictNoMatch
-	}
-
-	return verdictMatch
-}
-
-func (o *options) matches(record *kgo.Record) bool {
-	if o.inValue && o.hit(record.Value) {
-		return true
-	}
-
-	if o.inKey && o.hit(record.Key) {
-		return true
-	}
-
-	if o.inHeader {
-		for _, header := range record.Headers {
-			if o.hit([]byte(header.Key)) || o.hit(header.Value) {
-				return true
-			}
-		}
-	}
-
-	return false
-}
-
-func (o *options) hit(field []byte) bool {
-	if len(field) == 0 {
-		return false
-	}
-
-	switch {
-	case o.pattern != nil:
-		return o.pattern.Match(field)
-	case o.exact:
-		return string(field) == o.query
-	default:
-		return strings.Contains(strings.ToLower(string(field)), o.lowered)
-	}
+	return compileScript(o.source)
 }
 
 // resolveWindows turns the requested partitions, offsets and timestamps into

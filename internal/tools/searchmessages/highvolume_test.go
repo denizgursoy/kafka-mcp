@@ -108,8 +108,7 @@ func (s *HighVolumeSuite) TestFindsEveryMatchAcrossAThousandMessages() {
 		"",
 		searchmessages.Input{
 			Topic:      s.topic,
-			Query:      "NEW",
-			SearchIn:   []string{"value"},
+			Script:     `return value.eventType === "NEW"`,
 			MaxMatches: 50,
 		},
 	)
@@ -134,8 +133,7 @@ func (s *HighVolumeSuite) TestNewestFirstStopsAfterTheNewestChunk() {
 		"",
 		searchmessages.Input{
 			Topic:      s.topic,
-			Query:      "NEW",
-			SearchIn:   []string{"value"},
+			Script:     `return value.eventType === "NEW"`,
 			MaxMatches: 2,
 		},
 	)
@@ -162,8 +160,7 @@ func (s *HighVolumeSuite) TestOldestFirstStopsAtTheSecondMatch() {
 		"",
 		searchmessages.Input{
 			Topic:      s.topic,
-			Query:      "NEW",
-			SearchIn:   []string{"value"},
+			Script:     `return value.eventType === "NEW"`,
 			Direction:  "oldest_first",
 			MaxMatches: 2,
 		},
@@ -186,10 +183,8 @@ func (s *HighVolumeSuite) TestMatchExactlyOnTheChunkBoundary() {
 		s.env.Reader(),
 		"",
 		searchmessages.Input{
-			Topic:    s.topic,
-			Query:    "order-500",
-			SearchIn: []string{"key"},
-			Match:    "exact",
+			Topic:  s.topic,
+			Script: `return key === "order-500"`,
 		},
 	)
 
@@ -208,10 +203,8 @@ func (s *HighVolumeSuite) TestExactKeySearchIgnoresSubstringsInValues() {
 		s.env.Reader(),
 		"",
 		searchmessages.Input{
-			Topic:    s.topic,
-			Query:    "order-7",
-			SearchIn: []string{"key"},
-			Match:    "exact",
+			Topic:  s.topic,
+			Script: `return key === "order-7"`,
 		},
 	)
 
@@ -231,8 +224,7 @@ func (s *HighVolumeSuite) TestCountOnlyReportsTotalsWithoutBodies() {
 		"",
 		searchmessages.Input{
 			Topic:     s.topic,
-			Query:     "NEW",
-			SearchIn:  []string{"value"},
+			Script:    `return value.eventType === "NEW"`,
 			CountOnly: true,
 		},
 	)
@@ -257,11 +249,8 @@ func (s *HighVolumeSuite) TestJSONFilterSelectsByFieldValue() {
 		s.env.Reader(),
 		"",
 		searchmessages.Input{
-			Topic: s.topic,
-			Filter: filter(s.T(), `{"and":[
-				{"field":"eventType","op":"eq","value":"NEW"},
-				{"field":"payload.amount","op":"gte","value":500}
-			]}`),
+			Topic:      s.topic,
+			Script:     `return value.eventType === "NEW" && value.payload.amount >= 500`,
 			MaxMatches: 50,
 		},
 	)
@@ -272,8 +261,8 @@ func (s *HighVolumeSuite) TestJSONFilterSelectsByFieldValue() {
 		s.offsets(out.Matches),
 		"the filter must select exactly the planted messages, since only those carry eventType NEW with an amount of 900",
 	)
-	s.Require().Zero(out.NonJSONSkipped,
-		"every message in this topic is JSON, so none may be reported as skipped")
+	s.Require().Zero(out.ScriptErrors,
+		"every message in this topic is JSON, so the script must not have failed on any of them")
 }
 
 func (s *HighVolumeSuite) TestFilterOnNullField() {
@@ -284,7 +273,7 @@ func (s *HighVolumeSuite) TestFilterOnNullField() {
 		"",
 		searchmessages.Input{
 			Topic:      s.topic,
-			Filter:     filter(s.T(), `{"field":"payload.cancelledAt","op":"is_null"}`),
+			Script:     `return value.payload.cancelledAt === null`,
 			MaxMatches: 50,
 		},
 	)
@@ -305,10 +294,7 @@ func (s *HighVolumeSuite) TestQueryAndFilterMustBothHold() {
 		"",
 		searchmessages.Input{
 			Topic:      s.topic,
-			Query:      "order-493",
-			SearchIn:   []string{"key"},
-			Match:      "exact",
-			Filter:     filter(s.T(), `{"field":"payload.amount","op":"gte","value":500}`),
+			Script:     `return key === "order-493" && value.payload.amount >= 500`,
 			MaxMatches: 50,
 		},
 	)
@@ -329,8 +315,7 @@ func (s *HighVolumeSuite) TestScanCeilingReportsAnIncompleteSearch() {
 		"",
 		searchmessages.Input{
 			Topic:      s.topic,
-			Query:      "NEW",
-			SearchIn:   []string{"value"},
+			Script:     `return value.eventType === "NEW"`,
 			MaxScanned: 100,
 			MaxMatches: 50,
 		},
@@ -360,8 +345,7 @@ func (s *HighVolumeSuite) TestWritesEveryMatchToFile() {
 		dir,
 		searchmessages.Input{
 			Topic:      s.topic,
-			Query:      "NEW",
-			SearchIn:   []string{"value"},
+			Script:     `return value.eventType === "NEW"`,
 			OutputFile: "matches.jsonl",
 		},
 	)
@@ -401,7 +385,7 @@ func (s *HighVolumeSuite) TestRejectsWritingOutsideTheOutputDirectory() {
 		dir,
 		searchmessages.Input{
 			Topic:      s.topic,
-			Query:      "NEW",
+			Script:     `return value.eventType === "NEW"`,
 			OutputFile: "../escaped.jsonl",
 		},
 	)
@@ -410,16 +394,109 @@ func (s *HighVolumeSuite) TestRejectsWritingOutsideTheOutputDirectory() {
 		"a file name that escapes the output directory must be refused, because the server must not write wherever a caller asks")
 }
 
-// filter decodes a filter written as JSON in a test into the map the tool
-// accepts, which is the same shape an MCP client sends over the wire.
-func filter(t *testing.T, raw string) map[string]any {
-	t.Helper()
+func (s *HighVolumeSuite) TestParallelScanFindsTheSameMatches() {
+	out, err := searchmessages.Run(
+		s.T().Context(),
+		s.env.Admin(),
+		s.env.Reader(),
+		"",
+		searchmessages.Input{
+			Topic:       s.topic,
+			Script:      `return value.eventType === "NEW"`,
+			MaxMatches:  50,
+			Parallelism: 4,
+		},
+	)
 
-	var decoded map[string]any
+	s.Require().NoError(err, "a parallel search must succeed")
+	s.Require().ElementsMatch(
+		matchOffsets,
+		s.offsets(out.Matches),
+		"splitting a partition between readers must find exactly the same messages as scanning it sequentially, or the result depends on how the work was divided",
+	)
+	s.Require().EqualValues(totalMessages, out.ScannedMessages,
+		"every message must still be read exactly once: a slice boundary that overlapped or left a gap would show up here")
+}
 
-	if err := json.Unmarshal([]byte(raw), &decoded); err != nil {
-		t.Fatalf("test filter is not valid JSON: %v", err)
-	}
+func (s *HighVolumeSuite) TestParallelScanSplitsASinglePartition() {
+	out, err := searchmessages.Run(
+		s.T().Context(),
+		s.env.Admin(),
+		s.env.Reader(),
+		"",
+		searchmessages.Input{
+			Topic:       s.topic,
+			Script:      `return value.eventType === "NEW"`,
+			MaxMatches:  50,
+			Parallelism: 2,
+		},
+	)
 
-	return decoded
+	s.Require().NoError(err, "a parallel search over one partition must succeed")
+	s.Require().Len(out.ScannedRanges, 1,
+		"the topic has a single partition, and the report is per partition however many readers covered it")
+	s.Require().EqualValues(0, out.ScannedRanges[0].Start,
+		"the readers together must cover the partition from its first offset")
+	s.Require().EqualValues(totalMessages, out.ScannedRanges[0].End,
+		"the readers together must cover the partition to its end, which is what proves a single partition really was split")
+}
+
+func (s *HighVolumeSuite) TestParallelCountMatchesSequentialCount() {
+	sequential, err := searchmessages.Run(
+		s.T().Context(),
+		s.env.Admin(),
+		s.env.Reader(),
+		"",
+		searchmessages.Input{
+			Topic:     s.topic,
+			Script:    `return value.payload.amount >= 500`,
+			CountOnly: true,
+		},
+	)
+	s.Require().NoError(err, "the sequential count must succeed")
+
+	parallel, err := searchmessages.Run(
+		s.T().Context(),
+		s.env.Admin(),
+		s.env.Reader(),
+		"",
+		searchmessages.Input{
+			Topic:       s.topic,
+			Script:      `return value.payload.amount >= 500`,
+			CountOnly:   true,
+			Parallelism: 8,
+		},
+	)
+	s.Require().NoError(err, "the parallel count must succeed")
+
+	s.Require().Equal(sequential.MatchCount, parallel.MatchCount,
+		"counting is the case parallelism helps most, and a count that changes with the number of readers would be worthless")
+	s.Require().Equal(sequential.ScannedMessages, parallel.ScannedMessages,
+		"both must read the whole range exactly once")
+}
+
+func (s *HighVolumeSuite) TestSmallPartitionIsNotSplit() {
+	topic := s.env.CreateTopic(s.T(), "high-volume-small")
+
+	s.env.Produce(s.T(), topic,
+		testenv.Message{Value: `{"eventType":"NEW"}`},
+		testenv.Message{Value: `{"eventType":"OTHER"}`},
+	)
+
+	out, err := searchmessages.Run(
+		s.T().Context(),
+		s.env.Admin(),
+		s.env.Reader(),
+		"",
+		searchmessages.Input{
+			Topic:       topic,
+			Script:      `return value.eventType === "NEW"`,
+			Parallelism: 8,
+		},
+	)
+
+	s.Require().NoError(err,
+		"asking for more readers than a tiny partition can use must not fail")
+	s.Require().Len(out.Matches, 1,
+		"the result must be correct regardless of how many readers were requested: eight connections to read two messages costs more than it saves, so the split is skipped")
 }

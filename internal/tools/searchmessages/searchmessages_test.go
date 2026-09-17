@@ -29,6 +29,9 @@ func (s *SearchMessagesSuite) TearDownSuite() {
 	s.env.Stop()
 }
 
+// hitScript matches the messages the fixtures mark with "hit".
+const hitScript = `return value.indexOf("hit") >= 0`
+
 func (s *SearchMessagesSuite) TestFindsMatchInValue() {
 	topic := s.env.CreateTopic(s.T(), "search-value")
 
@@ -43,7 +46,7 @@ func (s *SearchMessagesSuite) TestFindsMatchInValue() {
 		s.env.Admin(),
 		s.env.Reader(),
 		"",
-		searchmessages.Input{Topic: topic, Query: "222"},
+		searchmessages.Input{Topic: topic, Script: `return value.order === "222"`},
 	)
 
 	s.Require().NoError(err, "searching an existing topic must succeed")
@@ -72,7 +75,7 @@ func (s *SearchMessagesSuite) TestMatchesAreCaseInsensitiveByDefault() {
 		s.env.Admin(),
 		s.env.Reader(),
 		"",
-		searchmessages.Input{Topic: topic, Query: "alice"},
+		searchmessages.Input{Topic: topic, Script: `return value.toLowerCase().indexOf("alice") >= 0`},
 	)
 
 	s.Require().NoError(err, "a case-insensitive search must succeed")
@@ -93,7 +96,7 @@ func (s *SearchMessagesSuite) TestSearchesKeyByDefault() {
 		s.env.Admin(),
 		s.env.Reader(),
 		"",
-		searchmessages.Input{Topic: topic, Query: "777"},
+		searchmessages.Input{Topic: topic, Script: `return key.indexOf("777") >= 0`},
 	)
 
 	s.Require().NoError(err, "searching keys must succeed")
@@ -123,9 +126,8 @@ func (s *SearchMessagesSuite) TestSearchInHeadersOnly() {
 		s.env.Reader(),
 		"",
 		searchmessages.Input{
-			Topic:    topic,
-			Query:    "corr-999",
-			SearchIn: []string{"headers"},
+			Topic:  topic,
+			Script: `return headers["correlation-id"] === "corr-999"`,
 		},
 	)
 
@@ -150,10 +152,8 @@ func (s *SearchMessagesSuite) TestExactMatchDoesNotMatchSubstrings() {
 		s.env.Reader(),
 		"",
 		searchmessages.Input{
-			Topic:    topic,
-			Query:    "42",
-			SearchIn: []string{"key"},
-			Match:    "exact",
+			Topic:  topic,
+			Script: `return key === "42"`,
 		},
 	)
 
@@ -178,9 +178,8 @@ func (s *SearchMessagesSuite) TestRegexMatch() {
 		s.env.Reader(),
 		"",
 		searchmessages.Input{
-			Topic: topic,
-			Query: `ORD-\d{4}-\d{3}`,
-			Match: "regex",
+			Topic:  topic,
+			Script: `return /ORD-\d{4}-\d{3}/.test(value)`,
 		},
 	)
 
@@ -189,8 +188,8 @@ func (s *SearchMessagesSuite) TestRegexMatch() {
 		"only the well-formed order id matches the pattern, which is the point of regex matching")
 }
 
-func (s *SearchMessagesSuite) TestInvalidRegexIsAnError() {
-	topic := s.env.CreateTopic(s.T(), "search-bad-regex")
+func (s *SearchMessagesSuite) TestMalformedScriptIsRejectedBeforeScanning() {
+	topic := s.env.CreateTopic(s.T(), "search-bad-script")
 
 	s.env.Produce(s.T(), topic, testenv.Message{Value: "anything"})
 
@@ -199,11 +198,11 @@ func (s *SearchMessagesSuite) TestInvalidRegexIsAnError() {
 		s.env.Admin(),
 		s.env.Reader(),
 		"",
-		searchmessages.Input{Topic: topic, Query: "ORD-[", Match: "regex"},
+		searchmessages.Input{Topic: topic, Script: `return value.order ===`},
 	)
 
 	s.Require().Error(err,
-		"an unparseable regex must be reported immediately, not silently matched against nothing")
+		"a script that does not compile must be refused before any message is read, so the caller fixes it instead of trusting an empty result")
 }
 
 func (s *SearchMessagesSuite) TestNoMatchReturnsEmptyListNotError() {
@@ -216,7 +215,7 @@ func (s *SearchMessagesSuite) TestNoMatchReturnsEmptyListNotError() {
 		s.env.Admin(),
 		s.env.Reader(),
 		"",
-		searchmessages.Input{Topic: topic, Query: "absent-value"},
+		searchmessages.Input{Topic: topic, Script: `return value.indexOf("absent-value") >= 0`},
 	)
 
 	s.Require().NoError(err,
@@ -245,7 +244,7 @@ func (s *SearchMessagesSuite) TestStopsAtMaxMatches() {
 		"",
 		searchmessages.Input{
 			Topic:      topic,
-			Query:      "hit",
+			Script:     hitScript,
 			MaxMatches: 2,
 			Direction:  "oldest_first",
 		},
@@ -272,7 +271,7 @@ func (s *SearchMessagesSuite) TestNewestFirstReturnsMostRecentMatches() {
 		s.env.Admin(),
 		s.env.Reader(),
 		"",
-		searchmessages.Input{Topic: topic, Query: "hit", MaxMatches: 1},
+		searchmessages.Input{Topic: topic, Script: hitScript, MaxMatches: 1},
 	)
 
 	s.Require().NoError(err, "a newest-first search must succeed")
@@ -297,7 +296,7 @@ func (s *SearchMessagesSuite) TestRestrictsToRequestedPartitions() {
 		"",
 		searchmessages.Input{
 			Topic:      topic,
-			Query:      "hit",
+			Script:     hitScript,
 			Partitions: []int32{2},
 		},
 	)
@@ -331,7 +330,7 @@ func (s *SearchMessagesSuite) TestRestrictsToOffsetRange() {
 		"",
 		searchmessages.Input{
 			Topic:      topic,
-			Query:      "hit",
+			Script:     hitScript,
 			FromOffset: &from,
 			ToOffset:   &to,
 			Direction:  "oldest_first",
@@ -367,7 +366,7 @@ func (s *SearchMessagesSuite) TestRestrictsToTimeRange() {
 		"",
 		searchmessages.Input{
 			Topic:         topic,
-			Query:         "hit",
+			Script:        hitScript,
 			FromTimestamp: &from,
 		},
 	)
@@ -392,7 +391,7 @@ func (s *SearchMessagesSuite) TestReportsScannedRange() {
 		s.env.Admin(),
 		s.env.Reader(),
 		"",
-		searchmessages.Input{Topic: topic, Query: "nothing-matches"},
+		searchmessages.Input{Topic: topic, Script: `return value.indexOf("nothing-matches") >= 0`},
 	)
 
 	s.Require().NoError(err, "a search that matches nothing must still report what it scanned")
@@ -410,26 +409,48 @@ func (s *SearchMessagesSuite) TestErrorsOnUnknownTopic() {
 		s.env.Admin(),
 		s.env.Reader(),
 		"",
-		searchmessages.Input{Topic: s.env.UniqueName("missing"), Query: "anything"},
+		searchmessages.Input{Topic: s.env.UniqueName("missing"), Script: `return true`},
 	)
 
 	s.Require().Error(err,
 		"searching a topic that does not exist must fail, not look like a topic with no matches")
 }
 
-func (s *SearchMessagesSuite) TestErrorsOnEmptyQuery() {
-	topic := s.env.CreateTopic(s.T(), "search-empty-query")
+func (s *SearchMessagesSuite) TestOmittingTheScriptMatchesEveryMessage() {
+	topic := s.env.CreateTopic(s.T(), "search-no-script")
+
+	s.env.Produce(s.T(), topic,
+		testenv.Message{Value: "one"},
+		testenv.Message{Value: "two"},
+	)
+
+	out, err := searchmessages.Run(
+		s.T().Context(),
+		s.env.Admin(),
+		s.env.Reader(),
+		"",
+		searchmessages.Input{Topic: topic},
+	)
+
+	s.Require().NoError(err,
+		"a search without a script is how a caller browses recent messages, and max_matches already bounds it")
+	s.Require().Len(out.Matches, 2,
+		"with no condition to apply every message matches")
+}
+
+func (s *SearchMessagesSuite) TestRejectsImpossibleParallelism() {
+	topic := s.env.CreateTopic(s.T(), "search-bad-parallelism")
 
 	_, err := searchmessages.Run(
 		s.T().Context(),
 		s.env.Admin(),
 		s.env.Reader(),
 		"",
-		searchmessages.Input{Topic: topic, Query: ""},
+		searchmessages.Input{Topic: topic, Parallelism: 99},
 	)
 
 	s.Require().Error(err,
-		"an empty query would match every message, so it must be rejected rather than dumping the topic")
+		"each reader is a connection, so an unbounded parallelism would let one search exhaust the broker's connection budget")
 }
 
 func (s *SearchMessagesSuite) TestErrorsWhenBrokerUnreachable() {
@@ -438,7 +459,7 @@ func (s *SearchMessagesSuite) TestErrorsWhenBrokerUnreachable() {
 		s.env.Admin(),
 		records.NewReader("127.0.0.1:1"),
 		"",
-		searchmessages.Input{Topic: "anything", Query: "anything"},
+		searchmessages.Input{Topic: "anything", Script: `return true`},
 	)
 
 	s.Require().Error(err,
