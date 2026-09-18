@@ -361,11 +361,21 @@ is what the tests and local runs use.
 
 ## Conventions
 
-- A tool that changes the cluster must call `kafkaclient.RequireWritable` before
-  the call that mutates, so a read-only server refuses it. Put the check
-  immediately before the mutation, so every other refusal is reported on its
-  own terms. Destructive changes also take a `confirm` parameter and do nothing
-  without it.
+- A tool that changes anything — cluster configuration, consumer offsets, or
+  message data — must call `kafkaclient.RequireWritable` before the call that
+  mutates, so a read-only server refuses it. Put the check immediately before
+  the mutation, so every other refusal is reported on its own terms. A tool
+  whose only purpose is to write refuses outright instead, preview included,
+  because a preview of a capability the server does not have is misleading.
+  Destructive changes also take a `confirm` parameter and do nothing without
+  it.
+- `read_only` is enforced by this server and never delegated to Kafka ACLs.
+  Many clusters have no ACLs at all, so a tool that relies on the broker to
+  refuse it has no protection there. Where ACLs do exist they are a second and
+  stronger barrier, not a replacement.
+- A skill whose purpose is to change something checks `server_config` before
+  walking the user through the steps, so a read-only server fails at the start
+  rather than after the user has already acted.
 - Never commit unless the user explicitly asks.
 - Keep `README.md` current. Any new tool, changed flag, changed environment
   variable or changed startup step must be reflected there in the same change.

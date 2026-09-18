@@ -9,7 +9,9 @@ import (
 	"github.com/denizgursoy/kafka-mcp/internal/domain/config"
 	"github.com/denizgursoy/kafka-mcp/internal/domain/kafkaclient"
 	"github.com/denizgursoy/kafka-mcp/internal/tools/addpartitions"
+	"github.com/denizgursoy/kafka-mcp/internal/tools/commitoffset"
 	"github.com/denizgursoy/kafka-mcp/internal/tools/consumerlag"
+	"github.com/denizgursoy/kafka-mcp/internal/tools/copymessage"
 	"github.com/denizgursoy/kafka-mcp/internal/tools/describetopic"
 	"github.com/denizgursoy/kafka-mcp/internal/tools/getmessage"
 	"github.com/denizgursoy/kafka-mcp/internal/tools/listconsumergroups"
@@ -50,13 +52,17 @@ func main() {
 	searchmessages.Register(server, kafka.Admin(), kafka.Reader(), cfg.OutputDir)
 	getmessage.Register(server, kafka.Reader())
 	addpartitions.Register(server, kafka, kafka.Reader())
+	commitoffset.Register(server, kafka)
+	copymessage.Register(server, kafka, kafka.Reader())
 
 	// server_config reports what this server exposes, and the MCP server
 	// offers no way to read that back, so the names are listed here beside
 	// the registrations they describe.
 	serverconfig.Register(server, kafka, []string{
 		"add_partitions",
+		"commit_offset",
 		"consumer_lag",
+		"copy_message",
 		"describe_topic",
 		"get_message",
 		"list_consumer_groups",

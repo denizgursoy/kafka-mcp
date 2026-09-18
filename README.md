@@ -389,6 +389,45 @@ lose their ordering guarantee. A keyed topic therefore requires
 `acknowledge_key_ordering` as well. Requesting fewer partitions than the topic
 has is refused with an explanation rather than attempted.
 
+### `commit_offset`
+
+Moves a consumer group's committed offset for one partition. Forward to skip
+messages, backward to replay them. **Irreversible** in the sense that skipped
+messages are never processed.
+
+| Parameter | Type | Required | Meaning |
+| --------- | ---- | -------- | ------- |
+| `topic`, `group`, `partition` | | yes | What to move |
+| `offset` | int | yes | The offset the group reads next. To skip offset 42, commit 43 |
+| `confirm` | bool | no | Default false: preview only, nothing changes |
+| `allow_active_members` | bool | no | Proceed despite running consumers |
+
+The group must have no active members. A running consumer keeps its position in
+memory and only reads the committed offset when it joins, so a commit made
+while it runs is overwritten by its next commit and the group does not move.
+Stop the consumers first.
+
+### `copy_message`
+
+Copies one message to another topic, preserving key, value and headers. Takes
+the message's address, never its content, so it can only duplicate a message
+the cluster already holds.
+
+| Parameter | Type | Required | Meaning |
+| --------- | ---- | -------- | ------- |
+| `source_topic`, `source_partition`, `source_offset` | | yes | Message to copy |
+| `destination_topic` | string | yes | Where to write it. Must already exist |
+| `confirm` | bool | no | Default false: preview only, nothing is written |
+
+Every copy carries provenance headers — `kafka-mcp-copied-from-topic`,
+`-from-partition`, `-from-offset`, `-copied-at`, `-copied-by-tool`,
+`-copied-by-principal` — so a message in a dead letter topic can be traced back
+to its original. If the message already carries one of those headers, the
+original is kept and the collision is reported.
+
+This tool is refused entirely on a read-only server, preview included, because
+writing is all it does.
+
 ## Skills
 
 - `internal/skills/find-message` — locating a message from something the user
@@ -397,6 +436,8 @@ has is refused with an explanation rather than attempted.
   a backlog will clear.
 - `internal/skills/scale-partitions` — deciding whether more partitions will
   help, and adding them safely.
+- `internal/skills/skip-poison-message` — unblocking a consumer stuck on a
+  message it cannot process, preserving the message first.
 
 ## Development
 
