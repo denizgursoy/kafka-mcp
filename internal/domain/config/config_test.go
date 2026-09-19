@@ -30,36 +30,51 @@ func (s *ConfigSuite) write(contents string) string {
 	return path
 }
 
-func (s *ConfigSuite) TestLoadsAConfigFile() {
+func (s *ConfigSuite) TestLoadsSeveralClusters() {
 	path := s.write(`{
-		"environment": "staging",
-		"broker": "kafka-1:9093,kafka-2:9093",
-		"read_only": true,
-		"output_dir": "/var/tmp/exports"
+		"http": {"address": ":9000"},
+		"output_dir": "/var/tmp/exports",
+		"clusters": {
+			"prod":    {"broker": "kafka-1:9093,kafka-2:9093", "read_only": true},
+			"preprod": {"broker": "kafka-preprod:9093"}
+		}
 	}`)
 
 	loaded, err := config.Load(path)
 
-	s.Require().NoError(err, "a well-formed config file must load")
+	s.Require().NoError(err, "a well-formed multi-cluster config must load")
+
+	s.Run("every cluster is present", func() {
+		s.Require().Len(loaded.Clusters, 2,
+			"each configured cluster becomes its own endpoint, so losing one would silently make it unreachable")
+		s.Require().Contains(loaded.Clusters, "prod",
+			"a cluster must be addressable by the name it was given in the file")
+		s.Require().Contains(loaded.Clusters, "preprod",
+			"a cluster must be addressable by the name it was given in the file")
+	})
 
 	s.Run("brokers are split into a list", func() {
-		s.Require().Equal([]string{"kafka-1:9093", "kafka-2:9093"}, loaded.Brokers,
+		s.Require().Equal([]string{"kafka-1:9093", "kafka-2:9093"}, loaded.Clusters["prod"].Brokers,
 			"a comma-separated broker list must be split, because franz-go takes seeds individually")
 	})
 
-	s.Run("the environment label is kept", func() {
-		s.Require().Equal("staging", loaded.Environment,
-			"the label is informational, but server_config reports it so an operator can confirm which cluster this is")
+	s.Run("read only is per cluster", func() {
+		s.Require().True(loaded.Clusters["prod"].ReadOnly,
+			"read_only is the only protection on a cluster without ACLs, so it must survive parsing")
+		s.Require().False(loaded.Clusters["preprod"].ReadOnly,
+			"a cluster that did not ask for read_only must stay writable, or a copy destination would be refused for no reason")
 	})
 
-	s.Run("read only is honoured", func() {
-		s.Require().True(loaded.ReadOnly,
-			"read_only is the only protection on a cluster without ACLs, so it must never be lost in parsing")
+	s.Run("the cluster knows its own name", func() {
+		s.Require().Equal("prod", loaded.Clusters["prod"].Name,
+			"the name is reported by list_clusters and server_config, so it must be carried on the cluster rather than only being a map key")
 	})
 
-	s.Run("the output directory is kept", func() {
+	s.Run("server-wide settings are read", func() {
+		s.Require().Equal(":9000", loaded.HTTP.Address,
+			"the listen address decides where clients connect, so a configured value must not be lost")
 		s.Require().Equal("/var/tmp/exports", loaded.OutputDir,
-			"exports must land where the operator chose, not in a default the caller cannot predict")
+			"exports are server-wide and must land where the operator chose")
 	})
 }
 
@@ -72,38 +87,38 @@ func (s *ConfigSuite) TestRequiresAConfigFile() {
 		"the error must name the variable that points at the file, so the operator knows what to set")
 }
 
-func (s *ConfigSuite) TestIgnoresEnvironmentVariablesEntirely() {
-	s.T().Setenv("KAFKA_BROKER", "env-broker:9092")
-	s.T().Setenv("KAFKA_MCP_OUTPUT_DIR", "/env/exports")
-
-	path := s.write(`{"broker": "file-broker:9093", "output_dir": "/file/exports"}`)
-
-	loaded, err := config.Load(path)
-
-	s.Require().NoError(err, "a config file alongside stale environment variables must load")
-
-	s.Run("the broker comes from the file", func() {
-		s.Require().Equal([]string{"file-broker:9093"}, loaded.Brokers,
-			"the file is the only source of configuration, so a leftover environment variable must not redirect the server elsewhere")
-	})
-
-	s.Run("the output directory comes from the file", func() {
-		s.Require().Equal("/file/exports", loaded.OutputDir,
-			"every setting comes from the file, never a mixture of file and environment")
-	})
-}
-
-func (s *ConfigSuite) TestRequiresABroker() {
-	path := s.write(`{"environment": "local"}`)
+func (s *ConfigSuite) TestRequiresAtLeastOneCluster() {
+	path := s.write(`{"clusters": {}}`)
 
 	_, err := config.Load(path)
 
 	s.Require().Error(err,
-		"a config file that names no broker cannot be used, and guessing a default would connect somewhere the operator did not choose")
+		"a server with no clusters serves no endpoints at all, which is a configuration mistake rather than a valid deployment")
+}
+
+func (s *ConfigSuite) TestRequiresABrokerPerCluster() {
+	path := s.write(`{"clusters": {"prod": {"read_only": true}}}`)
+
+	_, err := config.Load(path)
+
+	s.Require().Error(err,
+		"a cluster that names no broker cannot be connected to, and guessing a default would reach somewhere the operator did not choose")
+	s.Require().Contains(err.Error(), "prod",
+		"the error must name the offending cluster, or an operator with several has to guess which one is wrong")
+}
+
+func (s *ConfigSuite) TestDefaultsTheListenAddress() {
+	path := s.write(`{"clusters": {"local": {"broker": "localhost:19092"}}}`)
+
+	loaded, err := config.Load(path)
+
+	s.Require().NoError(err, "omitting the http block must be allowed")
+	s.Require().NotEmpty(loaded.HTTP.Address,
+		"the server must listen somewhere, and a default address means a minimal config still runs")
 }
 
 func (s *ConfigSuite) TestOutputDirectoryFallsBackToTheTempDirectory() {
-	path := s.write(`{"broker": "localhost:19092"}`)
+	path := s.write(`{"clusters": {"local": {"broker": "localhost:19092"}}}`)
 
 	loaded, err := config.Load(path)
 
@@ -112,29 +127,38 @@ func (s *ConfigSuite) TestOutputDirectoryFallsBackToTheTempDirectory() {
 		"exports still need somewhere to go, and the temp directory is a safe default that needs no configuration")
 }
 
-func (s *ConfigSuite) TestResolvesPasswordFromTheEnvironment() {
-	s.T().Setenv("KAFKA_PASSWORD", "s3cret")
+func (s *ConfigSuite) TestResolvesPasswordPerCluster() {
+	s.T().Setenv("PROD_PASSWORD", "prod-secret")
 
 	path := s.write(`{
-		"broker": "kafka:9093",
-		"sasl": {"mechanism": "scram-sha-256", "user": "ali", "password": "{env:KAFKA_PASSWORD}"}
+		"clusters": {
+			"prod": {
+				"broker": "kafka:9093",
+				"sasl": {"mechanism": "scram-sha-256", "user": "ali", "password": "{env:PROD_PASSWORD}"}
+			},
+			"local": {"broker": "localhost:19092"}
+		}
 	}`)
 
 	loaded, err := config.Load(path)
 
 	s.Require().NoError(err, "interpolating a password from the environment must succeed")
-	s.Require().Equal("s3cret", loaded.SASL.Password,
+	s.Require().Equal("prod-secret", loaded.Clusters["prod"].SASL.Password,
 		"the placeholder must be replaced with the real secret, which is what keeps it out of the file")
-	s.Require().Equal("ali", loaded.SASL.User,
-		"the principal must survive parsing, because Kafka ACLs are enforced against it")
+	s.Require().Nil(loaded.Clusters["local"].SASL,
+		"a cluster without authentication must stay unauthenticated, not inherit another cluster's identity")
 }
 
 func (s *ConfigSuite) TestErrorsWhenTheInterpolatedVariableIsMissing() {
-	s.T().Setenv("KAFKA_PASSWORD", "")
+	s.T().Setenv("PROD_PASSWORD", "")
 
 	path := s.write(`{
-		"broker": "kafka:9093",
-		"sasl": {"mechanism": "plain", "user": "ali", "password": "{env:KAFKA_PASSWORD}"}
+		"clusters": {
+			"prod": {
+				"broker": "kafka:9093",
+				"sasl": {"mechanism": "plain", "user": "ali", "password": "{env:PROD_PASSWORD}"}
+			}
+		}
 	}`)
 
 	_, err := config.Load(path)
@@ -150,19 +174,23 @@ func (s *ConfigSuite) TestReadsPasswordFromAFile() {
 		"the secret fixture must be written")
 
 	path := s.write(`{
-		"broker": "kafka:9093",
-		"sasl": {"mechanism": "plain", "user": "ali", "password_file": "` + secret + `"}
+		"clusters": {
+			"prod": {
+				"broker": "kafka:9093",
+				"sasl": {"mechanism": "plain", "user": "ali", "password_file": "` + secret + `"}
+			}
+		}
 	}`)
 
 	loaded, err := config.Load(path)
 
 	s.Require().NoError(err, "reading a password from a file must succeed")
-	s.Require().Equal("file-secret", loaded.SASL.Password,
+	s.Require().Equal("file-secret", loaded.Clusters["prod"].SASL.Password,
 		"the trailing newline must be trimmed, because mounted secret files almost always carry one and Kafka would reject the password")
 }
 
 func (s *ConfigSuite) TestRejectsUnknownKeys() {
-	path := s.write(`{"broker": "kafka:9093", "readonly": true}`)
+	path := s.write(`{"clusters": {"prod": {"broker": "kafka:9093", "readonly": true}}}`)
 
 	_, err := config.Load(path)
 
@@ -171,7 +199,7 @@ func (s *ConfigSuite) TestRejectsUnknownKeys() {
 }
 
 func (s *ConfigSuite) TestRejectsMalformedJSON() {
-	path := s.write(`{"broker": `)
+	path := s.write(`{"clusters": `)
 
 	_, err := config.Load(path)
 
@@ -188,8 +216,9 @@ func (s *ConfigSuite) TestErrorsWhenTheFileIsMissing() {
 
 func (s *ConfigSuite) TestRejectsAnUnknownSASLMechanism() {
 	path := s.write(`{
-		"broker": "kafka:9093",
-		"sasl": {"mechanism": "kerberos", "user": "ali", "password": "x"}
+		"clusters": {
+			"prod": {"broker": "kafka:9093", "sasl": {"mechanism": "kerberos", "user": "ali", "password": "x"}}
+		}
 	}`)
 
 	_, err := config.Load(path)
@@ -199,7 +228,9 @@ func (s *ConfigSuite) TestRejectsAnUnknownSASLMechanism() {
 }
 
 func (s *ConfigSuite) TestRejectsSASLWithoutCredentials() {
-	path := s.write(`{"broker": "kafka:9093", "sasl": {"mechanism": "plain"}}`)
+	path := s.write(`{
+		"clusters": {"prod": {"broker": "kafka:9093", "sasl": {"mechanism": "plain"}}}
+	}`)
 
 	_, err := config.Load(path)
 
@@ -207,13 +238,18 @@ func (s *ConfigSuite) TestRejectsSASLWithoutCredentials() {
 		"a mechanism without credentials must fail: connecting anonymously instead would silently drop the identity that ACLs are enforced against")
 }
 
-func (s *ConfigSuite) TestAcceptsAConfigWithoutSASL() {
-	path := s.write(`{"broker": "localhost:19092", "environment": "local"}`)
+func (s *ConfigSuite) TestSortsClusterNames() {
+	path := s.write(`{
+		"clusters": {
+			"preprod": {"broker": "b:9092"},
+			"local":   {"broker": "c:9092"},
+			"prod":    {"broker": "a:9092"}
+		}
+	}`)
 
 	loaded, err := config.Load(path)
 
-	s.Require().NoError(err,
-		"a cluster without authentication is normal in development and must not require SASL settings")
-	s.Require().Nil(loaded.SASL,
-		"no SASL configuration must mean no SASL, not an empty mechanism that changes how the client connects")
+	s.Require().NoError(err, "the config must load")
+	s.Require().Equal([]string{"local", "preprod", "prod"}, loaded.ClusterNames(),
+		"cluster names must be sorted, because Go map order is random and list_clusters would otherwise return a different order every call")
 }

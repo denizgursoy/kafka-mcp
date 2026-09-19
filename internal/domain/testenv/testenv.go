@@ -72,6 +72,8 @@ type Environment struct {
 	client  *kgo.Client
 	admin   *kadm.Client
 
+	skipConsole bool
+
 	mu     sync.Mutex
 	topics []string
 	groups []string
@@ -91,6 +93,12 @@ type Environment struct {
 func Start(t *testing.T) *Environment {
 	t.Helper()
 
+	return start(t)
+}
+
+func start(t *testing.T, options ...startOption) *Environment {
+	t.Helper()
+
 	if testing.Short() {
 		t.Skip("skipping container test in short mode")
 	}
@@ -101,6 +109,10 @@ func Start(t *testing.T) *Environment {
 	defer cancel()
 
 	env := &Environment{t: t}
+
+	for _, option := range options {
+		option(env)
+	}
 
 	if err := env.start(ctx); err != nil {
 		t.Logf("test environment did not start: %v", err)
@@ -113,6 +125,31 @@ func Start(t *testing.T) *Environment {
 	env.logConnectionDetails()
 
 	return env
+}
+
+// StartPair brings up two independent Redpanda brokers, so a test can prove
+// that something genuinely crosses a cluster boundary rather than merely
+// moving between two topics of one broker.
+//
+// Only the first environment runs a Console: it exists for a human watching a
+// suite, and a second one would double the startup cost for no benefit.
+func StartPair(t *testing.T) (*Environment, *Environment) {
+	t.Helper()
+
+	first := Start(t)
+
+	second := start(t, withoutConsole)
+
+	return first, second
+}
+
+// startOption varies what an environment brings up.
+type startOption func(*Environment)
+
+// withoutConsole skips the Console container, which is only useful to a human
+// and costs startup time a second broker does not need.
+func withoutConsole(e *Environment) {
+	e.skipConsole = true
 }
 
 func (e *Environment) start(ctx context.Context) error {
@@ -148,8 +185,10 @@ func (e *Environment) start(ctx context.Context) error {
 		return fmt.Errorf("resolve admin api address: %w", err)
 	}
 
-	if err := e.startConsole(ctx); err != nil {
-		return err
+	if !e.skipConsole {
+		if err := e.startConsole(ctx); err != nil {
+			return err
+		}
 	}
 
 	// kadm.ListTopics answers unfiltered listings from franz-go's metadata
@@ -213,6 +252,13 @@ func (e *Environment) startConsole(ctx context.Context) error {
 
 func (e *Environment) logConnectionDetails() {
 	e.t.Helper()
+
+	if e.skipConsole {
+		e.t.Logf("test environment ready: kafka broker %s, schema registry %s, admin api %s",
+			e.seed, e.schemaRegistry, e.adminAPI)
+
+		return
+	}
 
 	e.t.Logf(
 		"test environment ready: kafka broker %s, schema registry %s, admin api %s, console %s",

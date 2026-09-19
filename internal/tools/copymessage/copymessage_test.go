@@ -16,7 +16,8 @@ import (
 type CopyMessageSuite struct {
 	suite.Suite
 
-	env *testenv.Environment
+	env   *testenv.Environment
+	other *testenv.Environment
 }
 
 func TestCopyMessageSuite(t *testing.T) {
@@ -24,34 +25,47 @@ func TestCopyMessageSuite(t *testing.T) {
 }
 
 func (s *CopyMessageSuite) SetupSuite() {
-	s.env = testenv.Start(s.T())
+	// Two real brokers, so a cross-cluster copy is proven to cross a cluster
+	// boundary rather than merely moving between two topics of one broker.
+	s.env, s.other = testenv.StartPair(s.T())
 }
 
 func (s *CopyMessageSuite) TearDownSuite() {
+	s.other.Stop()
 	s.env.Stop()
 }
 
-func (s *CopyMessageSuite) client(readOnly bool) *kafkaclient.Client {
+// clusters builds a registry holding this suite's two brokers. The names are
+// the ones a caller would use as destination_cluster.
+func (s *CopyMessageSuite) clusters(readOnly bool, otherReadOnly bool) *kafkaclient.Registry {
 	s.T().Helper()
 
-	client, err := kafkaclient.New(&config.Config{
-		Environment: "test",
-		Brokers:     []string{s.env.Broker()},
-		ReadOnly:    readOnly,
+	registry, err := kafkaclient.NewRegistry(&config.Config{
+		Clusters: map[string]*config.Cluster{
+			"here":  {Name: "here", Brokers: []string{s.env.Broker()}, ReadOnly: readOnly},
+			"there": {Name: "there", Brokers: []string{s.other.Broker()}, ReadOnly: otherReadOnly},
+		},
 	})
-	s.Require().NoError(err, "connecting to the test broker must succeed")
+	s.Require().NoError(err, "building the registry must succeed")
 
-	s.T().Cleanup(client.Close)
+	s.T().Cleanup(registry.Close)
 
-	return client
+	return registry
+}
+
+// client is the local cluster only, for the cases that do not cross.
+func (s *CopyMessageSuite) client(readOnly bool) *kafkaclient.Registry {
+	s.T().Helper()
+
+	return s.clusters(readOnly, false)
 }
 
 // endOffset reads a topic's end offset straight from the broker, so a test can
 // prove whether anything was actually written.
-func (s *CopyMessageSuite) endOffset(topic string) int64 {
+func (s *CopyMessageSuite) endOffsetOn(env *testenv.Environment, topic string) int64 {
 	s.T().Helper()
 
-	ends, err := s.env.Admin().ListEndOffsets(s.T().Context(), topic)
+	ends, err := env.Admin().ListEndOffsets(s.T().Context(), topic)
 	s.Require().NoError(err, "reading the end offset must succeed")
 
 	end, ok := ends.Lookup(topic, 0)
@@ -60,8 +74,18 @@ func (s *CopyMessageSuite) endOffset(topic string) int64 {
 	return end.Offset
 }
 
+func (s *CopyMessageSuite) endOffset(topic string) int64 {
+	s.T().Helper()
+
+	return s.endOffsetOn(s.env, topic)
+}
+
 // read returns the message at an offset of a topic.
-func (s *CopyMessageSuite) read(topic string, offset int64) (string, string, map[string]string) {
+func (s *CopyMessageSuite) readOn(
+	env *testenv.Environment,
+	topic string,
+	offset int64,
+) (string, string, map[string]string) {
 	s.T().Helper()
 
 	var (
@@ -70,7 +94,7 @@ func (s *CopyMessageSuite) read(topic string, offset int64) (string, string, map
 		headers = map[string]string{}
 	)
 
-	err := s.env.Reader().Scan(
+	err := env.Reader().Scan(
 		s.T().Context(),
 		topic,
 		[]records.Range{{Partition: 0, Start: offset, End: offset + 1}},
@@ -90,6 +114,12 @@ func (s *CopyMessageSuite) read(topic string, offset int64) (string, string, map
 	return key, value, headers
 }
 
+func (s *CopyMessageSuite) read(topic string, offset int64) (string, string, map[string]string) {
+	s.T().Helper()
+
+	return s.readOn(s.env, topic, offset)
+}
+
 func (s *CopyMessageSuite) TestCopiesTheMessageIntact() {
 	source := s.env.CreateTopic(s.T(), "copy-source")
 	destination := s.env.CreateTopic(s.T(), "copy-destination")
@@ -103,7 +133,7 @@ func (s *CopyMessageSuite) TestCopiesTheMessageIntact() {
 	out, err := copymessage.Run(
 		s.T().Context(),
 		s.client(false),
-		s.env.Reader(),
+		"here",
 		copymessage.Input{
 			SourceTopic:      source,
 			SourcePartition:  0,
@@ -146,7 +176,7 @@ func (s *CopyMessageSuite) TestAddsProvenanceHeaders() {
 	_, err := copymessage.Run(
 		s.T().Context(),
 		s.client(false),
-		s.env.Reader(),
+		"here",
 		copymessage.Input{
 			SourceTopic:      source,
 			SourcePartition:  0,
@@ -191,7 +221,7 @@ func (s *CopyMessageSuite) TestOriginalHeadersWinOnCollision() {
 	out, err := copymessage.Run(
 		s.T().Context(),
 		s.client(false),
-		s.env.Reader(),
+		"here",
 		copymessage.Input{
 			SourceTopic:      source,
 			SourcePartition:  0,
@@ -220,7 +250,7 @@ func (s *CopyMessageSuite) TestDryRunWritesNothing() {
 	out, err := copymessage.Run(
 		s.T().Context(),
 		s.client(false),
-		s.env.Reader(),
+		"here",
 		copymessage.Input{
 			SourceTopic:      source,
 			SourcePartition:  0,
@@ -247,7 +277,7 @@ func (s *CopyMessageSuite) TestReadOnlyRefusesEvenADryRun() {
 	_, err := copymessage.Run(
 		s.T().Context(),
 		s.client(true),
-		s.env.Reader(),
+		"here",
 		copymessage.Input{
 			SourceTopic:      source,
 			SourcePartition:  0,
@@ -272,7 +302,7 @@ func (s *CopyMessageSuite) TestErrorsWhenTheDestinationDoesNotExist() {
 	_, err := copymessage.Run(
 		s.T().Context(),
 		s.client(false),
-		s.env.Reader(),
+		"here",
 		copymessage.Input{
 			SourceTopic:      source,
 			SourcePartition:  0,
@@ -295,7 +325,7 @@ func (s *CopyMessageSuite) TestErrorsWhenTheSourceOffsetDoesNotExist() {
 	_, err := copymessage.Run(
 		s.T().Context(),
 		s.client(false),
-		s.env.Reader(),
+		"here",
 		copymessage.Input{
 			SourceTopic:      source,
 			SourcePartition:  0,
@@ -319,7 +349,7 @@ func (s *CopyMessageSuite) TestErrorsWhenSourceAndDestinationAreTheSame() {
 	_, err := copymessage.Run(
 		s.T().Context(),
 		s.client(false),
-		s.env.Reader(),
+		"here",
 		copymessage.Input{
 			SourceTopic:      source,
 			SourcePartition:  0,
@@ -331,4 +361,133 @@ func (s *CopyMessageSuite) TestErrorsWhenSourceAndDestinationAreTheSame() {
 
 	s.Require().Error(err,
 		"copying a topic onto itself appends a duplicate to the topic being debugged, which is never what the caller meant")
+}
+
+func (s *CopyMessageSuite) TestCopiesToAnotherCluster() {
+	source := s.env.CreateTopic(s.T(), "cross-source")
+	destination := s.other.CreateTopic(s.T(), "cross-destination")
+
+	s.env.Produce(s.T(), source, testenv.Message{
+		Key:     "order-42",
+		Value:   `{"id":42}`,
+		Headers: map[string]string{"correlation-id": "corr-42"},
+	})
+
+	out, err := copymessage.Run(
+		s.T().Context(),
+		s.clusters(false, false),
+		"here",
+		copymessage.Input{
+			SourceTopic:        source,
+			SourcePartition:    0,
+			SourceOffset:       0,
+			DestinationTopic:   destination,
+			DestinationCluster: "there",
+			Confirm:            true,
+		},
+	)
+
+	s.Require().NoError(err, "copying to another cluster must succeed")
+	s.Require().True(out.Applied, "a copy that happened must be reported as applied")
+
+	key, value, headers := s.readOn(s.other, destination, 0)
+
+	s.Run("the message arrives on the other cluster", func() {
+		s.Require().Equal("order-42", key,
+			"the key must survive a cross-cluster copy, or the message is not the same message")
+		s.Require().Equal(`{"id":42}`, value,
+			"the value is the whole reason for copying, and must arrive byte for byte on the other cluster")
+		s.Require().Equal("corr-42", headers["correlation-id"],
+			"original headers must cross too, since they carry the correlation ids that make a message traceable")
+	})
+
+	s.Run("the source cluster is recorded", func() {
+		s.Require().Equal("here", headers["kafka-mcp-copied-from-cluster"],
+			"once two clusters are in play, the source topic alone is ambiguous: a message in preprod must say it came from prod")
+	})
+
+	s.Run("nothing was written to the source cluster", func() {
+		s.Require().Equal(int64(1), s.endOffsetOn(s.env, source),
+			"a copy must not append to the cluster it read from, which would duplicate the message being investigated")
+	})
+}
+
+func (s *CopyMessageSuite) TestRefusesAReadOnlyDestinationCluster() {
+	source := s.env.CreateTopic(s.T(), "cross-ro-source")
+	destination := s.other.CreateTopic(s.T(), "cross-ro-destination")
+
+	s.env.Produce(s.T(), source, testenv.Message{Value: "payload"})
+
+	_, err := copymessage.Run(
+		s.T().Context(),
+		s.clusters(false, true),
+		"here",
+		copymessage.Input{
+			SourceTopic:        source,
+			SourcePartition:    0,
+			SourceOffset:       0,
+			DestinationTopic:   destination,
+			DestinationCluster: "there",
+			Confirm:            true,
+		},
+	)
+
+	s.Require().Error(err,
+		"read_only protects the cluster being written to, so a read-only destination must refuse the copy")
+	s.Require().Contains(err.Error(), "read-only",
+		"the error must name the reason, so the operator looks at that cluster's configuration")
+	s.Require().Zero(s.endOffsetOn(s.other, destination),
+		"nothing may have been written to the read-only cluster")
+}
+
+func (s *CopyMessageSuite) TestAllowsAReadOnlySourceCluster() {
+	source := s.env.CreateTopic(s.T(), "cross-ro-src-source")
+	destination := s.other.CreateTopic(s.T(), "cross-ro-src-destination")
+
+	s.env.Produce(s.T(), source, testenv.Message{Value: "payload"})
+
+	out, err := copymessage.Run(
+		s.T().Context(),
+		s.clusters(true, false),
+		"here",
+		copymessage.Input{
+			SourceTopic:        source,
+			SourcePartition:    0,
+			SourceOffset:       0,
+			DestinationTopic:   destination,
+			DestinationCluster: "there",
+			Confirm:            true,
+		},
+	)
+
+	s.Require().NoError(err,
+		"copying out of a read-only cluster changes nothing there, so it must be allowed: this is how a message is rescued from production")
+	s.Require().True(out.Applied, "the copy must have happened")
+	s.Require().Equal(int64(1), s.endOffsetOn(s.other, destination),
+		"the message must have arrived on the writable cluster")
+}
+
+func (s *CopyMessageSuite) TestErrorsOnAnUnknownDestinationCluster() {
+	source := s.env.CreateTopic(s.T(), "cross-unknown-source")
+
+	s.env.Produce(s.T(), source, testenv.Message{Value: "payload"})
+
+	_, err := copymessage.Run(
+		s.T().Context(),
+		s.clusters(false, false),
+		"here",
+		copymessage.Input{
+			SourceTopic:        source,
+			SourcePartition:    0,
+			SourceOffset:       0,
+			DestinationTopic:   "anything",
+			DestinationCluster: "never-configured",
+			Confirm:            true,
+		},
+	)
+
+	s.Require().Error(err,
+		"a destination cluster that does not exist must fail by name, so the caller can correct it from list_clusters rather than guess")
+	s.Require().Contains(err.Error(), "never-configured",
+		"the error must quote the unknown name, since a typo is the likeliest cause")
 }
