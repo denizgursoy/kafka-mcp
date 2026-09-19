@@ -19,6 +19,7 @@ import (
 // Provenance headers added to every copy, so a message that turns up in
 // another topic can explain how it got there.
 const (
+	headerFromCluster   = "kafka-mcp-copied-from-cluster"
 	headerFromTopic     = "kafka-mcp-copied-from-topic"
 	headerFromPartition = "kafka-mcp-copied-from-partition"
 	headerFromOffset    = "kafka-mcp-copied-from-offset"
@@ -36,27 +37,30 @@ const (
 // can only duplicate something the cluster already holds. It has no way to
 // write a message that no producer sent.
 type Input struct {
-	SourceTopic      string `json:"source_topic" jsonschema:"Topic holding the message to copy. Matched exactly and case-sensitively."`
-	SourcePartition  int32  `json:"source_partition" jsonschema:"Partition holding the message to copy."`
-	SourceOffset     int64  `json:"source_offset" jsonschema:"Exact offset of the message to copy."`
-	DestinationTopic string `json:"destination_topic" jsonschema:"Topic to write the copy to. It must already exist, and must be different from the source topic."`
-	Confirm          bool   `json:"confirm,omitempty" jsonschema:"Optional. When false or omitted, nothing is written and the response shows the message that would be copied. Must be true to actually write it."`
-	MaxValueBytes    int    `json:"max_value_bytes,omitempty" jsonschema:"Optional maximum number of value bytes to show in the response. Defaults to 4096. This affects the preview only: the copy always carries the whole value."`
+	SourceTopic        string `json:"source_topic" jsonschema:"Topic holding the message to copy. Matched exactly and case-sensitively."`
+	SourcePartition    int32  `json:"source_partition" jsonschema:"Partition holding the message to copy."`
+	SourceOffset       int64  `json:"source_offset" jsonschema:"Exact offset of the message to copy."`
+	DestinationTopic   string `json:"destination_topic" jsonschema:"Topic to write the copy to. It must already exist. It must differ from the source topic when both are on the same cluster."`
+	DestinationCluster string `json:"destination_cluster,omitempty" jsonschema:"Optional cluster to write the copy to. Defaults to the cluster this endpoint serves. Use list_clusters to see which names are valid. The destination cluster must not be read-only; the source may be."`
+	Confirm            bool   `json:"confirm,omitempty" jsonschema:"Optional. When false or omitted, nothing is written and the response shows the message that would be copied. Must be true to actually write it."`
+	MaxValueBytes      int    `json:"max_value_bytes,omitempty" jsonschema:"Optional maximum number of value bytes to show in the response. Defaults to 4096. This affects the preview only: the copy always carries the whole value."`
 }
 
 // Output is the result returned by the copy_message tool.
 type Output struct {
-	SourceTopic       string          `json:"source_topic"`
-	SourcePartition   int32           `json:"source_partition"`
-	SourceOffset      int64           `json:"source_offset"`
-	DestinationTopic  string          `json:"destination_topic"`
-	Message           records.Message `json:"message"`
-	Applied           bool            `json:"applied"`
-	WrittenPartition  int32           `json:"written_partition,omitempty"`
-	WrittenOffset     int64           `json:"written_offset,omitempty"`
-	ProvenanceHeaders []string        `json:"provenance_headers,omitempty"`
-	Warnings          []string        `json:"warnings,omitempty"`
-	Note              string          `json:"note,omitempty"`
+	SourceCluster      string          `json:"source_cluster"`
+	DestinationCluster string          `json:"destination_cluster"`
+	SourceTopic        string          `json:"source_topic"`
+	SourcePartition    int32           `json:"source_partition"`
+	SourceOffset       int64           `json:"source_offset"`
+	DestinationTopic   string          `json:"destination_topic"`
+	Message            records.Message `json:"message"`
+	Applied            bool            `json:"applied"`
+	WrittenPartition   int32           `json:"written_partition,omitempty"`
+	WrittenOffset      int64           `json:"written_offset,omitempty"`
+	ProvenanceHeaders  []string        `json:"provenance_headers,omitempty"`
+	Warnings           []string        `json:"warnings,omitempty"`
+	Note               string          `json:"note,omitempty"`
 }
 
 const description = `
@@ -70,8 +74,17 @@ another to reproduce a problem.
 The message is named by topic, partition and offset. There is no way to supply
 content, so this tool can only duplicate a message the cluster already holds.
 
-Every copy carries provenance headers recording the topic, partition and offset
-it came from, when it was copied, by which tool, and the principal this server
+Set "destination_cluster" to copy to another cluster this server serves, which
+is how a message is taken from production into a preproduction topic to be
+debugged safely. Omit it to copy within the cluster this endpoint serves. Use
+list_clusters to see which names are valid.
+
+read_only protects the cluster being written to. A read-only cluster can be
+the source of a copy, because copying out of it changes nothing; it cannot be
+the destination.
+
+Every copy carries provenance headers recording the cluster, topic, partition
+and offset it came from, when it was copied, by which tool, and the principal this server
 connects as. A copy is therefore traceable back to its original, which is what
 keeps a dead letter topic from becoming a pile of messages nobody can explain.
 If the original already carries one of those headers, the original is kept and
@@ -90,7 +103,11 @@ Producing needs write permission on the destination topic.
 `
 
 // Register adds the copy_message tool to the MCP server.
-func Register(server *mcp.Server, kafka *kafkaclient.Client, reader *records.Reader) {
+func Register(
+	server *mcp.Server,
+	clusters *kafkaclient.Registry,
+	own string,
+) {
 	mcp.AddTool(
 		server,
 		&mcp.Tool{
@@ -109,7 +126,7 @@ func Register(server *mcp.Server, kafka *kafkaclient.Client, reader *records.Rea
 				client = info.Name
 			}
 
-			out, err := run(ctx, kafka, reader, input, client)
+			out, err := run(ctx, clusters, own, input, client)
 			if err != nil {
 				return nil, Output{}, fmt.Errorf("copy message: %w", err)
 			}
@@ -122,27 +139,50 @@ func Register(server *mcp.Server, kafka *kafkaclient.Client, reader *records.Rea
 // Run previews or performs a copy.
 func Run(
 	ctx context.Context,
-	kafka *kafkaclient.Client,
-	reader *records.Reader,
+	clusters *kafkaclient.Registry,
+	own string,
 	input Input,
 ) (Output, error) {
 
-	return run(ctx, kafka, reader, input, "")
+	return run(ctx, clusters, own, input, "")
 }
 
 func run(
 	ctx context.Context,
-	kafka *kafkaclient.Client,
-	reader *records.Reader,
+	clusters *kafkaclient.Registry,
+	own string,
 	input Input,
 	client string,
 ) (Output, error) {
 
-	// Writing is the only thing this tool does, so a read-only server refuses
-	// it outright rather than offering a preview of a capability it does not
-	// have. The check is here, before any work, because there is no part of
-	// this tool that is useful without the write.
-	if err := kafka.RequireWritable(toolName); err != nil {
+	source := clusters.Get(own)
+	if source == nil {
+		return Output{}, fmt.Errorf("unknown cluster %q", own)
+	}
+
+	// The destination defaults to this endpoint's own cluster, so a copy
+	// within one cluster needs no extra parameter.
+	destination := source
+	destinationName := own
+
+	if input.DestinationCluster != "" && input.DestinationCluster != own {
+		destination = clusters.Get(input.DestinationCluster)
+		if destination == nil {
+			return Output{}, fmt.Errorf(
+				"unknown destination_cluster %q: use list_clusters to see which clusters this server serves",
+				input.DestinationCluster)
+		}
+
+		destinationName = input.DestinationCluster
+	}
+
+	// read_only protects the cluster being written to. Copying out of a
+	// read-only cluster changes nothing there and is how a message is rescued
+	// from production, so only the destination is checked.
+	//
+	// Writing is the only thing this tool does, so it refuses outright rather
+	// than offering a preview of a capability it does not have.
+	if err := destination.RequireWritable(toolName); err != nil {
 		return Output{}, err
 	}
 
@@ -154,7 +194,7 @@ func run(
 		return Output{}, fmt.Errorf("destination_topic is required")
 	}
 
-	if input.SourceTopic == input.DestinationTopic {
+	if input.SourceTopic == input.DestinationTopic && destinationName == own {
 		return Output{}, fmt.Errorf(
 			"source_topic and destination_topic are both %q: copying a topic onto itself appends a duplicate to the topic being debugged",
 			input.SourceTopic)
@@ -165,25 +205,27 @@ func run(
 			"source_offset must not be negative, got %d", input.SourceOffset)
 	}
 
-	if err := topicExists(ctx, kafka, input.DestinationTopic); err != nil {
+	if err := topicExists(ctx, destination, input.DestinationTopic); err != nil {
 		return Output{}, err
 	}
 
-	record, err := readSource(ctx, kafka, reader, input)
+	record, err := readSource(ctx, source, source.Reader(), input)
 	if err != nil {
 		return Output{}, err
 	}
 
 	out := Output{
-		SourceTopic:      input.SourceTopic,
-		SourcePartition:  input.SourcePartition,
-		SourceOffset:     input.SourceOffset,
-		DestinationTopic: input.DestinationTopic,
-		Message:          records.Render(record, input.MaxValueBytes),
-		Warnings:         []string{},
+		SourceCluster:      own,
+		DestinationCluster: destinationName,
+		SourceTopic:        input.SourceTopic,
+		SourcePartition:    input.SourcePartition,
+		SourceOffset:       input.SourceOffset,
+		DestinationTopic:   input.DestinationTopic,
+		Message:            records.Render(record, input.MaxValueBytes),
+		Warnings:           []string{},
 	}
 
-	headers, added, collisions := withProvenance(record, input, kafka, client)
+	headers, added, collisions := withProvenance(record, input, own, destination, client)
 
 	out.ProvenanceHeaders = added
 
@@ -199,7 +241,7 @@ func run(
 		return out, nil
 	}
 
-	written, err := produce(ctx, kafka, input.DestinationTopic, record, headers)
+	written, err := produce(ctx, destination, input.DestinationTopic, record, headers)
 	if err != nil {
 		return Output{}, err
 	}
@@ -208,8 +250,8 @@ func run(
 	out.WrittenPartition = written.Partition
 	out.WrittenOffset = written.Offset
 	out.Note = fmt.Sprintf(
-		"copied to %s partition %d offset %d",
-		input.DestinationTopic, written.Partition, written.Offset)
+		"copied to cluster %s topic %s partition %d offset %d",
+		destinationName, input.DestinationTopic, written.Partition, written.Offset)
 
 	return out, nil
 }
@@ -219,7 +261,8 @@ func run(
 func withProvenance(
 	record *kgo.Record,
 	input Input,
-	kafka *kafkaclient.Client,
+	sourceCluster string,
+	destination *kafkaclient.Client,
 	client string,
 ) ([]kgo.RecordHeader, []string, []string) {
 
@@ -234,11 +277,12 @@ func withProvenance(
 
 	principal := "anonymous"
 
-	if cfg := kafka.Config(); cfg != nil && cfg.SASL != nil && cfg.SASL.User != "" {
+	if cfg := destination.Config(); cfg != nil && cfg.SASL != nil && cfg.SASL.User != "" {
 		principal = cfg.SASL.User
 	}
 
 	provenance := []kgo.RecordHeader{
+		{Key: headerFromCluster, Value: []byte(sourceCluster)},
 		{Key: headerFromTopic, Value: []byte(input.SourceTopic)},
 		{Key: headerFromPartition, Value: []byte(strconv.Itoa(int(input.SourcePartition)))},
 		{Key: headerFromOffset, Value: []byte(strconv.FormatInt(input.SourceOffset, 10))},

@@ -18,7 +18,7 @@ cmd/server/main.go        MCP server entrypoint, tool registration
 internal/tools/           One package per MCP tool, and nothing else
 internal/domain/          Everything shared by more than one tool
   config/                 The server's own configuration
-  kafkaclient/            The Kafka connection the tools are given
+  kafkaclient/            The Kafka connections, one per cluster
   records/                Reading and rendering Kafka records
   testenv/                Test container environment (broker + Console)
 internal/skills/          Skills describing how tools are used together
@@ -316,25 +316,43 @@ whether matching is case-sensitive.
 
 ### 6. Verify end to end
 
-Building is not verification. Confirm the tool works over the real MCP stdio
-protocol:
+Building is not verification. Confirm the tool works over the real MCP protocol,
+against a running server:
 
 ```sh
 make up
-go build -o bin/kafka-debugger ./cmd/server
+make run &                    # serves kafka-mcp.local.json on :8090
 
-{ printf '%s\n' \
-  '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}' \
-  '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
-  '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' \
-  '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"list_topics","arguments":{}}}'; sleep 5; } \
-  | KAFKA_MCP_CONFIG=kafka-mcp.local.json ./bin/kafka-debugger
+curl http://localhost:8090/healthz
+
+# Initialize, keeping the session id the server returns.
+SID=$(curl -s -D- -X POST http://localhost:8090/mcp/local \
+  -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}' \
+  | grep -i '^mcp-session-id:' | tr -d '\r' | awk '{print $2}')
+
+curl -s -X POST http://localhost:8090/mcp/local -H "Mcp-Session-Id: $SID" \
+  -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
+  -d '{"jsonrpc":"2.0","method":"notifications/initialized"}' > /dev/null
+
+curl -s -X POST http://localhost:8090/mcp/local -H "Mcp-Session-Id: $SID" \
+  -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
+  -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"list_topics","arguments":{}}}'
 ```
 
-The `sleep` matters: the server exits when stdin closes, so piping input without
-holding the pipe open kills it before responses are flushed. Responses may
-arrive out of order because requests are handled concurrently; match them by
-`id`, not by position.
+Responses come back as `text/event-stream`, so each is a line beginning
+`data: `. The session id is required on every request after `initialize`; without
+it the server starts a new session and the call fails.
+
+Also confirm an unknown cluster is refused, since the routing is what binds a
+session to one cluster:
+
+```sh
+curl -s -o /dev/null -w '%{http_code}\n' -X POST http://localhost:8090/mcp/nope \
+  -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}'
+# 400
+```
 
 ## Commands
 
@@ -343,7 +361,7 @@ arrive out of order because requests are handled concurrently; match them by
 | `make up`           | Start Redpanda and Console                  |
 | `make down`         | Stop containers                             |
 | `make build`        | Build the server binary                     |
-| `make run`          | Run the server                              |
+| `make run`          | Run the server on :8090                     |
 | `go test ./...`     | Run all tests, including container tests    |
 | `go test -short ./...` | Run tests without containers             |
 | `go vet ./...`      | Vet all packages                            |
@@ -376,6 +394,14 @@ is what the tests and local runs use.
 - A skill whose purpose is to change something checks `server_config` before
   walking the user through the steps, so a read-only server fails at the start
   rather than after the user has already acted.
+- `read_only` protects the cluster being **written to**, not the one being read
+  from. A tool that moves data between clusters checks the destination, so a
+  message can still be rescued out of a read-only production cluster.
+- One server serves several clusters, each on its own HTTP path under `/mcp/`.
+  A tool is bound to one cluster at registration and must not take a cluster
+  parameter, so a caller cannot redirect it. The exceptions are `copy_message`,
+  which needs a destination, and `list_clusters`, which reports the roster;
+  both take the registry rather than a single client.
 - Never commit unless the user explicitly asks.
 - Keep `README.md` current. Any new tool, changed flag, changed environment
   variable or changed startup step must be reflected there in the same change.

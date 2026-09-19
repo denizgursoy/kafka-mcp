@@ -2,7 +2,11 @@
 # kafka-mcp
 
 An MCP server that exposes Kafka debugging as tools an LLM can call. It speaks
-MCP over stdio and talks to Kafka with [franz-go](https://github.com/twmb/franz-go).
+MCP over HTTP and talks to Kafka with [franz-go](https://github.com/twmb/franz-go).
+
+One server can serve several Kafka clusters. Each is served on its own path, so
+a session is bound to one cluster by the endpoint it connects to rather than by
+a parameter a caller could forget to send.
 
 ## Start the server
 
@@ -11,8 +15,7 @@ the only environment variable it reads.
 
 ```sh
 make up                                  # local Redpanda + Console
-make build                               # builds bin/kafka-debugger
-KAFKA_MCP_CONFIG=kafka-mcp.local.json ./bin/kafka-debugger
+make run                                 # serves kafka-mcp.local.json
 ```
 
 `kafka-mcp.local.json` is committed and points at the compose broker, so a
@@ -20,43 +23,101 @@ clone works without writing any configuration. `make up` publishes the broker
 on `localhost:19092`, the Schema Registry on `localhost:18081` and the Redpanda
 Console on <http://localhost:8080>.
 
-A relative path is resolved from the working directory, so a config file kept
-beside the code needs no absolute path.
+Check it is up:
+
+```sh
+curl http://localhost:8090/healthz
+```
+
+Note the server listens on **8090**, not 8080: the Redpanda Console already
+uses 8080, and running both is the normal case.
 
 ## Configuration
 
 ```jsonc
 {
-  "environment": "production",          // free-form label, informational only
-  "broker": "kafka-1:9093,kafka-2:9093",
-  "read_only": true,
+  "http": { "address": ":8090" },
   "output_dir": "/var/tmp/kafka-mcp",
-  "tls": { "enabled": true, "ca_file": "/etc/kafka/ca.pem" },
-  "sasl": {
-    "mechanism": "scram-sha-256",       // plain, scram-sha-256, scram-sha-512
-    "user": "kafka-mcp-readonly",
-    "password": "{env:KAFKA_PASSWORD}"  // or "password_file": "/run/secrets/kafka"
+  "clusters": {
+    "prod": {
+      "broker": "kafka-1:9093,kafka-2:9093",
+      "read_only": true,
+      "tls": { "enabled": true, "ca_file": "/etc/kafka/ca.pem" },
+      "sasl": {
+        "mechanism": "scram-sha-256",       // plain, scram-sha-256, scram-sha-512
+        "user": "kafka-mcp-readonly",
+        "password": "{env:KAFKA_PASSWORD}"  // or "password_file": "/run/secrets/kafka"
+      }
+    },
+    "preprod": { "broker": "kafka-preprod:9093" }
   }
 }
 ```
 
-Every field is optional except `broker`. A minimal local file:
+Each key under `clusters` names both the cluster and the path it is served on,
+so `prod` is reached at `/mcp/prod`. Only `broker` is required per cluster. A
+minimal local file:
 
 ```json
-{ "environment": "local", "broker": "localhost:19092" }
+{ "clusters": { "local": { "broker": "localhost:19092" } } }
 ```
 
 The file is the only source of configuration. The server refuses to start
-without one rather than guessing a broker address, and `output_dir` defaults to
-the system temp directory when omitted. Exports are confined to that directory:
-`output_file` takes a file name, never a path.
+without one rather than guessing a broker address, `http.address` defaults to
+`:8080`, and `output_dir` defaults to the system temp directory. Exports are
+confined to that directory: `output_file` takes a file name, never a path.
 
 Keep secrets out of the file with `{env:VAR}` or `password_file`. Unknown keys
 are rejected, so a typo like `"readonly"` fails at startup rather than silently
 leaving writes enabled.
 
-`server_config` reports the effective configuration at runtime. It never
-reports the password.
+A cluster that cannot be reached at startup is still served, and
+`list_clusters` reports it as disconnected. One cluster being down must not
+block debugging the others.
+
+`server_config` reports which cluster an endpoint serves, and never the
+password.
+
+## Connecting a client
+
+Register one entry per cluster:
+
+```jsonc
+{
+  "mcp": {
+    "kafka-local": {
+      "type": "remote",
+      "url": "http://localhost:8090/mcp/local"
+    },
+    "kafka-prod": {
+      "type": "remote",
+      "url": "http://localhost:8090/mcp/prod",
+      "enabled": false
+    }
+  }
+}
+```
+
+The key becomes the tool prefix, so these appear as `kafka-local_list_topics`
+and `kafka-prod_list_topics`. **Name the entries after the clusters they point
+at**: the prefix is the clearest signal of which cluster a call will hit, and a
+`kafka-local` entry aimed at `/mcp/prod` would be actively misleading. Use
+`server_config` to confirm rather than trusting the name.
+
+Each enabled cluster costs context: these tools are roughly 8k tokens of
+definitions. Enable only what you need, and put production behind an agent:
+
+```jsonc
+{
+  "tools": { "kafka-prod*": false },
+  "agent": {
+    "kafka-prod": {
+      "description": "Debugging against production Kafka.",
+      "tools": { "kafka-prod*": true }
+    }
+  }
+}
+```
 
 ## Permissions
 
@@ -97,48 +158,25 @@ ali cannot bypass that by editing config or rebuilding the binary, because the
 decision is made by Kafka rather than by this server. On a cluster without
 ACLs, `read_only: true` is the available protection.
 
-## Running against several environments
-
-Register one MCP server per cluster, each with its own config file:
-
-```jsonc
-{
-  "mcp": {
-    "kafka-local": {
-      "type": "local",
-      "command": ["kafka-mcp"],
-      "environment": { "KAFKA_MCP_CONFIG": "kafka-mcp.local.json" }
-    },
-    "kafka-prod": {
-      "type": "local",
-      "command": ["kafka-mcp"],
-      "enabled": false,
-      "environment": { "KAFKA_MCP_CONFIG": "/etc/kafka-mcp/prod.json" }
-    }
-  }
-}
-```
-
-The server name becomes part of every tool name, so `kafka-prod_describe_topic`
-is visibly different from `kafka-local_describe_topic`.
-
-Each enabled server costs context: these tools are roughly 8k tokens of
-definitions. Enabling three environments spends about 24k tokens before you
-type anything, so enable only what you need and put production behind an agent:
-
-```jsonc
-{
-  "tools": { "kafka-prod*": false },
-  "agent": {
-    "kafka-prod": {
-      "description": "Debugging against production Kafka.",
-      "tools": { "kafka-prod*": true }
-    }
-  }
-}
-```
-
 ## Tools
+
+### `list_clusters`
+
+Lists the clusters this server serves, with whether each is reachable and
+whether it accepts writes. Takes no parameters. Available from every endpoint,
+so a session can discover what `copy_message` may target.
+
+```json
+{"clusters": [
+  {"name": "prod", "connected": true, "read_only": true},
+  {"name": "preprod", "connected": true, "read_only": false}
+], "count": 2}
+```
+
+`connected` is checked when you call, not recorded at startup, so a cluster
+that has since gone down is reported honestly. Only the name, reachability and
+writability are reported: broker addresses and credentials are deliberately
+not, because this tool is reachable from every endpoint.
 
 ### `list_topics`
 
@@ -417,16 +455,24 @@ the cluster already holds.
 | --------- | ---- | -------- | ------- |
 | `source_topic`, `source_partition`, `source_offset` | | yes | Message to copy |
 | `destination_topic` | string | yes | Where to write it. Must already exist |
+| `destination_cluster` | string | no | Another cluster to write to. Defaults to this endpoint's own |
 | `confirm` | bool | no | Default false: preview only, nothing is written |
 
-Every copy carries provenance headers — `kafka-mcp-copied-from-topic`,
-`-from-partition`, `-from-offset`, `-copied-at`, `-copied-by-tool`,
-`-copied-by-principal` — so a message in a dead letter topic can be traced back
-to its original. If the message already carries one of those headers, the
-original is kept and the collision is reported.
+Set `destination_cluster` to copy into another cluster this server serves,
+which is how a production message is taken into a preproduction topic to be
+debugged safely. Use `list_clusters` to see which names are valid.
 
-This tool is refused entirely on a read-only server, preview included, because
-writing is all it does.
+Every copy carries provenance headers — `kafka-mcp-copied-from-cluster`,
+`-from-topic`, `-from-partition`, `-from-offset`, `-copied-at`,
+`-copied-by-tool`, `-copied-by-principal` — so a message in a dead letter or
+preproduction topic can be traced back to its original. If the message already
+carries one of those headers, the original is kept and the collision is
+reported.
+
+`read_only` protects the cluster being **written to**. A read-only cluster can
+be the source of a copy, because copying out of it changes nothing; it cannot
+be the destination. The tool is refused entirely when the destination is
+read-only, preview included, because writing is all it does.
 
 ## Skills
 
