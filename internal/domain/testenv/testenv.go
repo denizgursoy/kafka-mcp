@@ -34,11 +34,15 @@ import (
 	"github.com/testcontainers/testcontainers-go/wait"
 	"github.com/twmb/franz-go/pkg/kadm"
 	"github.com/twmb/franz-go/pkg/kgo"
+	"github.com/twmb/franz-go/pkg/sasl/scram"
 
 	"github.com/denizgursoy/kafka-mcp/internal/domain/records"
 )
 
 const (
+	// SASLUser and SASLPassword are credentials for the isolated SASL fixture.
+	SASLUser     = "test-reader"
+	SASLPassword = "test-reader-secret"
 	// BrokerImage is the Redpanda broker image started for tests.
 	BrokerImage = "redpandadata/redpanda:v25.3.1"
 
@@ -66,11 +70,12 @@ const (
 type Environment struct {
 	t *testing.T
 
-	network *testcontainers.DockerNetwork
-	broker  *redpanda.Container
-	console testcontainers.Container
-	client  *kgo.Client
-	admin   *kadm.Client
+	network     *testcontainers.DockerNetwork
+	broker      *redpanda.Container
+	console     testcontainers.Container
+	client      *kgo.Client
+	admin       *kadm.Client
+	authOptions []kgo.Opt
 
 	skipConsole bool
 
@@ -94,6 +99,15 @@ func Start(t *testing.T) *Environment {
 	t.Helper()
 
 	return start(t)
+}
+
+// StartSASL starts the same broker and Console with mandatory SCRAM-SHA-256
+// authentication, including credentials for the Console and fixture clients.
+func StartSASL(t *testing.T) *Environment {
+	t.Helper()
+	return start(t, func(e *Environment) {
+		e.authOptions = []kgo.Opt{kgo.SASL(scram.Auth{User: SASLUser, Pass: SASLPassword}.AsSha256Mechanism())}
+	})
 }
 
 func start(t *testing.T, options ...startOption) *Environment {
@@ -160,12 +174,17 @@ func (e *Environment) start(ctx context.Context) error {
 		return fmt.Errorf("create docker network: %w", err)
 	}
 
-	e.broker, err = redpanda.Run(
-		ctx,
-		BrokerImage,
-		redpanda.WithListener(internalListener),
+	brokerOptions := []testcontainers.ContainerCustomizer{
 		network.WithNetwork([]string{networkAlias}, e.network),
-	)
+	}
+	if len(e.authOptions) > 0 {
+		brokerOptions = append(brokerOptions, redpanda.WithEnableSASL(),
+			redpanda.WithNewServiceAccount(SASLUser, SASLPassword), redpanda.WithSuperusers(SASLUser))
+	}
+	// WithListener captures the authentication method when the option runs.
+	// Apply it after WithEnableSASL so Console uses the same protected listener.
+	brokerOptions = append(brokerOptions, redpanda.WithListener(internalListener))
+	e.broker, err = redpanda.Run(ctx, BrokerImage, brokerOptions...)
 	if err != nil {
 		return fmt.Errorf("start broker %s: %w", BrokerImage, err)
 	}
@@ -199,11 +218,12 @@ func (e *Environment) start(ctx context.Context) error {
 	// ManualPartitioner makes Record.Partition authoritative. Without it
 	// franz-go ignores that field and balances records itself, so a test that
 	// produces to a named partition would silently land somewhere else.
-	e.client, err = kgo.NewClient(
+	clientOptions := []kgo.Opt{
 		kgo.SeedBrokers(e.seed),
 		kgo.MetadataMinAge(metadataMinAge),
 		kgo.RecordPartitioner(kgo.ManualPartitioner()),
-	)
+	}
+	e.client, err = kgo.NewClient(append(clientOptions, e.authOptions...)...)
 	if err != nil {
 		return fmt.Errorf("connect kafka client to %s: %w", e.seed, err)
 	}
@@ -218,14 +238,21 @@ func (e *Environment) start(ctx context.Context) error {
 }
 
 func (e *Environment) startConsole(ctx context.Context) error {
+	env := map[string]string{
+		"KAFKA_BROKERS":                internalListener,
+		"KAFKA_SCHEMAREGISTRY_ENABLED": "true",
+		"KAFKA_SCHEMAREGISTRY_URLS":    "http://" + networkAlias + ":8081",
+	}
+	if len(e.authOptions) > 0 {
+		env["KAFKA_SASL_ENABLED"] = "true"
+		env["KAFKA_SASL_MECHANISM"] = "SCRAM-SHA-256"
+		env["KAFKA_SASL_USERNAME"] = SASLUser
+		env["KAFKA_SASL_PASSWORD"] = SASLPassword
+	}
 	console, err := testcontainers.Run(
 		ctx,
 		ConsoleImage,
-		testcontainers.WithEnv(map[string]string{
-			"KAFKA_BROKERS":                internalListener,
-			"KAFKA_SCHEMAREGISTRY_ENABLED": "true",
-			"KAFKA_SCHEMAREGISTRY_URLS":    "http://" + networkAlias + ":8081",
-		}),
+		testcontainers.WithEnv(env),
 		testcontainers.WithExposedPorts("8080/tcp"),
 		network.WithNetwork([]string{"console"}, e.network),
 		testcontainers.WithWaitStrategy(
@@ -335,7 +362,7 @@ func (e *Environment) Broker() string {
 // Reader returns a record reader pointed at the running broker, for tools that
 // read message content rather than metadata.
 func (e *Environment) Reader() *records.Reader {
-	return records.NewReader(e.seed)
+	return records.NewReaderWithOptions(append([]kgo.Opt{kgo.SeedBrokers(e.seed)}, e.authOptions...)...)
 }
 
 // SchemaRegistry returns the host address of the Schema Registry.
@@ -569,13 +596,14 @@ func (e *Environment) ConsumeAndCommit(
 ) {
 	t.Helper()
 
-	client, err := kgo.NewClient(
+	options := []kgo.Opt{
 		kgo.SeedBrokers(e.seed),
 		kgo.ConsumerGroup(group),
 		kgo.ConsumeTopics(topic),
 		kgo.ConsumeResetOffset(kgo.NewOffset().AtStart()),
 		kgo.DisableAutoCommit(),
-	)
+	}
+	client, err := kgo.NewClient(append(options, e.authOptions...)...)
 	if err != nil {
 		t.Fatalf("connect consumer for group %s: %v", group, err)
 	}
