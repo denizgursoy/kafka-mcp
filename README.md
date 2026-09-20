@@ -1,4 +1,3 @@
-
 # kafka-mcp
 
 An MCP server that exposes Kafka debugging as tools an LLM can call. It speaks
@@ -10,15 +9,16 @@ a parameter a caller could forget to send.
 
 ## Start the server
 
-The server is configured by a JSON file, named by `KAFKA_MCP_CONFIG`. That is
-the only environment variable it reads.
+Requires Go 1.27 or later. Configuration is loaded with `chu`; set `CONFIG_FILE`
+to select a YAML or JSON file. `into` manages the process lifecycle, `ada` serves
+HTTP with context-driven shutdown, and `logi` initializes structured logging.
 
 ```sh
 make up                                  # local Redpanda + Console
-make run                                 # serves kafka-mcp.local.json
+make run                                 # serves kafka-mcp.local.yaml
 ```
 
-`kafka-mcp.local.json` is committed and points at the compose broker, so a
+`kafka-mcp.local.yaml` is committed and points at the compose broker, so a
 clone works without writing any configuration. `make up` publishes the broker
 on `localhost:19092`, the Schema Registry on `localhost:18081` and the Redpanda
 Console on <http://localhost:8080>.
@@ -34,49 +34,104 @@ uses 8080, and running both is the normal case.
 
 ## Configuration
 
-```jsonc
-{
-  "http": { "address": ":8090" },
-  "output_dir": "/var/tmp/kafka-mcp",
-  "clusters": {
-    "prod": {
-      "broker": "kafka-1:9093,kafka-2:9093",
-      "read_only": true,
-      "tls": { "enabled": true, "ca_file": "/etc/kafka/ca.pem" },
-      "sasl": {
-        "mechanism": "scram-sha-256",       // plain, scram-sha-256, scram-sha-512
-        "user": "kafka-mcp-readonly",
-        "password": "{env:KAFKA_PASSWORD}"  // or "password_file": "/run/secrets/kafka"
-      }
-    },
-    "preprod": { "broker": "kafka-preprod:9093" }
-  }
-}
+```yaml
+http:
+  address: ":8090"
+output_dir: /var/tmp/kafka-mcp
+clusters:
+  prod:
+    broker: kafka-1:9093,kafka-2:9093
+    read_only: true
+    security:
+      tls:
+        enabled: true
+        ca_file: /etc/kafka/ca.pem
+        # cert_file: /etc/kafka/client.pem # optional mTLS; requires key_file
+        # key_file: /run/secrets/client.key
+      sasl:
+        - scram:
+            enabled: true
+            algorithm: SCRAM-SHA-256 # or SCRAM-SHA-512
+            user: kafka-mcp-readonly
+            pass: "{env:KAFKA_PASSWORD}" # or password_file: /run/secrets/kafka
+  preprod:
+    broker: kafka-preprod:9093
 ```
 
 Each key under `clusters` names both the cluster and the path it is served on,
 so `prod` is reached at `/mcp/prod`. Only `broker` is required per cluster. A
 minimal local file:
 
-```json
-{ "clusters": { "local": { "broker": "localhost:19092" } } }
+```yaml
+clusters:
+  local:
+    broker: localhost:19092
 ```
 
-The file is the only source of configuration. The server refuses to start
-without one rather than guessing a broker address, `http.address` defaults to
+Run a custom configuration with `CONFIG_FILE=/path/to/config.yaml go run ./cmd/server`.
+Without `CONFIG_FILE`, chu discovers `kafka-mcp.{toml,yaml,yml,json}` in the
+working directory or `/etc`. Its standard loader order is defaults, file, HTTP,
+then environment; environment overrides use the `KAFKA_MCP_` prefix (for example,
+`KAFKA_MCP_HTTP_ADDRESS=:9000`). Logging can be configured with `LOG_LEVEL` and
+`LOG_PRETTY`.
+
+At least one cluster with a broker is required. `http.address` defaults to
 `:8080`, and `output_dir` defaults to the system temp directory. Exports are
 confined to that directory: `output_file` takes a file name, never a path.
 
-Keep secrets out of the file with `{env:VAR}` or `password_file`. Unknown keys
-are rejected, so a typo like `"readonly"` fails at startup rather than silently
-leaving writes enabled.
+Keep secrets out of the file with `{env:VAR}` or `password_file`. Unknown fields
+are ignored by chu.
+
+TLS is configured with `twmb/tlscfg`, using its TLS 1.2 minimum and recommended
+cipher suites. TLS uses the system trust store;
+`ca_file` adds a custom CA. For mTLS, supply both `cert_file` and `key_file`.
+`security.sasl` is a preference-ordered list: each entry enables either `scram`
+or `plain`, or uses `oauth` as shown below. For PLAIN, use `plain: {enabled: true, user: alice, pass: "{env:KAFKA_PASSWORD}"}`.
+Both accept optional `zid` (authorization identity) and `password_file` instead
+of `pass`; SCRAM also accepts `is_token: true` for delegation tokens. Algorithms
+are case-insensitive. Disabled entries are ignored; repeated mechanisms and
+entries enabling multiple mechanisms are rejected. Fallback negotiates a
+broker-supported mechanism; it does not retry invalid credentials.
+All Kafka connections, including message-reading sessions, use these settings.
+
+Legacy per-cluster `tls` and `sasl: {mechanism, user, password, password_file}`
+remain supported, but cannot be combined with `security` on the same cluster.
+
+For OAUTHBEARER client credentials, use this cluster security block:
+
+```yaml
+security:
+  tls:
+    enabled: true
+  sasl:
+    - oauth:
+        enabled: true
+        token_url: https://identity.example.com/realms/apps/protocol/openid-connect/token
+        client_id: kafka-mcp
+        client_secret: "{env:KAFKA_CLIENT_SECRET}"
+        scopes: [kafka]
+        timeout: 10s
+        # zid: optional-authorization-id
+        # extensions: {tenant: example}
+```
+
+Alternatively, use `oauth: {enabled: true, token: "{env:KAFKA_TOKEN}"}` for a
+static token. Configure exactly one mode. Client-credentials tokens are fetched
+on authentication, cached per cluster across admin and reading connections,
+and renewed near expiry using `expires_in`. Token requests use the current
+authentication context and a timeout (default 10 seconds). Static tokens are
+not renewed. The broker must support OAUTHBEARER and trust the identity provider.
+Broker `security.tls` settings apply to Kafka connections; HTTPS token endpoints
+use the HTTP client's system trust store.
 
 A cluster that cannot be reached at startup is still served, and
 `list_clusters` reports it as disconnected. One cluster being down must not
 block debugging the others.
 
 `server_config` reports which cluster an endpoint serves, and never the
-password.
+password. Its `authentication` and `sasl_user` describe the first configured
+option; `sasl_options` lists all configured identities in preference order,
+not the mechanism negotiated by an individual broker connection.
 
 ## Connecting a client
 
@@ -145,7 +200,7 @@ rpk acl create --allow-principal User:deniz \
   --operation read,describe,alter --topic orders
 ```
 
-Each points `KAFKA_MCP_CONFIG` at their own file, differing only in `sasl.user`
+Each points `CONFIG_FILE` at their own file, differing only in `security.sasl[0].scram.user`
 and the password. When ali calls `add_partitions`, the broker refuses:
 
 ```

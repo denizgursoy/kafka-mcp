@@ -7,14 +7,13 @@ package kafkaclient
 import (
 	"context"
 	"crypto/tls"
-	"crypto/x509"
 	"fmt"
-	"os"
 
 	"github.com/twmb/franz-go/pkg/kgo"
 	"github.com/twmb/franz-go/pkg/sasl"
 	"github.com/twmb/franz-go/pkg/sasl/plain"
 	"github.com/twmb/franz-go/pkg/sasl/scram"
+	"github.com/twmb/tlscfg"
 
 	"github.com/twmb/franz-go/pkg/kadm"
 
@@ -44,13 +43,21 @@ func New(cfg *config.Cluster) (*Client, error) {
 		options = append(options, kgo.DialTLSConfig(tlsConfig))
 	}
 
-	if cfg.SASL != nil {
-		mechanism, err := saslMechanism(cfg.SASL)
+	auths := cfg.SASLMechanisms
+	if len(auths) == 0 && cfg.SASL != nil {
+		auths = []*config.SASL{cfg.SASL}
+	}
+	mechanisms := make([]sasl.Mechanism, 0, len(auths))
+	for _, auth := range auths {
+		mechanism, err := saslMechanism(auth)
 		if err != nil {
 			return nil, err
 		}
 
-		options = append(options, kgo.SASL(mechanism))
+		mechanisms = append(mechanisms, mechanism)
+	}
+	if len(mechanisms) > 0 {
+		options = append(options, kgo.SASL(mechanisms...))
 	}
 
 	client, err := kgo.NewClient(options...)
@@ -61,7 +68,7 @@ func New(cfg *config.Cluster) (*Client, error) {
 	return &Client{
 		client: client,
 		admin:  kadm.NewClient(client),
-		reader: records.NewReader(cfg.Brokers...),
+		reader: records.NewReaderWithOptions(options...),
 		cfg:    cfg,
 	}, nil
 }
@@ -71,22 +78,32 @@ func New(cfg *config.Cluster) (*Client, error) {
 // running the same server can have different permissions.
 func saslMechanism(auth *config.SASL) (sasl.Mechanism, error) {
 	switch auth.Mechanism {
+	case config.MechanismOAuth:
+		if auth.OAuth == nil {
+			return nil, fmt.Errorf("oauth settings are required")
+		}
+		return oauthMechanism(auth.OAuth)
 	case config.MechanismPlain:
 		return plain.Auth{
+			Zid:  auth.Zid,
 			User: auth.User,
 			Pass: auth.Password,
 		}.AsMechanism(), nil
 
 	case config.MechanismScramSHA256:
 		return scram.Auth{
-			User: auth.User,
-			Pass: auth.Password,
+			Zid:     auth.Zid,
+			IsToken: auth.IsToken,
+			User:    auth.User,
+			Pass:    auth.Password,
 		}.AsSha256Mechanism(), nil
 
 	case config.MechanismScramSHA512:
 		return scram.Auth{
-			User: auth.User,
-			Pass: auth.Password,
+			Zid:     auth.Zid,
+			IsToken: auth.IsToken,
+			User:    auth.User,
+			Pass:    auth.Password,
 		}.AsSha512Mechanism(), nil
 	}
 
@@ -94,28 +111,16 @@ func saslMechanism(auth *config.SASL) (sasl.Mechanism, error) {
 }
 
 func tlsConfig(settings *config.TLS) (*tls.Config, error) {
-	tlsConfig := &tls.Config{MinVersion: tls.VersionTLS12}
-
-	if settings.CAFile == "" {
-		return tlsConfig, nil
-	}
-
-	pem, err := os.ReadFile(settings.CAFile)
+	cfg, err := tlscfg.New(
+		tlscfg.MaybeWithDiskKeyPair(settings.CertFile, settings.KeyFile),
+		tlscfg.MaybeWithDiskCA(settings.CAFile, tlscfg.ForClient),
+		tlscfg.WithSystemCertPool(),
+	)
 	if err != nil {
-		return nil, fmt.Errorf("read tls ca_file: %w", err)
+		return nil, fmt.Errorf("configure tls: %w", err)
 	}
 
-	pool := x509.NewCertPool()
-
-	// A CA that does not parse would otherwise leave an empty pool, which
-	// fails later as an opaque handshake error.
-	if !pool.AppendCertsFromPEM(pem) {
-		return nil, fmt.Errorf("tls ca_file %s holds no usable certificate", settings.CAFile)
-	}
-
-	tlsConfig.RootCAs = pool
-
-	return tlsConfig, nil
+	return cfg, nil
 }
 
 // Config returns the cluster this client was built from.

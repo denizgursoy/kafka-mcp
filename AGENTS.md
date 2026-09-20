@@ -321,7 +321,7 @@ against a running server:
 
 ```sh
 make up
-make run &                    # serves kafka-mcp.local.json on :8090
+make run &                    # serves kafka-mcp.local.yaml on :8090
 
 curl http://localhost:8090/healthz
 
@@ -372,10 +372,13 @@ Local endpoints from `docker-compose.yml`:
 - Schema Registry: `localhost:18081`
 - Redpanda Console: <http://localhost:8080>
 
-The server is configured by a JSON file named by `KAFKA_MCP_CONFIG`, which is
-the only environment variable it reads. It refuses to start without one.
-`kafka-mcp.local.json` in the repository root points at the compose broker and
-is what the tests and local runs use.
+The server requires Go 1.27 and uses `into` for lifecycle, `ada` for HTTP with
+`StartWithContext`, `logi` for logging, and `chu` for configuration.
+`CONFIG_FILE` selects a YAML or JSON file; chu's
+standard loaders also support file discovery, HTTP and environment overrides
+with the `KAFKA_MCP_` prefix. Unknown fields are ignored. At least one cluster
+with a broker is required. `kafka-mcp.local.yaml` in the repository root points
+at the compose broker and is what local runs use.
 
 ## Conventions
 

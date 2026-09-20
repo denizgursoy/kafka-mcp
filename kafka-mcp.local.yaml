@@ -1,0 +1,6 @@
+http:
+  address: ":8090"
+output_dir: /tmp/kafka-mcp-exports
+clusters:
+  local:
+    broker: localhost:19092

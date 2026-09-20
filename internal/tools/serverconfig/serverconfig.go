@@ -22,17 +22,18 @@ type Input struct{}
 // client and may be logged or shown to a model, so a secret must never be
 // able to reach it.
 type Output struct {
-	Cluster        string   `json:"cluster"`
-	Brokers        []string `json:"brokers"`
-	Authentication string   `json:"authentication"`
-	SASLUser       string   `json:"sasl_user,omitempty"`
-	TLS            bool     `json:"tls"`
-	ReadOnly       bool     `json:"read_only"`
-	OutputDir      string   `json:"output_dir"`
-	ConfigFile     string   `json:"config_file,omitempty"`
-	HTTPAddress    string   `json:"http_address,omitempty"`
-	Tools          []string `json:"tools"`
-	Note           string   `json:"note"`
+	Cluster        string                `json:"cluster"`
+	Brokers        []string              `json:"brokers"`
+	Authentication string                `json:"authentication"`
+	SASLUser       string                `json:"sasl_user,omitempty"`
+	SASLOptions    []config.SASLIdentity `json:"sasl_options,omitempty"`
+	TLS            bool                  `json:"tls"`
+	ReadOnly       bool                  `json:"read_only"`
+	OutputDir      string                `json:"output_dir"`
+	ConfigFile     string                `json:"config_file,omitempty"`
+	HTTPAddress    string                `json:"http_address,omitempty"`
+	Tools          []string              `json:"tools"`
+	Note           string                `json:"note"`
 }
 
 const description = `
@@ -52,8 +53,11 @@ talking to rather than inferring it from a tool name the client chose.
 cluster. It protects a cluster that has no ACLs of its own; it is not a
 security boundary, because whoever can edit the configuration can turn it off.
 
-"sasl_user" is the principal the broker sees. Kafka ACLs are enforced against
-it, so it explains why a write may be refused even when read_only is false.
+"authentication" and "sasl_user" describe the first configured SASL option.
+"sasl_options" lists all configured mechanisms and identities in preference
+order, including optional authorization identities (zid). These are configured
+preferences, not the negotiated identity of an individual broker connection.
+Kafka ACLs apply to the authenticated identity even when read_only is false.
 
 The password is never reported.
 `
@@ -108,7 +112,7 @@ func Run(kafka *kafkaclient.Client, server *config.Config, tools []string) (Outp
 		Tools:          append([]string{}, tools...),
 		Note: "read_only protects a cluster without ACLs and can be turned off by " +
 			"anyone who can edit the configuration. Real authorisation comes from " +
-			"Kafka ACLs on the principal in sasl_user.",
+			"Kafka ACLs on the authenticated identity; sasl_options reports configured preferences.",
 	}
 
 	if server != nil {
@@ -117,9 +121,10 @@ func Run(kafka *kafkaclient.Client, server *config.Config, tools []string) (Outp
 		out.HTTPAddress = server.HTTP.Address
 	}
 
-	if cfg.SASL != nil {
-		out.Authentication = cfg.SASL.Mechanism
-		out.SASLUser = cfg.SASL.User
+	out.SASLOptions = cfg.AuthenticationOptions()
+	if len(out.SASLOptions) > 0 {
+		out.Authentication = out.SASLOptions[0].Mechanism
+		out.SASLUser = out.SASLOptions[0].User
 	}
 
 	sort.Strings(out.Tools)

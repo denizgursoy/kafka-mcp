@@ -6,12 +6,16 @@
 package main
 
 import (
+	"context"
 	"fmt"
-	"log"
+	"log/slog"
 	"net/http"
 	"strings"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"github.com/rakunlabs/ada"
+	"github.com/rakunlabs/into"
+	"github.com/rakunlabs/logi"
 
 	"github.com/denizgursoy/kafka-mcp/internal/domain/config"
 	"github.com/denizgursoy/kafka-mcp/internal/domain/kafkaclient"
@@ -52,14 +56,21 @@ var toolNames = []string{
 }
 
 func main() {
-	cfg, err := config.LoadDefault()
+	into.Init(run,
+		into.WithLogger(logi.InitializeLog(logi.WithCaller(false))),
+		into.WithMsgf("kafka-mcp"),
+	)
+}
+
+func run(ctx context.Context) error {
+	cfg, err := config.Load(ctx)
 	if err != nil {
-		log.Fatal(err)
+		return fmt.Errorf("load configuration: %w", err)
 	}
 
 	clusters, err := kafkaclient.NewRegistry(cfg)
 	if err != nil {
-		log.Fatal(err)
+		return fmt.Errorf("create Kafka registry: %w", err)
 	}
 
 	defer clusters.Close()
@@ -69,8 +80,8 @@ func main() {
 	for _, name := range cfg.ClusterNames() {
 		servers[name] = newServer(cfg, clusters, name)
 
-		log.Printf("serving cluster %q at %s%s (read_only %t)",
-			name, pathPrefix, name, cfg.Clusters[name].ReadOnly)
+		slog.Info("serving cluster", "cluster", name,
+			"path", pathPrefix+name, "read_only", cfg.Clusters[name].ReadOnly)
 	}
 
 	// The SDK turns a nil server into a 400, so an unknown cluster needs no
@@ -82,20 +93,16 @@ func main() {
 		nil,
 	)
 
-	mux := http.NewServeMux()
-	mux.Handle(pathPrefix, handler)
+	server := ada.New(ada.WithLogger(slog.Default()))
+	server.HandleWildcard(pathPrefix, handler)
 
 	// A liveness endpoint that needs no MCP session, so a container
 	// orchestrator can tell the process is up without speaking the protocol.
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+	server.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		fmt.Fprintln(w, "ok")
 	})
 
-	log.Printf("Kafka MCP server listening on %s", cfg.HTTP.Address)
-
-	if err := http.ListenAndServe(cfg.HTTP.Address, mux); err != nil {
-		log.Fatal(err)
-	}
+	return server.StartWithContext(ctx, cfg.HTTP.Address)
 }
 
 // newServer builds the MCP server for one cluster. Every tool is bound to

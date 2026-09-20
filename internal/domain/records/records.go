@@ -104,12 +104,18 @@ func (r Range) Empty() bool {
 // is client-wide state in franz-go: assigning partitions on the shared client
 // would disturb any other tool call running at the same time.
 type Reader struct {
-	seeds []string
+	options []kgo.Opt
 }
 
 // NewReader returns a Reader for the given seed brokers.
 func NewReader(seeds ...string) *Reader {
-	return &Reader{seeds: seeds}
+	return NewReaderWithOptions(kgo.SeedBrokers(seeds...))
+}
+
+// NewReaderWithOptions carries cluster connection settings, including TLS and
+// SASL, into each independent reading session. Do not pass consumer options.
+func NewReaderWithOptions(options ...kgo.Opt) *Reader {
+	return &Reader{options: append([]kgo.Opt(nil), options...)}
 }
 
 const (
@@ -145,16 +151,17 @@ type Session struct {
 // The partitions to read are chosen per scan, so the session starts consuming
 // nothing. It must be closed by the caller.
 func (r *Reader) Session(topic string) (*Session, error) {
-	client, err := kgo.NewClient(
-		kgo.SeedBrokers(r.seeds...),
+	options := append([]kgo.Opt(nil), r.options...)
+	options = append(options,
 		// Consuming must be configured at construction for partitions to be
 		// addable later: franz-go only sets up a direct consumer when the
 		// client is built with one of the consume options.
 		kgo.ConsumePartitions(map[string]map[int32]kgo.Offset{topic: {}}),
 		kgo.FetchMaxWait(fetchMaxWait),
 	)
+	client, err := kgo.NewClient(options...)
 	if err != nil {
-		return nil, fmt.Errorf("connect to %v: %w", r.seeds, err)
+		return nil, fmt.Errorf("create record reader: %w", err)
 	}
 
 	return &Session{client: client, topic: topic}, nil
