@@ -23,7 +23,7 @@ func TestServerConfigSuite(t *testing.T) {
 // client builds a client for the given configuration. No broker needs to be
 // reachable: reporting the configuration must work even when the cluster is
 // down, which is exactly when an operator asks what the server is pointed at.
-func (s *ServerConfigSuite) client(cfg *config.Config) *kafkaclient.Client {
+func (s *ServerConfigSuite) client(cfg *config.Cluster) *kafkaclient.Client {
 	s.T().Helper()
 
 	client, err := kafkaclient.New(cfg)
@@ -35,14 +35,17 @@ func (s *ServerConfigSuite) client(cfg *config.Config) *kafkaclient.Client {
 }
 
 func (s *ServerConfigSuite) TestReportsTheConnectionAndPermissions() {
-	client := s.client(&config.Config{
-		Environment: "production",
-		Brokers:     []string{"kafka-1:9093", "kafka-2:9093"},
-		ReadOnly:    true,
-		OutputDir:   "/var/tmp/exports",
+	client := s.client(&config.Cluster{
+		Name:     "production",
+		Brokers:  []string{"kafka-1:9093", "kafka-2:9093"},
+		ReadOnly: true,
 	})
 
-	out, err := serverconfig.Run(client, []string{"list_topics", "describe_topic"})
+	out, err := serverconfig.Run(
+		client,
+		&config.Config{OutputDir: "/var/tmp/exports", HTTP: config.HTTP{Address: ":8080"}},
+		[]string{"list_topics", "describe_topic"},
+	)
 
 	s.Require().NoError(err, "reporting the configuration must succeed")
 
@@ -51,9 +54,9 @@ func (s *ServerConfigSuite) TestReportsTheConnectionAndPermissions() {
 			"an operator asking what the server is connected to must get the actual broker list")
 	})
 
-	s.Run("the environment label is reported", func() {
-		s.Require().Equal("production", out.Environment,
-			"the label exists so a session can confirm which cluster it is talking to")
+	s.Run("the cluster is reported", func() {
+		s.Require().Equal("production", out.Cluster,
+			"a server may serve several clusters, so a session must be able to confirm which one this endpoint is bound to")
 	})
 
 	s.Run("read only is reported", func() {
@@ -68,12 +71,9 @@ func (s *ServerConfigSuite) TestReportsTheConnectionAndPermissions() {
 }
 
 func (s *ServerConfigSuite) TestReportsWhenThereIsNoAuthentication() {
-	client := s.client(&config.Config{
-		Brokers:   []string{"localhost:19092"},
-		OutputDir: "/tmp",
-	})
+	client := s.client(&config.Cluster{Name: "local", Brokers: []string{"localhost:19092"}})
 
-	out, err := serverconfig.Run(client, nil)
+	out, err := serverconfig.Run(client, nil, nil)
 
 	s.Require().NoError(err, "a cluster without authentication must still be reportable")
 	s.Require().Equal("none", out.Authentication,
@@ -85,7 +85,8 @@ func (s *ServerConfigSuite) TestReportsWhenThereIsNoAuthentication() {
 }
 
 func (s *ServerConfigSuite) TestReportsTheSASLPrincipal() {
-	client := s.client(&config.Config{
+	client := s.client(&config.Cluster{
+		Name:    "prod",
 		Brokers: []string{"kafka:9093"},
 		SASL: &config.SASL{
 			Mechanism: config.MechanismScramSHA256,
@@ -94,7 +95,7 @@ func (s *ServerConfigSuite) TestReportsTheSASLPrincipal() {
 		},
 	})
 
-	out, err := serverconfig.Run(client, nil)
+	out, err := serverconfig.Run(client, nil, nil)
 
 	s.Require().NoError(err, "reporting a SASL connection must succeed")
 	s.Require().Equal("scram-sha-256", out.Authentication,
@@ -106,7 +107,8 @@ func (s *ServerConfigSuite) TestReportsTheSASLPrincipal() {
 func (s *ServerConfigSuite) TestNeverRevealsThePassword() {
 	const secret = "super-secret-value"
 
-	client := s.client(&config.Config{
+	client := s.client(&config.Cluster{
+		Name:    "prod",
 		Brokers: []string{"kafka:9093"},
 		SASL: &config.SASL{
 			Mechanism: config.MechanismPlain,
@@ -115,7 +117,7 @@ func (s *ServerConfigSuite) TestNeverRevealsThePassword() {
 		},
 	})
 
-	out, err := serverconfig.Run(client, nil)
+	out, err := serverconfig.Run(client, nil, nil)
 
 	s.Require().NoError(err, "reporting must succeed")
 

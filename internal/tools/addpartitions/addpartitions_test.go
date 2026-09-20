@@ -33,10 +33,10 @@ func (s *AddPartitionsSuite) TearDownSuite() {
 func (s *AddPartitionsSuite) client(readOnly bool) *kafkaclient.Client {
 	s.T().Helper()
 
-	client, err := kafkaclient.New(&config.Config{
-		Environment: "test",
-		Brokers:     []string{s.env.Broker()},
-		ReadOnly:    readOnly,
+	client, err := kafkaclient.New(&config.Cluster{
+		Name:     "test",
+		Brokers:  []string{s.env.Broker()},
+		ReadOnly: readOnly,
 	})
 	s.Require().NoError(err, "connecting to the test broker must succeed")
 

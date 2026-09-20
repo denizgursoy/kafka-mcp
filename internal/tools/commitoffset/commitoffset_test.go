@@ -33,10 +33,10 @@ func (s *CommitOffsetSuite) TearDownSuite() {
 func (s *CommitOffsetSuite) client(readOnly bool) *kafkaclient.Client {
 	s.T().Helper()
 
-	client, err := kafkaclient.New(&config.Config{
-		Environment: "test",
-		Brokers:     []string{s.env.Broker()},
-		ReadOnly:    readOnly,
+	client, err := kafkaclient.New(&config.Cluster{
+		Name:     "test",
+		Brokers:  []string{s.env.Broker()},
+		ReadOnly: readOnly,
 	})
 	s.Require().NoError(err, "connecting to the test broker must succeed")
 
@@ -272,7 +272,7 @@ func (s *CommitOffsetSuite) TestErrorsOnUnknownTopic() {
 }
 
 func (s *CommitOffsetSuite) TestErrorsWhenBrokerUnreachable() {
-	client, err := kafkaclient.New(&config.Config{Brokers: []string{"127.0.0.1:1"}})
+	client, err := kafkaclient.New(&config.Cluster{Name: "test", Brokers: []string{"127.0.0.1:1"}})
 	s.Require().NoError(err, "building a client against a dead address must not fail yet")
 
 	s.T().Cleanup(client.Close)

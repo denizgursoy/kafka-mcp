@@ -22,16 +22,17 @@ import (
 	"github.com/denizgursoy/kafka-mcp/internal/domain/records"
 )
 
-// Client owns the Kafka connection shared by every tool package.
+// Client owns one cluster's Kafka connection, shared by every tool bound to
+// that cluster.
 type Client struct {
 	client *kgo.Client
 	admin  *kadm.Client
 	reader *records.Reader
-	cfg    *config.Config
+	cfg    *config.Cluster
 }
 
 // New connects to the cluster described by cfg.
-func New(cfg *config.Config) (*Client, error) {
+func New(cfg *config.Cluster) (*Client, error) {
 	options := []kgo.Opt{kgo.SeedBrokers(cfg.Brokers...)}
 
 	if cfg.TLS != nil && cfg.TLS.Enabled {
@@ -117,9 +118,15 @@ func tlsConfig(settings *config.TLS) (*tls.Config, error) {
 	return tlsConfig, nil
 }
 
-// Config returns the configuration this client was built from.
-func (c *Client) Config() *config.Config {
+// Config returns the cluster this client was built from.
+func (c *Client) Config() *config.Cluster {
 	return c.cfg
+}
+
+// Name returns the cluster's name, which is also the endpoint path it is
+// served on.
+func (c *Client) Name() string {
+	return c.cfg.Name
 }
 
 // RequireWritable reports whether the server is allowed to change the
@@ -133,11 +140,7 @@ func (c *Client) RequireWritable(operation string) error {
 		return nil
 	}
 
-	where := "this server"
-
-	if c.cfg.Environment != "" {
-		where = fmt.Sprintf("cluster %q", c.cfg.Environment)
-	}
+	where := fmt.Sprintf("cluster %q", c.cfg.Name)
 
 	return fmt.Errorf(
 		"%s is read-only: it is configured with read_only, so %s cannot change it",

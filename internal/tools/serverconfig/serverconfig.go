@@ -8,6 +8,7 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"github.com/denizgursoy/kafka-mcp/internal/domain/config"
 	"github.com/denizgursoy/kafka-mcp/internal/domain/kafkaclient"
 )
 
@@ -21,7 +22,7 @@ type Input struct{}
 // client and may be logged or shown to a model, so a secret must never be
 // able to reach it.
 type Output struct {
-	Environment    string   `json:"environment,omitempty"`
+	Cluster        string   `json:"cluster"`
 	Brokers        []string `json:"brokers"`
 	Authentication string   `json:"authentication"`
 	SASLUser       string   `json:"sasl_user,omitempty"`
@@ -29,6 +30,7 @@ type Output struct {
 	ReadOnly       bool     `json:"read_only"`
 	OutputDir      string   `json:"output_dir"`
 	ConfigFile     string   `json:"config_file,omitempty"`
+	HTTPAddress    string   `json:"http_address,omitempty"`
 	Tools          []string `json:"tools"`
 	Note           string   `json:"note"`
 }
@@ -42,8 +44,9 @@ Use this when a result is surprising. An empty topic list means something very
 different depending on whether the server is pointed at a local broker or a
 production cluster, and this is the only way to tell from inside a session.
 
-"environment" is a free-form label from the configuration. It changes no
-behaviour and is only as accurate as whoever wrote the config file.
+"cluster" is the cluster this endpoint serves. A server may serve several,
+each on its own endpoint, so this is how a session confirms which one it is
+talking to rather than inferring it from a tool name the client chose.
 
 "read_only" means this server refuses operations that would change the
 cluster. It protects a cluster that has no ACLs of its own; it is not a
@@ -60,7 +63,12 @@ The password is never reported.
 // The tool names are passed in because the MCP server exposes no way to read
 // back what has been registered. Keeping the list in main, beside the
 // registrations themselves, is the closest thing to a single source.
-func Register(server *mcp.Server, kafka *kafkaclient.Client, tools []string) {
+func Register(
+	server *mcp.Server,
+	kafka *kafkaclient.Client,
+	cfg *config.Config,
+	tools []string,
+) {
 	mcp.AddTool(
 		server,
 		&mcp.Tool{
@@ -73,7 +81,7 @@ func Register(server *mcp.Server, kafka *kafkaclient.Client, tools []string) {
 			input Input,
 		) (*mcp.CallToolResult, Output, error) {
 
-			out, err := Run(kafka, tools)
+			out, err := Run(kafka, cfg, tools)
 			if err != nil {
 				return nil, Output{}, fmt.Errorf("server config: %w", err)
 			}
@@ -84,7 +92,7 @@ func Register(server *mcp.Server, kafka *kafkaclient.Client, tools []string) {
 }
 
 // Run reports the effective configuration of the running server.
-func Run(kafka *kafkaclient.Client, tools []string) (Output, error) {
+func Run(kafka *kafkaclient.Client, server *config.Config, tools []string) (Output, error) {
 	cfg := kafka.Config()
 
 	if cfg == nil {
@@ -92,17 +100,21 @@ func Run(kafka *kafkaclient.Client, tools []string) (Output, error) {
 	}
 
 	out := Output{
-		Environment:    cfg.Environment,
+		Cluster:        cfg.Name,
 		Brokers:        cfg.Brokers,
 		Authentication: "none",
 		TLS:            cfg.TLS != nil && cfg.TLS.Enabled,
 		ReadOnly:       cfg.ReadOnly,
-		OutputDir:      cfg.OutputDir,
-		ConfigFile:     cfg.Path,
 		Tools:          append([]string{}, tools...),
 		Note: "read_only protects a cluster without ACLs and can be turned off by " +
 			"anyone who can edit the configuration. Real authorisation comes from " +
 			"Kafka ACLs on the principal in sasl_user.",
+	}
+
+	if server != nil {
+		out.OutputDir = server.OutputDir
+		out.ConfigFile = server.Path
+		out.HTTPAddress = server.HTTP.Address
 	}
 
 	if cfg.SASL != nil {

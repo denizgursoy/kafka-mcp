@@ -1,4 +1,4 @@
-.PHONY: up down restart logs ps build run clean
+.PHONY: up down restart logs ps build run serve clean
 
 APP_NAME := kafka-debugger
 COMPOSE := docker compose
@@ -24,12 +24,13 @@ ps:
 build:
 	go build -o bin/$(APP_NAME) ./cmd/server
 
+# The server reads only KAFKA_MCP_CONFIG, so a run needs nothing else.
 run:
-	go run ./cmd/server
+	KAFKA_MCP_CONFIG=kafka-mcp.local.json go run ./cmd/server
 
 clean:
 	rm -rf bin
 
 # Development
 dev: up
-	go run ./cmd/server
+	KAFKA_MCP_CONFIG=kafka-mcp.local.json go run ./cmd/server
