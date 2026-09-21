@@ -1,8 +1,3 @@
----
-name: check-lag
-description: Use when asked whether a Kafka topic has consumer lag, how far behind consumers are, how fast messages are produced or consumed, or when a backlog will clear. Covers measuring lag per partition, throughput per second, minute and hour, and estimating when the lag reaches zero. Use for requests like "is there lag on this topic", "how far behind is this consumer group", "how fast are we consuming", or "when will the backlog clear".
----
-
 # Check lag
 
 Report whether a topic's consumers are behind, how fast messages move, and when

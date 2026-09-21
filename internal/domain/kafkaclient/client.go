@@ -43,12 +43,8 @@ func New(cfg *config.Cluster) (*Client, error) {
 		options = append(options, kgo.DialTLSConfig(tlsConfig))
 	}
 
-	auths := cfg.SASLMechanisms
-	if len(auths) == 0 && cfg.SASL != nil {
-		auths = []*config.SASL{cfg.SASL}
-	}
-	mechanisms := make([]sasl.Mechanism, 0, len(auths))
-	for _, auth := range auths {
+	mechanisms := make([]sasl.Mechanism, 0, len(cfg.SASL))
+	for _, auth := range cfg.SASL {
 		mechanism, err := saslMechanism(auth)
 		if err != nil {
 			return nil, err

@@ -133,6 +133,52 @@ password. Its `authentication` and `sasl_user` describe the first configured
 option; `sasl_options` lists all configured identities in preference order,
 not the mechanism negotiated by an individual broker connection.
 
+### Browser clients (CORS)
+
+A command-line client sends no `Origin` header and needs none of this. A client
+running in a browser does: the browser discards the response unless the server
+allows the origin, so the defaults already cover the MCP transport.
+
+```yaml
+http:
+  address: ":8090"
+  cors:
+    allow_origins: ["https://mcp-client.example"]
+    allow_methods: [GET, POST, DELETE, OPTIONS]
+    allow_headers: [content-type, accept, authorization, cache-control, last-event-id, mcp-session-id, mcp-protocol-version]
+    expose_headers: [Mcp-Session-Id]
+    allow_private_network: true
+    max_age: 600
+```
+
+`http.cors` is ada's CORS middleware configuration, read straight from the
+file, so every option that middleware has is available here. Each key is
+optional and keeps its own default, so setting `allow_origins` alone does not
+drop the rest. The defaults are the values above with `allow_origins: ["*"]`.
+
+Three of them are load-bearing for the MCP transport. `allow_methods` needs
+`GET`, `POST` and `DELETE`: requests are posted, the event stream is a GET,
+and a client ends its session with DELETE. `allow_headers` needs
+`mcp-session-id` and `mcp-protocol-version`, which the client sends from the
+second request onwards, and a header missing there fails the whole preflight
+rather than being dropped. `Mcp-Session-Id` must stay in `expose_headers`: the
+session id arrives on the `initialize` response, and a page that cannot read
+it cannot make a second call.
+
+`allow_private_network` answers Chrome's Private Network Access preflight,
+which a page on a public address must pass before it may reach a server on a
+private or loopback address; it defaults to on, and is granted only on a
+preflight the rest of the policy already allowed. Setting `allow_credentials`
+together with a wildcard `allow_origins` is refused by the middleware at
+startup unless `unsafe_wildcard_origin_with_allow_credentials` is also set,
+which it should not be.
+
+**These endpoints have no authentication of their own.** An allowed origin can
+drive every tool with the server's Kafka credentials, from any page the
+browser's user happens to visit. `allow_origins` is the only barrier, so narrow
+it to the pages that should have that power, and set `read_only: true` on
+clusters that should not be written to.
+
 ## Connecting a client
 
 Register one entry per cluster:
@@ -183,6 +229,23 @@ Three layers, and only one of them is real security:
 | `confirm: true` on writes | An LLM changing things on one ambiguous request | No — a guardrail |
 | `read_only: true` | Accidental writes to a cluster with no ACLs | No — anyone who can edit the config can turn it off |
 | **Kafka ACLs on the SASL principal** | **An unauthorised person** | **Yes — the broker decides** |
+
+### What a read-only endpoint exposes
+
+`read_only: true` does more than refuse a write: the endpoint does not list the
+tools whose only purpose is to write. `add_partitions` and `commit_offset` are
+absent from `tools/list` on a read-only cluster, so a client never sees a tool
+it could not have used, and their preview cannot describe a change this
+endpoint would never apply.
+
+`copy_message` stays, because `read_only` protects the cluster being written
+to and the destination is chosen per call. Copying a message out of a
+read-only production cluster is exactly what it is for.
+
+Hiding a tool decides what is advertised, not what is permitted: both tools
+still refuse at the point of mutation, so a registration mistake cannot turn
+into a write. `server_config` reports the tools the endpoint actually exposes,
+which is how a session can tell the two cases apart.
 
 ### Giving two people different permissions
 
@@ -458,13 +521,17 @@ Reports the effective configuration: brokers, environment label, authentication
 mechanism and principal, TLS, read-only state, export directory and the tools
 this server exposes. Takes no parameters. The password is never reported.
 
+`tools` is the list for this endpoint, not for the deployment: a read-only
+cluster omits `add_partitions` and `commit_offset`, because it does not register
+them.
+
 Use it when a result is surprising: an empty topic list means something very
 different on a local broker than on production.
 
 ### `add_partitions`
 
 Adds partitions to a topic. **Irreversible** — Kafka cannot reduce a partition
-count.
+count. Not exposed on a read-only cluster.
 
 | Parameter | Type | Required | Meaning |
 | --------- | ---- | -------- | ------- |
@@ -486,7 +553,7 @@ has is refused with an explanation rather than attempted.
 
 Moves a consumer group's committed offset for one partition. Forward to skip
 messages, backward to replay them. **Irreversible** in the sense that skipped
-messages are never processed.
+messages are never processed. Not exposed on a read-only cluster.
 
 | Parameter | Type | Required | Meaning |
 | --------- | ---- | -------- | ------- |
@@ -531,21 +598,28 @@ read-only, preview included, because writing is all it does.
 
 ## Skills
 
-- `internal/skills/find-message` — locating a message from something the user
-  knows about it.
-- `internal/skills/check-lag` — measuring lag and throughput, and judging when
-  a backlog will clear.
-- `internal/skills/scale-partitions` — deciding whether more partitions will
-  help, and adding them safely.
-- `internal/skills/skip-poison-message` — unblocking a consumer stuck on a
-  message it cannot process, preserving the message first.
+`skills/kafka-debugging/SKILL.md` is the one skill an agent loads. It routes to
+a guide beside it, rather than holding all four scenarios itself, so a session
+reads only the one it needs:
+
+- `find-message.md` — locating a message from something the user knows about it.
+- `check-lag.md` — measuring lag and throughput, and judging when a backlog will
+  clear.
+- `scale-partitions.md` — deciding whether more partitions will help, and adding
+  them safely.
+- `skip-poison-message.md` — unblocking a consumer stuck on a message it cannot
+  process, preserving the message first.
+
+The umbrella also resolves the overlap between them: "the consumer is behind"
+opens three of these guides, and `consumer_lag`'s `status` is what decides which
+one is right.
 
 ## Development
 
 | Command                | Purpose                                  |
 | ---------------------- | ---------------------------------------- |
 | `make up` / `make down`| Start / stop Redpanda and Console        |
-| `make build`           | Build `bin/kafka-debugger`               |
+| `make build`           | Build with goreleaser into `dist/`       |
 | `make run`             | Run the server from source               |
 | `go test ./...`        | All tests, including container tests     |
 | `go test -short ./...` | Tests that need no containers            |

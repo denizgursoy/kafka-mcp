@@ -17,48 +17,32 @@ import (
 	"github.com/rakunlabs/into"
 	"github.com/rakunlabs/logi"
 
+	mcors "github.com/rakunlabs/ada/middleware/cors"
+	mlog "github.com/rakunlabs/ada/middleware/log"
+	mrecover "github.com/rakunlabs/ada/middleware/recover"
+	mrequestid "github.com/rakunlabs/ada/middleware/requestid"
+	mserver "github.com/rakunlabs/ada/middleware/server"
+	mtelemetry "github.com/rakunlabs/ada/middleware/telemetry"
+
 	"github.com/denizgursoy/kafka-mcp/internal/domain/config"
 	"github.com/denizgursoy/kafka-mcp/internal/domain/kafkaclient"
-	"github.com/denizgursoy/kafka-mcp/internal/tools/addpartitions"
-	"github.com/denizgursoy/kafka-mcp/internal/tools/commitoffset"
-	"github.com/denizgursoy/kafka-mcp/internal/tools/consumerlag"
-	"github.com/denizgursoy/kafka-mcp/internal/tools/copymessage"
-	"github.com/denizgursoy/kafka-mcp/internal/tools/describetopic"
-	"github.com/denizgursoy/kafka-mcp/internal/tools/getmessage"
-	"github.com/denizgursoy/kafka-mcp/internal/tools/listclusters"
-	"github.com/denizgursoy/kafka-mcp/internal/tools/listconsumergroups"
-	"github.com/denizgursoy/kafka-mcp/internal/tools/listtopics"
-	"github.com/denizgursoy/kafka-mcp/internal/tools/samplemessages"
-	"github.com/denizgursoy/kafka-mcp/internal/tools/searchmessages"
-	"github.com/denizgursoy/kafka-mcp/internal/tools/serverconfig"
+	"github.com/denizgursoy/kafka-mcp/internal/tools"
+)
+
+var (
+	version = "dev"
+	commit  = "-"
+	date    = "-"
 )
 
 // pathPrefix is where the per-cluster endpoints are mounted. A cluster named
 // "prod" is served at /mcp/prod.
 const pathPrefix = "/mcp/"
 
-// toolNames is what server_config reports. The MCP server offers no way to
-// read back what has been registered, so the list is kept here beside the
-// registrations it describes.
-var toolNames = []string{
-	"add_partitions",
-	"commit_offset",
-	"consumer_lag",
-	"copy_message",
-	"describe_topic",
-	"get_message",
-	"list_clusters",
-	"list_consumer_groups",
-	"list_topics",
-	"sample_messages",
-	"search_messages",
-	"server_config",
-}
-
 func main() {
 	into.Init(run,
 		into.WithLogger(logi.InitializeLog(logi.WithCaller(false))),
-		into.WithMsgf("kafka-mcp"),
+		into.WithMsgf("kafka-mcp version:[%s] commit:[%s] buildDate:[%s]", version, commit, date),
 	)
 }
 
@@ -80,8 +64,7 @@ func run(ctx context.Context) error {
 	for _, name := range cfg.ClusterNames() {
 		servers[name] = newServer(cfg, clusters, name)
 
-		slog.Info("serving cluster", "cluster", name,
-			"path", pathPrefix+name, "read_only", cfg.Clusters[name].ReadOnly)
+		slog.Info("serving cluster", "cluster", name, "path", pathPrefix+name, "read_only", cfg.Clusters[name].ReadOnly)
 	}
 
 	// The SDK turns a nil server into a 400, so an unknown cluster needs no
@@ -93,7 +76,15 @@ func run(ctx context.Context) error {
 		nil,
 	)
 
-	server := ada.New(ada.WithLogger(slog.Default()))
+	server := ada.New()
+	server.Use(
+		mrecover.Middleware(),
+		mserver.Middleware("kafka-mcp/"+version),
+		mcors.Middleware(mcors.WithConfig(cfg.HTTP.CORS)),
+		mrequestid.Middleware(),
+		mlog.Middleware(),
+		mtelemetry.Middleware(),
+	)
 	server.HandleWildcard(pathPrefix, handler)
 
 	// A liveness endpoint that needs no MCP session, so a container
@@ -105,45 +96,33 @@ func run(ctx context.Context) error {
 	return server.StartWithContext(ctx, cfg.HTTP.Address)
 }
 
-// newServer builds the MCP server for one cluster. Every tool is bound to
-// that cluster, so nothing a caller sends can redirect it to another.
+// newServer builds the MCP server for one cluster.
+//
+// Which tools that server ends up with is not decided here: internal/tools
+// owns it, so adding or gating a tool never touches main.
 func newServer(
 	cfg *config.Config,
 	clusters *kafkaclient.Registry,
 	name string,
 ) *mcp.Server {
 
-	kafka := clusters.Get(name)
-
 	server := mcp.NewServer(
 		&mcp.Implementation{
 			// Naming the server after its cluster makes a misdirected client
 			// visible in the initialize handshake, before any tool is called.
-			Name:    "kafka-debugger-" + name,
-			Version: "1.0.0",
+			Name: "kafka-mcp-" + name,
+
+			// The build's own version, not a constant. It is the only thing a
+			// client sees that says which binary is answering, so a stale
+			// deployment is visible in the handshake rather than guessed at
+			// from tool behaviour. Local builds report "dev", which is the
+			// honest answer for one.
+			Version: version,
 		},
 		nil,
 	)
 
-	// Every tool registers itself: one call per tool, no Kafka logic and no
-	// tool schema here.
-	listtopics.Register(server, kafka.Admin())
-	listconsumergroups.Register(server, kafka.Admin())
-	consumerlag.Register(server, kafka.Admin())
-	describetopic.Register(server, kafka.Admin(), kafka.Reader())
-	samplemessages.Register(server, kafka.Admin(), kafka.Reader())
-	searchmessages.Register(server, kafka.Admin(), kafka.Reader(), cfg.OutputDir)
-	getmessage.Register(server, kafka.Reader())
-	addpartitions.Register(server, kafka, kafka.Reader())
-	commitoffset.Register(server, kafka)
-
-	// These two need the whole roster rather than one cluster: copy_message so
-	// it can write to another cluster, list_clusters so a caller can discover
-	// which names are valid.
-	copymessage.Register(server, clusters, name)
-	listclusters.Register(server, clusters)
-
-	serverconfig.Register(server, kafka, cfg, toolNames)
+	tools.Register(server, cfg, clusters, name)
 
 	return server
 }

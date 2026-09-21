@@ -277,8 +277,12 @@ func withProvenance(
 
 	principal := "anonymous"
 
-	if cfg := destination.Config(); cfg != nil && cfg.SASL != nil && cfg.SASL.User != "" {
-		principal = cfg.SASL.User
+	if cfg := destination.Config(); cfg != nil {
+		// The first configured identity is the one franz-go prefers, so it is
+		// the principal a broker is most likely to have recorded for the write.
+		if options := cfg.AuthenticationOptions(); len(options) > 0 && options[0].User != "" {
+			principal = options[0].User
+		}
 	}
 
 	provenance := []kgo.RecordHeader{

@@ -1,5 +1,10 @@
 http:
-  address: ":8090"
+  address: "127.0.0.1:8090"
+  # Defaults already allow any origin and answer Chrome's private-network
+  # preflight, which is what a browser-based MCP client needs. Narrow
+  # allow_origins before pointing this at a cluster that matters.
+  # cors:
+  #   allow_origins: ["https://mcp-client.example"]
 output_dir: /tmp/kafka-mcp-exports
 clusters:
   local:

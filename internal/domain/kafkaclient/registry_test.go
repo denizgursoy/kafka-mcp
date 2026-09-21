@@ -123,7 +123,7 @@ func (s *RegistrySuite) TestErrorsOnAMisconfiguredCluster() {
 			"broken": {
 				Name:    "broken",
 				Brokers: []string{s.env.Broker()},
-				SASL:    &config.SASL{Mechanism: "not-a-mechanism", User: "x", Password: "y"},
+				SASL:    []*config.SASL{{Mechanism: "not-a-mechanism", User: "x", Password: "y"}},
 			},
 		},
 	})

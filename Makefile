@@ -8,27 +8,27 @@ PKG := $(shell go list -m | head -n 1)
 
 .DEFAULT_GOAL := help
 
-COMPOSE := docker compose --project-name=$(PROJECT)
+COMPOSE := docker compose --project-name=$(PROJECT) -f env/docker-compose.yaml
 
-.PHONY: up
-up: ## Start environment with docker-compose (Kafka/Redpanda)
+.PHONY: env-up
+env-up: ## Start environment with docker-compose (Kafka/Redpanda)
 	$(COMPOSE) up -d
 
-.PHONY: down
-down: ## Stop environment with docker-compose
+.PHONY: env-down
+env-down: ## Stop environment with docker-compose
 	$(COMPOSE) down
 
-.PHONY: restart
-restart: ## Restart environment with docker-compose
+.PHONY: env-restart
+env-restart: ## Restart environment with docker-compose
 	$(COMPOSE) down --volumes
 	$(COMPOSE) up -d
 
-.PHONY: logs
-logs: ## Show logs from environment
+.PHONY: env-logs
+env-logs: ## Show logs from environment
 	$(COMPOSE) logs -f
 
-.PHONY: ps
-ps: ## Show status of environment
+.PHONY: env-ps
+env-ps: ## Show status of environment
 	$(COMPOSE) ps
 
 .PHONY: build
@@ -41,8 +41,9 @@ build-container: build ## Build the container image with test tag
 	docker build --platform=linux/amd64 -t $(PROJECT):test -f ci/Dockerfile dist/$(PROJECT)_linux_amd64_v1/
 
 .PHONY: run
+run: export CONFIG_FILE ?= kafka-mcp.local.yaml
 run: ## Run the application
-	CONFIG_FILE=kafka-mcp.local.yaml go run -ldflags="-X main.date=$(BUILD_DATE) -X main.commit=$(BUILD_COMMIT) -X main.version=$(VERSION)" $(MAIN_FILE)
+	go run -ldflags="-X main.date=$(BUILD_DATE) -X main.commit=$(BUILD_COMMIT) -X main.version=$(VERSION)" $(MAIN_FILE)
 
 .PHONY: help
 help: ## Display this help screen

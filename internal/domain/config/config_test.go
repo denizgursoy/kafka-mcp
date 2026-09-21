@@ -2,11 +2,14 @@ package config_test
 
 import (
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
+	mcors "github.com/rakunlabs/ada/middleware/cors"
 	"github.com/stretchr/testify/suite"
 
 	"github.com/denizgursoy/kafka-mcp/internal/domain/config"
@@ -125,6 +128,96 @@ func (s *ConfigSuite) TestDefaultsTheListenAddress() {
 		"the server must listen somewhere, and a default address means a minimal config still runs")
 }
 
+// TestCORSDefaults covers the merge chu performs over the seeded policy. A
+// browser reports almost nothing when a preflight is refused, so a key
+// silently lost between the file and the middleware would surface as "the
+// client cannot reach the server" and nothing more.
+func (s *ConfigSuite) TestCORSDefaults() {
+	s.Run("an absent cors block keeps every default", func() {
+		loaded, err := s.load(s.write(`{"clusters": {"local": {"broker": "localhost:19092"}}}`))
+
+		s.Require().NoError(err, "omitting the cors block must be allowed")
+		s.Require().Equal(config.DefaultCORS(), loaded.HTTP.CORS,
+			"a config file that says nothing about CORS must get the whole default policy, not a zero struct")
+	})
+
+	s.Run("setting one key keeps the others", func() {
+		loaded, err := s.load(s.write(`{
+			"http": {"cors": {"allow_origins": ["https://allowed.example"]}},
+			"clusters": {"local": {"broker": "localhost:19092"}}
+		}`))
+
+		s.Require().NoError(err, "narrowing the origins must be allowed")
+		s.Require().Equal([]string{"https://allowed.example"}, loaded.HTTP.CORS.AllowOrigins,
+			"the configured origin must win, or narrowing the policy does nothing")
+		s.Require().Equal(config.DefaultCORS().AllowHeaders, loaded.HTTP.CORS.AllowHeaders,
+			"narrowing the origins must not drop the MCP headers, or the allowed origin still cannot call the server")
+		s.Require().Equal(config.DefaultCORS().AllowMethods, loaded.HTTP.CORS.AllowMethods,
+			"the transport needs GET, POST and DELETE, and an unrelated key must not take them away")
+		s.Require().True(loaded.HTTP.CORS.AllowPrivateNetwork,
+			"an unmentioned key must keep its default, including the one that is true by default")
+	})
+
+	s.Run("private network access can be turned off", func() {
+		loaded, err := s.load(s.write(`{
+			"http": {"cors": {"allow_private_network": false}},
+			"clusters": {"local": {"broker": "localhost:19092"}}
+		}`))
+
+		s.Require().NoError(err, "disabling private network access must be allowed")
+		s.Require().False(loaded.HTTP.CORS.AllowPrivateNetwork,
+			"an explicit false must be distinguishable from an absent key, or the setting cannot be turned off at all")
+	})
+
+	s.Run("the defaults answer the preflight an MCP client sends", func() {
+		handler := mcors.Middleware(mcors.WithConfig(config.DefaultCORS()))(
+			http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusOK)
+			}))
+
+		request := httptest.NewRequestWithContext(
+			s.T().Context(), http.MethodOptions, "/mcp/local", nil)
+		request.Header.Set("Origin", "https://mcp-client.example")
+		request.Header.Set("Access-Control-Request-Method", http.MethodPost)
+		request.Header.Set("Access-Control-Request-Headers",
+			"content-type,mcp-session-id,mcp-protocol-version")
+		request.Header.Set("Access-Control-Request-Private-Network", "true")
+
+		recorder := httptest.NewRecorder()
+		handler.ServeHTTP(recorder, request)
+
+		s.Require().Equal("*", recorder.Header().Get("Access-Control-Allow-Origin"),
+			"without an allow-origin the browser discards the response, so the client never sees the server at all")
+		s.Require().Contains(recorder.Header().Get("Access-Control-Allow-Headers"), "mcp-session-id",
+			"every request after initialize carries the session id, so refusing it limits the client to one call")
+		s.Require().Contains(recorder.Header().Get("Access-Control-Allow-Headers"), "mcp-protocol-version",
+			"the SDK sends the negotiated protocol version on later requests, so refusing it breaks them")
+		s.Require().Contains(recorder.Header().Get("Access-Control-Allow-Methods"), http.MethodDelete,
+			"a client ends its session with DELETE, so refusing it leaks sessions on the server")
+		s.Require().Equal("true", recorder.Header().Get("Access-Control-Allow-Private-Network"),
+			"a public page reaching a server on a private address is blocked by Chrome without this, which is the common case for a local broker")
+	})
+
+	s.Run("the session id is readable by the page", func() {
+		handler := mcors.Middleware(mcors.WithConfig(config.DefaultCORS()))(
+			http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusOK)
+			}))
+
+		request := httptest.NewRequestWithContext(
+			s.T().Context(), http.MethodPost, "/mcp/local", nil)
+		request.Header.Set("Origin", "https://mcp-client.example")
+
+		recorder := httptest.NewRecorder()
+		handler.ServeHTTP(recorder, request)
+
+		s.Require().Equal(http.StatusOK, recorder.Code,
+			"a non-preflight request must reach the handler, not be answered by the CORS middleware")
+		s.Require().Contains(recorder.Header().Get("Access-Control-Expose-Headers"), "Mcp-Session-Id",
+			"an unexposed session id is invisible to JavaScript, so the client cannot continue the session it just opened")
+	})
+}
+
 func (s *ConfigSuite) TestOutputDirectoryFallsBackToTheTempDirectory() {
 	path := s.write(`{"clusters": {"local": {"broker": "localhost:19092"}}}`)
 
@@ -151,9 +244,11 @@ func (s *ConfigSuite) TestResolvesPasswordPerCluster() {
 	loaded, err := s.load(path)
 
 	s.Require().NoError(err, "interpolating a password from the environment must succeed")
-	s.Require().Equal("prod-secret", loaded.Clusters["prod"].SASL.Password,
+	s.Require().Len(loaded.Clusters["prod"].SASL, 1,
+		"the legacy single sasl block must resolve to a list of exactly one mechanism")
+	s.Require().Equal("prod-secret", loaded.Clusters["prod"].SASL[0].Password,
 		"the placeholder must be replaced with the real secret, which is what keeps it out of the file")
-	s.Require().Nil(loaded.Clusters["local"].SASL,
+	s.Require().Empty(loaded.Clusters["local"].SASL,
 		"a cluster without authentication must stay unauthenticated, not inherit another cluster's identity")
 }
 
@@ -193,7 +288,9 @@ func (s *ConfigSuite) TestReadsPasswordFromAFile() {
 	loaded, err := s.load(path)
 
 	s.Require().NoError(err, "reading a password from a file must succeed")
-	s.Require().Equal("file-secret", loaded.Clusters["prod"].SASL.Password,
+	s.Require().Len(loaded.Clusters["prod"].SASL, 1,
+		"the legacy single sasl block must resolve to a list of exactly one mechanism")
+	s.Require().Equal("file-secret", loaded.Clusters["prod"].SASL[0].Password,
 		"the trailing newline must be trimmed, because mounted secret files almost always carry one and Kafka would reject the password")
 }
 
@@ -295,12 +392,12 @@ func (s *ConfigSuite) TestSecurityConfiguration() {
 			]}}}}`))
 		s.Require().NoError(err, "wkafka-style security must load with independently configured mechanisms")
 		cfg := loaded.Clusters["prod"]
-		s.Require().Len(cfg.SASLMechanisms, 2, "all enabled mechanisms must survive parsing for broker negotiation")
-		s.Require().Equal(config.MechanismScramSHA512, cfg.SASLMechanisms[0].Mechanism, "preference order must survive normalization")
-		s.Require().Equal("secret-from-env", cfg.SASLMechanisms[0].Password, "environment secrets must resolve inside security.sasl")
-		s.Require().True(cfg.SASLMechanisms[0].IsToken, "delegation tokens require the SCRAM token attribute")
-		s.Require().Equal("delegate", cfg.SASLMechanisms[0].Zid, "authorization identity must survive parsing")
-		s.Require().Equal("proxy", cfg.SASLMechanisms[1].Zid, "PLAIN must also preserve authorization identity")
+		s.Require().Len(cfg.SASL, 2, "all enabled mechanisms must survive parsing for broker negotiation")
+		s.Require().Equal(config.MechanismScramSHA512, cfg.SASL[0].Mechanism, "preference order must survive normalization")
+		s.Require().Equal("secret-from-env", cfg.SASL[0].Password, "environment secrets must resolve inside security.sasl")
+		s.Require().True(cfg.SASL[0].IsToken, "delegation tokens require the SCRAM token attribute")
+		s.Require().Equal("delegate", cfg.SASL[0].Zid, "authorization identity must survive parsing")
+		s.Require().Equal("proxy", cfg.SASL[1].Zid, "PLAIN must also preserve authorization identity")
 		s.Require().Equal("client.pem", cfg.TLS.CertFile, "mTLS needs the client certificate as well as a CA")
 		s.Require().Equal("client.key", cfg.TLS.KeyFile, "mTLS needs the key paired with the certificate")
 		s.Require().NotContains(cfg.Describe(), "password", "configuration reporting must never expose credentials")
@@ -309,12 +406,13 @@ func (s *ConfigSuite) TestSecurityConfiguration() {
 		secret := s.write("mounted-secret\n")
 		loaded, err := s.load(s.write(`{"clusters":{"prod":{"broker":"kafka:9093","security":{"sasl":[{"plain":{"enabled":true,"user":"alice","password_file":"` + secret + `"}}]}}}}`))
 		s.Require().NoError(err, "mounted secrets must remain usable in the new layout")
-		s.Require().Equal("mounted-secret", loaded.Clusters["prod"].SASL.Password, "mounted secret newlines must not become part of the password")
+		s.Require().Len(loaded.Clusters["prod"].SASL, 1, "one enabled entry must resolve to one mechanism")
+		s.Require().Equal("mounted-secret", loaded.Clusters["prod"].SASL[0].Password, "mounted secret newlines must not become part of the password")
 	})
 	s.Run("disabled mechanisms", func() {
 		loaded, err := s.load(s.write(`{"clusters":{"local":{"broker":"localhost:9092","security":{"sasl":[{"scram":{"algorithm":"invalid","pass":"{env:UNUSED_SECRET}"}}]}}}}`))
 		s.Require().NoError(err, "disabled entries must not require credentials or resolve unused secrets")
-		s.Require().Nil(loaded.Clusters["local"].SASL, "no enabled entries means a plaintext unauthenticated connection")
+		s.Require().Empty(loaded.Clusters["local"].SASL, "no enabled entries means a plaintext unauthenticated connection")
 	})
 	s.Run("mixed layouts", func() {
 		_, err := s.load(s.write(`{"clusters":{"prod":{"broker":"kafka:9093","tls":{"enabled":true},"security":{}}}}`))
@@ -351,7 +449,8 @@ func (s *ConfigSuite) TestOAuthConfiguration() {
 		s.T().Setenv("OAUTH_SECRET", "client-secret-value")
 		loaded, err := s.load(s.write(`{"clusters":{"prod":{"broker":"kafka:9093","security":{"sasl":[{"oauth":{"enabled":true,"token_url":"https://idp.example/token","client_id":"kafka-mcp","client_secret":"{env:OAUTH_SECRET}","scopes":["kafka"],"timeout":"3s","zid":"delegate","extensions":{"tenant":"test"}}}]}}}}`))
 		s.Require().NoError(err, "OAuth client credentials must load using wkafka's configuration names")
-		auth := loaded.Clusters["prod"].SASL
+		s.Require().Len(loaded.Clusters["prod"].SASL, 1, "one enabled OAuth entry must resolve to one mechanism")
+		auth := loaded.Clusters["prod"].SASL[0]
 		s.Require().Equal(config.MechanismOAuth, auth.Mechanism, "OAuth must select OAUTHBEARER, not anonymous authentication")
 		s.Require().Equal("client-secret-value", auth.OAuth.ClientSecret, "client secrets must support environment substitution")
 		s.Require().Equal(3*time.Second, auth.OAuth.Timeout, "duration strings must bound token endpoint requests")
@@ -365,7 +464,8 @@ func (s *ConfigSuite) TestOAuthConfiguration() {
 		s.T().Setenv("OAUTH_TOKEN", "static-token-secret")
 		loaded, err := s.load(s.write(`{"clusters":{"prod":{"broker":"kafka:9093","security":{"sasl":[{"oauth":{"enabled":true,"token":"{env:OAUTH_TOKEN}"}}]}}}}`))
 		s.Require().NoError(err, "static tokens must not require client credentials")
-		s.Require().Equal("static-token-secret", loaded.Clusters["prod"].SASL.OAuth.Token, "token placeholders must be resolved before authentication")
+		s.Require().Len(loaded.Clusters["prod"].SASL, 1, "a static token must still resolve to one mechanism")
+		s.Require().Equal("static-token-secret", loaded.Clusters["prod"].SASL[0].OAuth.Token, "token placeholders must be resolved before authentication")
 		data, err := json.Marshal(loaded.Clusters["prod"].Describe())
 		s.Require().NoError(err, "static-token configuration must be reportable")
 		s.Require().NotContains(string(data), "static-token-secret", "static bearer tokens must never be reported")

@@ -11,11 +11,13 @@ package config
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"os"
 	"regexp"
 	"sort"
 	"strings"
 
+	mcors "github.com/rakunlabs/ada/middleware/cors"
 	"github.com/rakunlabs/chu"
 	"github.com/rakunlabs/chu/loader/loaderenv"
 )
@@ -88,6 +90,66 @@ type SASLSCRAM struct {
 // HTTP controls where the server listens.
 type HTTP struct {
 	Address string `cfg:"address" default:":8080"`
+
+	// CORS is ada's own CORS configuration, filled straight from the config
+	// file. Its `cfg` tags are the config keys, so the middleware gains an
+	// option and this server gains it with it, without a mapping in between
+	// that can quietly fall behind.
+	CORS mcors.Cors `cfg:"cors"`
+}
+
+// DefaultCORS is the policy the server starts from, and what it keeps for
+// every key the config file does not mention.
+//
+// A command-line MCP client sends no Origin header and none of this applies to
+// it. A client running in a browser is another matter: the browser discards
+// the response unless the server allows the origin, and tells the page almost
+// nothing about why, so these values decide whether a browser-based client can
+// talk to this server at all.
+func DefaultCORS() mcors.Cors {
+	return mcors.Cors{
+		// Every origin, because the endpoints are otherwise unreachable from
+		// a browser and this is a debugging tool. It is also the widest the
+		// policy ever gets: an allowed origin can drive every tool with the
+		// server's Kafka credentials, so a deployment that can reach a
+		// cluster worth protecting should narrow it.
+		AllowOrigins: []string{"*"},
+
+		// The streamable HTTP transport posts requests, opens the event
+		// stream with GET, and ends the session with DELETE.
+		AllowMethods: []string{
+			http.MethodGet,
+			http.MethodPost,
+			http.MethodDelete,
+			http.MethodOptions,
+		},
+
+		// A header missing here fails the whole preflight rather than being
+		// dropped, and the transport needs the two mcp- ones from the second
+		// request onwards.
+		AllowHeaders: []string{
+			"content-type",
+			"accept",
+			"authorization",
+			"cache-control",
+			"last-event-id",
+			"mcp-session-id",
+			"mcp-protocol-version",
+		},
+
+		// The session id arrives on the initialize response, and a page that
+		// cannot read it cannot make a second call.
+		ExposeHeaders: []string{"Mcp-Session-Id"},
+
+		// Answers Chrome's Private Network Access preflight, which a page on
+		// a public address must pass before it may reach a server on a
+		// private or loopback address. On by default because that is the
+		// usual shape of a browser client here, and the alternative failure
+		// is a browser error with no server-side trace.
+		AllowPrivateNetwork: true,
+
+		MaxAge: 600,
+	}
 }
 
 // cluster holds a cluster's input before splitting the comma-separated brokers.
@@ -111,15 +173,17 @@ type Cluster struct {
 	// Name is the key from the config file. It names the HTTP path the
 	// cluster is served on and is reported by list_clusters, so it is carried
 	// here rather than left as only a map key.
-	Name string
+	Name string `cfg:"name"`
 
-	Brokers  []string
-	ReadOnly bool
-	TLS      *TLS
-	SASL     *SASL
-	// SASLMechanisms contains enabled mechanisms in configured preference order.
-	// SASL is the first entry, retained for legacy callers and reporting.
-	SASLMechanisms []*SASL
+	Brokers  []string `cfg:"brokers"`
+	ReadOnly bool     `cfg:"read_only"`
+	TLS      *TLS     `cfg:"tls"`
+
+	// SASL holds every enabled mechanism in configured preference order, so
+	// both config forms end up as the same thing: the legacy single `sasl`
+	// block is a list of one, and `security.sasl` is the list it declares.
+	// franz-go is handed all of them and settles on one the broker offers.
+	SASL []*SASL `cfg:"sasl"`
 }
 
 // Config is the effective configuration the server runs with.
@@ -153,6 +217,12 @@ func (c *Config) ClusterNames() []string {
 // Load uses chu's default, file, HTTP and environment loaders.
 func Load(ctx context.Context) (*Config, error) {
 	var parsed file
+
+	// Seeded before loading, because chu merges the file over the struct it
+	// is given rather than replacing it. A key the file omits keeps its
+	// default, a key it sets wins, and `allow_private_network: false` is
+	// still distinguishable from the field being absent.
+	parsed.HTTP.CORS = DefaultCORS()
 
 	if err := chu.Load(ctx, "kafka-mcp", &parsed,
 		chu.WithLoaderOption(loaderenv.New(loaderenv.WithPrefix("KAFKA_MCP_"))),
@@ -210,7 +280,6 @@ func resolveCluster(name string, parsed *cluster) (*Cluster, error) {
 		Brokers:  splitBrokers(parsed.Broker),
 		ReadOnly: parsed.ReadOnly,
 		TLS:      parsed.TLS,
-		SASL:     parsed.SASL,
 	}
 
 	if len(resolved.Brokers) == 0 {
@@ -254,22 +323,23 @@ func resolveCluster(name string, parsed *cluster) (*Cluster, error) {
 				continue
 			}
 			if auth.OAuth == nil {
-				if err := resolveSASL(&Cluster{Name: name, SASL: auth}); err != nil {
+				if err := resolveSASL(auth, name); err != nil {
 					return nil, fmt.Errorf("security.sasl[%d]: %w", i, err)
 				}
 			}
-			for _, previous := range resolved.SASLMechanisms {
+			for _, previous := range resolved.SASL {
 				if previous.Mechanism == auth.Mechanism {
 					return nil, fmt.Errorf("cluster %q: duplicate sasl mechanism %q", name, auth.Mechanism)
 				}
 			}
-			resolved.SASLMechanisms = append(resolved.SASLMechanisms, auth)
+			resolved.SASL = append(resolved.SASL, auth)
 		}
-		if len(resolved.SASLMechanisms) > 0 {
-			resolved.SASL = resolved.SASLMechanisms[0]
+	} else if parsed.SASL != nil {
+		if err := resolveSASL(parsed.SASL, name); err != nil {
+			return nil, err
 		}
-	} else if err := resolveSASL(resolved); err != nil {
-		return nil, err
+
+		resolved.SASL = []*SASL{parsed.SASL}
 	}
 	if t := resolved.TLS; t != nil && t.Enabled && (t.CertFile == "") != (t.KeyFile == "") {
 		return nil, fmt.Errorf("cluster %q: tls cert_file and key_file must be supplied together", name)
@@ -280,32 +350,32 @@ func resolveCluster(name string, parsed *cluster) (*Cluster, error) {
 
 // resolveSASL validates the mechanism and turns whichever password form was
 // used into the actual secret.
-func resolveSASL(cluster *Cluster) error {
-	if cluster.SASL == nil {
+func resolveSASL(auth *SASL, name string) error {
+	if auth == nil {
 		return nil
 	}
 
-	mechanism := strings.ToLower(strings.TrimSpace(cluster.SASL.Mechanism))
+	mechanism := strings.ToLower(strings.TrimSpace(auth.Mechanism))
 
 	switch mechanism {
 	case MechanismPlain, MechanismScramSHA256, MechanismScramSHA512:
-		cluster.SASL.Mechanism = mechanism
+		auth.Mechanism = mechanism
 	case "":
 		return fmt.Errorf(
 			"config: cluster %q sasl needs a mechanism, one of %s, %s or %s",
-			cluster.Name, MechanismPlain, MechanismScramSHA256, MechanismScramSHA512)
+			name, MechanismPlain, MechanismScramSHA256, MechanismScramSHA512)
 	default:
 		return fmt.Errorf(
 			"config: cluster %q has unsupported sasl mechanism %q, must be one of %s, %s or %s",
-			cluster.Name, cluster.SASL.Mechanism,
+			name, auth.Mechanism,
 			MechanismPlain, MechanismScramSHA256, MechanismScramSHA512)
 	}
 
-	if cluster.SASL.User == "" {
-		return fmt.Errorf("config: cluster %q sasl needs a user", cluster.Name)
+	if auth.User == "" {
+		return fmt.Errorf("config: cluster %q sasl needs a user", name)
 	}
 
-	password, err := resolvePassword(cluster.SASL, cluster.Name)
+	password, err := resolvePassword(auth, name)
 	if err != nil {
 		return err
 	}
@@ -315,11 +385,11 @@ func resolveSASL(cluster *Cluster) error {
 	if password == "" {
 		return fmt.Errorf(
 			"config: cluster %q sasl user %q has no password: set password, password_file, or use {env:VAR}",
-			cluster.Name, cluster.SASL.User)
+			name, auth.User)
 	}
 
-	cluster.SASL.Password = password
-	cluster.SASL.PasswordFile = ""
+	auth.Password = password
+	auth.PasswordFile = ""
 
 	return nil
 }
@@ -390,12 +460,8 @@ type SASLIdentity struct {
 // AuthenticationOptions reports configured identities in preference order,
 // not the mechanism negotiated by any individual broker connection.
 func (c *Cluster) AuthenticationOptions() []SASLIdentity {
-	auths := c.SASLMechanisms
-	if len(auths) == 0 && c.SASL != nil {
-		auths = []*SASL{c.SASL}
-	}
-	identities := make([]SASLIdentity, 0, len(auths))
-	for _, auth := range auths {
+	identities := make([]SASLIdentity, 0, len(c.SASL))
+	for _, auth := range c.SASL {
 		identity := SASLIdentity{Mechanism: auth.Mechanism, User: auth.User, Zid: auth.Zid}
 		if auth.OAuth != nil {
 			identity.ClientID = auth.OAuth.ClientID

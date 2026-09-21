@@ -35,7 +35,7 @@ func (s *AuthenticationSuite) TestAuthenticatedConnections() {
 	s.env.Produce(s.T(), topic, testenv.Message{Value: "protected-message"})
 	cfg := &config.Cluster{
 		Name: "secured", Brokers: []string{s.env.Broker()},
-		SASLMechanisms: []*config.SASL{{Mechanism: config.MechanismScramSHA256, User: testenv.SASLUser, Password: testenv.SASLPassword}},
+		SASL: []*config.SASL{{Mechanism: config.MechanismScramSHA256, User: testenv.SASLUser, Password: testenv.SASLPassword}},
 	}
 	client, err := kafkaclient.New(cfg)
 	s.Require().NoError(err, "valid SCRAM settings must build a client")
@@ -62,7 +62,7 @@ func (s *AuthenticationSuite) TestAuthenticatedConnections() {
 	})
 	s.Run("wrong password is refused", func() {
 		bad, err := kafkaclient.New(&config.Cluster{Brokers: cfg.Brokers,
-			SASL: &config.SASL{Mechanism: config.MechanismScramSHA256, User: testenv.SASLUser, Password: "wrong"}})
+			SASL: []*config.SASL{{Mechanism: config.MechanismScramSHA256, User: testenv.SASLUser, Password: "wrong"}}})
 		s.Require().NoError(err, "credentials are checked by the broker on connection")
 		defer bad.Close()
 		ctx, cancel := context.WithTimeout(s.T().Context(), 5*time.Second)

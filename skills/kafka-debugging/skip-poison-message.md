@@ -1,8 +1,3 @@
----
-name: skip-poison-message
-description: Use when a Kafka consumer is stuck on a message it cannot process — a poison message, a malformed payload, or a consumer that keeps failing on the same offset and never advances. Covers confirming the consumer is genuinely blocked, preserving the message before it becomes unreachable, and moving the consumer group past it. Use for requests like "the consumer is stuck", "skip this bad message", "our consumer keeps crashing on the same record", or "unblock the payments consumer".
----
-
 # Skip a poison message
 
 Move a consumer group past a message it cannot process, after preserving the
@@ -29,6 +24,9 @@ same message", or "skip this record and move on".
 
 Call `server_config` **first**. If `read_only` is true, stop here.
 
+A read-only endpoint does not expose `commit_offset` at all, so there is no
+preview to fall back on either.
+
 Tell the user the message can be diagnosed but not skipped, and that skipping
 needs a server configured without `read_only`. Do not walk them through
 finding and preserving the message for a fix that cannot happen: that wastes
@@ -52,7 +50,7 @@ It is **not** a poison message when:
 - **`status: draining`** — it is working, just slowly. Skipping loses data for
   no reason.
 - **`status: growing`** — consumers cannot keep up. That is a capacity problem;
-  see the scale-partitions skill.
+  see [scale-partitions.md](scale-partitions.md).
 
 Say so plainly when the diagnosis does not fit. Skipping a message that was
 going to be processed anyway destroys data for nothing.

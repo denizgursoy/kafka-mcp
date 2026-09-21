@@ -1,8 +1,3 @@
----
-name: find-message
-description: Use when locating Kafka messages by their content — finding a message by order id, correlation id, customer id or message key, or selecting messages by a field condition such as event type or amount. Covers searching a topic, reading the scan report before answering, and handling large result sets. Use for requests like "find the message for order 12345", "which message had this correlation id", or "show me the failed payments over 500".
----
-
 # Find a message
 
 Locate Kafka messages by their content, when the user knows something about a

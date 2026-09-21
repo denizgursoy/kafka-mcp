@@ -14,14 +14,16 @@ debugging capabilities as MCP tools. It is written in Go and uses:
 Layout:
 
 ```
-cmd/server/main.go        MCP server entrypoint, tool registration
-internal/tools/           One package per MCP tool, and nothing else
+cmd/server/main.go        MCP server entrypoint: config, HTTP, one server per cluster
+internal/tools/
+  tools.go                Which tools an endpoint exposes, and their registration
+  <tool>/                 One package per MCP tool
 internal/domain/          Everything shared by more than one tool
   config/                 The server's own configuration
   kafkaclient/            The Kafka connections, one per cluster
   records/                Reading and rendering Kafka records
   testenv/                Test container environment (broker + Console)
-internal/skills/          Skills describing how tools are used together
+skills/kafka-debugging/   One umbrella skill, one guide per scenario
 docker-compose.yml        Local Redpanda + Redpanda Console
 Makefile                  Build, run and compose targets
 ```
@@ -31,8 +33,10 @@ Makefile                  Build, run and compose targets
 There are three places code can go, and which one is decided by how many tools
 use it.
 
-`internal/tools` holds tools and nothing else. Every directory under it is one
-MCP tool, so the list of directories is the list of tools the server exposes.
+Every directory under `internal/tools` is one MCP tool, so the list of
+directories is the list of tools the server has. The single file at the top of
+it, `tools.go`, is the registry: it says which of those tools a given endpoint
+exposes and wires each one to its cluster. Nothing else goes there.
 
 - **Used by one tool** — keep it in that tool's own package, as another file in
   the same directory. Do not give it a package of its own: a package used from
@@ -42,7 +46,8 @@ MCP tool, so the list of directories is the list of tools the server exposes.
   `internal/domain/kafkaclient`).
 
 Nothing else belongs at the top of `internal`: shared code goes in
-`internal/domain`, tools in `internal/tools`, skills in `internal/skills`.
+`internal/domain` and tools in `internal/tools`. Skills are not code and live
+at the repository root, under `skills/`.
 
 Move a helper out of a tool package the moment a second tool needs it, and move
 it back if it ever drops to one caller again. **Ask the user for approval
@@ -51,9 +56,16 @@ on.
 
 ## Skill-driven development
 
-Tools exist to serve skills. A skill in `internal/skills/` describes a real debugging
-scenario, and the tools are whatever that scenario needs — not a wishlist of
-Kafka features. So development starts from the skill, never from the tool.
+Tools exist to serve skills. `skills/kafka-debugging/` holds one umbrella
+`SKILL.md` that routes to a guide per scenario, and each guide describes a real
+debugging scenario. The tools are whatever those scenarios need — not a
+wishlist of Kafka features. So development starts from the skill, never from
+the tool.
+
+A new scenario is a new guide beside the others plus a row in the umbrella's
+routing table, not a new `SKILL.md`: a second `SKILL.md` under `skills/` would
+be discovered as a separate skill, and the discovery rule requires its `name`
+to match its directory.
 
 When asked to build or extend a skill, work in this order and **do not write
 code before step 4**.
@@ -69,8 +81,9 @@ scenario is wasted work no matter how well it is written.
 
 List the tools the server already exposes and map each step of the scenario to
 one. Reuse beats addition: a parameter on an existing tool is usually better
-than a new tool. Check `cmd/server/main.go` for what is actually registered,
-not what a skill file claims — skills may name tools that do not exist yet.
+than a new tool. Check `internal/tools/tools.go` for what is actually
+registered, not what a skill file claims — skills may name tools that do not
+exist yet.
 
 ### 3. State the gap and get approval
 
@@ -301,14 +314,20 @@ func Register(server *mcp.Server, admin *kadm.Client) {
 }
 ```
 
-`main.go` then contains exactly one line per tool, and nothing else about it:
+`internal/tools/tools.go` then contains exactly one line per tool, and nothing
+else about it:
 
 ```go
 listtopics.Register(server, kafka.Admin())
 ```
 
-No tool names, descriptions, schemas, handlers or Kafka logic in `main.go`.
-Adding a tool must never mean growing `main`.
+The tool's name goes in the `names` slice in the same function, because
+`server_config` reports that list and the MCP server cannot be asked what it
+holds. Registering a tool without listing it there makes `server_config` lie.
+
+No tool names, descriptions, schemas, handlers or Kafka logic in `cmd/server`.
+Adding a tool must never mean touching `main`, which knows only that
+`tools.Register` exists.
 
 Write tool descriptions and `jsonschema` tags for an LLM caller. State what the
 tool returns and what each parameter does, including whether it is optional and
@@ -390,6 +409,20 @@ at the compose broker and is what local runs use.
   because a preview of a capability the server does not have is misleading.
   Destructive changes also take a `confirm` parameter and do nothing without
   it.
+- A tool whose only purpose is to change the cluster it is bound to is not
+  registered at all on a read-only cluster. `tools.Register` gates it on
+  `kafka.Config().ReadOnly`, so the endpoint's tool list is the list of what it
+  can do, and a caller spends no call discovering a refusal. This decides what
+  is advertised, not what is permitted: `RequireWritable` stays inside the tool,
+  so a registration mistake still cannot write. A tool that only reads, and a
+  tool that writes to a cluster chosen per call (`copy_message`), stay
+  registered everywhere.
+- `server_config` reports the tools of **its own endpoint**. Its list is built
+  in `tools.Register` beside the registrations, because the MCP server offers no
+  way to read back what was added. A conditional registration that is not
+  matched there makes `server_config` lie about a protected cluster, which is
+  worse than not reporting the list at all. `internal/tools/tools_test.go`
+  asserts the two agree on both a read-only and a writable cluster.
 - `read_only` is enforced by this server and never delegated to Kafka ACLs.
   Many clusters have no ACLs at all, so a tool that relies on the broker to
   refuse it has no protection there. Where ACLs do exist they are a second and

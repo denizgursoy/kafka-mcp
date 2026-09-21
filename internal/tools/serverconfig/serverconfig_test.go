@@ -88,11 +88,11 @@ func (s *ServerConfigSuite) TestReportsTheSASLPrincipal() {
 	client := s.client(&config.Cluster{
 		Name:    "prod",
 		Brokers: []string{"kafka:9093"},
-		SASL: &config.SASL{
+		SASL: []*config.SASL{{
 			Mechanism: config.MechanismScramSHA256,
 			User:      "kafka-mcp-readonly",
 			Password:  "super-secret-value",
-		},
+		}},
 	})
 
 	out, err := serverconfig.Run(client, nil, nil)
@@ -110,11 +110,11 @@ func (s *ServerConfigSuite) TestNeverRevealsThePassword() {
 	client := s.client(&config.Cluster{
 		Name:    "prod",
 		Brokers: []string{"kafka:9093"},
-		SASL: &config.SASL{
+		SASL: []*config.SASL{{
 			Mechanism: config.MechanismPlain,
 			User:      "ali",
 			Password:  secret,
-		},
+		}},
 	})
 
 	out, err := serverconfig.Run(client, nil, nil)

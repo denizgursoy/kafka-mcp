@@ -53,6 +53,12 @@ talking to rather than inferring it from a tool name the client chose.
 cluster. It protects a cluster that has no ACLs of its own; it is not a
 security boundary, because whoever can edit the configuration can turn it off.
 
+"tools" is what this endpoint exposes, not what the deployment can do. A
+read-only cluster does not register the tools whose only purpose is to change
+it, so they are absent here and absent from the tool list. Do not tell the user
+a tool is missing when this reports read_only true: the cluster is protected,
+which is a different answer.
+
 "authentication" and "sasl_user" describe the first configured SASL option.
 "sasl_options" lists all configured mechanisms and identities in preference
 order, including optional authorization identities (zid). These are configured

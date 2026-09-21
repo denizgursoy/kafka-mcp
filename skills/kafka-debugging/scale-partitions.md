@@ -1,8 +1,3 @@
----
-name: scale-partitions
-description: Use when asked to add partitions to a Kafka topic, increase partition count, or scale a topic for more consumer parallelism. Covers checking whether scaling will actually help, the irreversible loss of key ordering, previewing the change before applying it, and verifying the result. Use for requests like "add partitions to this topic", "increase partition count", "scale up orders", or "we need more consumers on this topic".
----
-
 # Scale partitions
 
 Add partitions to a topic, safely and only when it will actually help.
@@ -19,8 +14,22 @@ Use this when the user says "add partitions", "increase the partition count",
 | `describe_topic`       | Current partition count and layout                  |
 | `sample_messages`      | Whether messages are keyed, and by what             |
 | `add_partitions`       | Previewing and applying the change                  |
+| `server_config`        | Checking the server may change the cluster at all   |
 
 ## Steps
+
+### 0. Check the server may change anything
+
+Call `server_config` **first**. If `read_only` is true, stop here.
+
+A read-only endpoint does not expose `add_partitions` at all, so there is no
+preview to fall back on. Tell the user the topic can be diagnosed but not
+scaled, and that scaling needs a server configured without `read_only`. Do not
+walk them through the investigation below for a change that cannot happen.
+
+Steps 1 and 2 are still worth doing on their own terms, because knowing whether
+scaling would help is useful even when this server cannot apply it. What stops
+is the promise of a fix.
 
 ### 1. Check that scaling is the right answer
 
@@ -97,8 +106,8 @@ adding partitions needs ALTER on the topic for the principal this server
 connects as. That is a request to whoever administers the cluster, not
 something to work around.
 
-If the server is read-only, `add_partitions` refuses. That is configuration,
-not Kafka.
+If `add_partitions` is not among the tools at all, the cluster is read-only and
+step 0 was skipped. That is this server's configuration, not Kafka.
 
 ### 6. Verify and explain what happens next
 
