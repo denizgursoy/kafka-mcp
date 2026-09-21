@@ -46,6 +46,15 @@ func (s *AuthenticationSuite) TestAuthenticatedConnections() {
 		defer cancel()
 		s.Require().NoError(client.Ping(ctx), "the main client must authenticate to the protected broker")
 	})
+	s.Run("testenv cluster client preserves authentication", func() {
+		ctx, cancel := context.WithTimeout(s.T().Context(), 10*time.Second)
+		defer cancel()
+
+		testClient := s.env.ClusterClient(s.T(), false)
+
+		s.Require().NoError(testClient.Ping(ctx),
+			"the shared production-shaped test client must carry the environment's SCRAM credentials rather than connecting anonymously")
+	})
 	s.Run("reader authenticates independently", func() {
 		session, err := client.Reader().Session(topic)
 		s.Require().NoError(err, "the independent reading session must build")

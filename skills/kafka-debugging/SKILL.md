@@ -1,11 +1,11 @@
 ---
 name: kafka-debugging
-description: Use when debugging a Kafka cluster through the kafka-mcp server — finding a message by order id, correlation id, key or a field condition; measuring consumer lag, throughput and when a backlog will clear; unblocking a consumer stuck on a poison message; or adding partitions to a topic. Use for requests like "find the message for order 12345", "which message had this correlation id", "is there lag on orders", "how far behind is this consumer group", "how fast are we consuming", "the consumer is stuck", "skip this bad message", "add partitions to this topic", or "when will the backlog clear". Routes to the guide for the scenario, so read this before calling the tools.
+description: Use when debugging a Kafka cluster through the kafka-mcp server — finding a message by order id, correlation id, key or a field condition; measuring consumer lag, throughput and when a backlog will clear; unblocking a consumer stuck on a poison message; adding partitions to a topic; or creating a topic. Use for requests like "find the message for order 12345", "which message had this correlation id", "is there lag on orders", "how far behind is this consumer group", "how fast are we consuming", "the consumer is stuck", "skip this bad message", "add partitions to this topic", "create a topic", "we need a dead letter topic", or "when will the backlog clear". Routes to the guide for the scenario, so read this before calling the tools.
 ---
 
 # Kafka debugging
 
-Four scenarios, one per guide. Read the guide for the scenario before calling
+Five scenarios, one per guide. Read the guide for the scenario before calling
 any tool: each one exists because the obvious sequence of calls gets the answer
 wrong in a specific way.
 
@@ -17,6 +17,7 @@ wrong in a specific way.
 | Whether consumers are behind, how fast, when it clears | [check-lag.md](check-lag.md) |
 | Why a consumer is stuck, and how to get it moving | [skip-poison-message.md](skip-poison-message.md) |
 | Whether to add partitions, and doing it safely | [scale-partitions.md](scale-partitions.md) |
+| For a new topic, with a partition count and retention chosen on purpose | [create-topic.md](create-topic.md) |
 
 ## When "the consumer is behind" is ambiguous
 
@@ -43,9 +44,11 @@ called on. No tool takes a cluster parameter, except `copy_message`, which
 chooses a destination, and `list_clusters`, which reports the roster.
 
 **Check `server_config` before promising a change.** A read-only endpoint does
-not expose `add_partitions` or `commit_offset` at all, so there is no refusal
-to discover and no preview to fall back on. Find out at the start, not after
-the user has already stopped their consumers.
+not expose `add_partitions`, `commit_offset` or `create_topic` at all, and any
+endpoint may withhold individual tools through its configuration, so there is no
+refusal to discover and no preview to fall back on. Its `tools` list is what
+this endpoint actually has. Find out at the start, not after the user has
+already stopped their consumers.
 
 **Never guess a topic.** If the user did not name one, call `list_topics` and
 ask when several are plausible. Answering confidently about the wrong topic is

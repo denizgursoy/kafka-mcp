@@ -59,8 +59,30 @@ clusters:
 ```
 
 Each key under `clusters` names both the cluster and the path it is served on,
-so `prod` is reached at `/mcp/prod`. Only `broker` is required per cluster. A
-minimal local file:
+so `prod` is reached at `/mcp/prod`. Only `broker` is required per cluster.
+
+A cluster may also switch individual tools off, by name:
+
+```yaml
+clusters:
+  prod:
+    broker: kafka-1:9093
+    tools:
+      create_topic: false
+      commit_offset: false
+```
+
+A tool the map does not mention stays exposed, so the file states only what it
+withholds rather than relisting every tool and silently losing whatever is added
+later. Names are exact and lowercase, as listed by `server_config`. They are
+checked at startup: a name that is not a tool stops the
+server, because a typo would leave the tool it was meant to withhold exposed.
+`server_config` cannot be switched off, since it is how a session learns which
+tools the endpoint has. This narrows an endpoint, it never widens one:
+`read_only: true` still withholds the writing tools regardless of what the map
+says.
+
+A minimal local file:
 
 ```yaml
 clusters:
@@ -233,10 +255,14 @@ Three layers, and only one of them is real security:
 ### What a read-only endpoint exposes
 
 `read_only: true` does more than refuse a write: the endpoint does not list the
-tools whose only purpose is to write. `add_partitions` and `commit_offset` are
-absent from `tools/list` on a read-only cluster, so a client never sees a tool
-it could not have used, and their preview cannot describe a change this
-endpoint would never apply.
+tools whose only purpose is to write. `add_partitions`, `commit_offset` and
+`create_topic` are absent from `tools/list` on a read-only cluster, so a client
+never sees a tool it could not have used, and their preview cannot describe a
+change this endpoint would never apply.
+
+A writable cluster can withhold individual tools too, with the per-cluster
+`tools` map above. That is the same mechanism seen from the client: the tool is
+not registered, so it is absent from `tools/list` and from `server_config`.
 
 `copy_message` stays, because `read_only` protects the cluster being written
 to and the destination is chosen per call. Copying a message out of a
@@ -522,8 +548,9 @@ mechanism and principal, TLS, read-only state, export directory and the tools
 this server exposes. Takes no parameters. The password is never reported.
 
 `tools` is the list for this endpoint, not for the deployment: a read-only
-cluster omits `add_partitions` and `commit_offset`, because it does not register
-them.
+cluster omits `add_partitions`, `commit_offset` and `create_topic`, because it
+does not register them, and any cluster omits whatever its `tools` configuration
+switches off.
 
 Use it when a result is surprising: an empty topic list means something very
 different on a local broker than on production.
@@ -548,6 +575,37 @@ Adding partitions changes which partition a key hashes to, so existing keys
 lose their ordering guarantee. A keyed topic therefore requires
 `acknowledge_key_ordering` as well. Requesting fewer partitions than the topic
 has is refused with an explanation rather than attempted.
+
+### `create_topic`
+
+Creates a topic. Refuses a topic that already exists rather than adjusting it.
+Not exposed on a read-only cluster.
+
+| Parameter | Type | Required | Meaning |
+| --------- | ---- | -------- | ------- |
+| `topic` | string | yes | Name of the topic to create |
+| `partitions` | int | no | Omit for the broker default on Kafka 2.4+. Can grow later, never shrink |
+| `replication_factor` | int | no | Omit for the broker default on Kafka 2.4+. Cannot exceed the broker count |
+| `configs` | map | no | Topic-level config, such as `retention.ms` or `cleanup.policy` |
+| `confirm` | bool | no | Default false: the broker validates the request and creates nothing |
+
+Without `confirm` the request is sent to the broker with `ValidateOnly`, so the
+preview reports the cluster's own answer — an invalid name, an unknown config
+key, a replication factor larger than the cluster — rather than a guess. With
+`confirm` the topic is created and the resulting partition count and
+replication factor are read back from the cluster, which is how an omitted
+count is reported as the number the broker actually chose.
+
+Using broker defaults requires Kafka 2.4 or newer, whose CreateTopics v4 API
+introduced `-1` as "use the broker default". On an older broker, pass both
+counts explicitly.
+
+A replication factor larger than the number of brokers is refused here, with
+the broker count in the message, because brokers differ on whether a
+validate-only request catches it.
+
+Use `add_partitions` to change an existing topic's partition count; this tool
+never modifies a topic it did not create.
 
 ### `commit_offset`
 
@@ -599,7 +657,7 @@ read-only, preview included, because writing is all it does.
 ## Skills
 
 `skills/kafka-debugging/SKILL.md` is the one skill an agent loads. It routes to
-a guide beside it, rather than holding all four scenarios itself, so a session
+a guide beside it, rather than holding all five scenarios itself, so a session
 reads only the one it needs:
 
 - `find-message.md` — locating a message from something the user knows about it.
@@ -609,6 +667,8 @@ reads only the one it needs:
   them safely.
 - `skip-poison-message.md` — unblocking a consumer stuck on a message it cannot
   process, preserving the message first.
+- `create-topic.md` — creating a topic with a partition count and retention
+  chosen on purpose, including as a `copy_message` destination.
 
 The umbrella also resolves the overlap between them: "the consumer is behind"
 opens three of these guides, and `consumer_lag`'s `status` is what decides which

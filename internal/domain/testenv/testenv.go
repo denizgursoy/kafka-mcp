@@ -22,6 +22,7 @@ package testenv
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"sync"
@@ -33,9 +34,12 @@ import (
 	"github.com/testcontainers/testcontainers-go/network"
 	"github.com/testcontainers/testcontainers-go/wait"
 	"github.com/twmb/franz-go/pkg/kadm"
+	"github.com/twmb/franz-go/pkg/kerr"
 	"github.com/twmb/franz-go/pkg/kgo"
 	"github.com/twmb/franz-go/pkg/sasl/scram"
 
+	"github.com/denizgursoy/kafka-mcp/internal/domain/config"
+	"github.com/denizgursoy/kafka-mcp/internal/domain/kafkaclient"
 	"github.com/denizgursoy/kafka-mcp/internal/domain/records"
 )
 
@@ -365,6 +369,38 @@ func (e *Environment) Reader() *records.Reader {
 	return records.NewReaderWithOptions(append([]kgo.Opt{kgo.SeedBrokers(e.seed)}, e.authOptions...)...)
 }
 
+// ClusterClient builds the same domain client a tool receives in production,
+// pointed at this environment's broker and optionally marked read-only.
+//
+// The client is closed when the running test ends. Pass that test's *testing.T,
+// not the suite's, so a connection failure aborts the case that asked for it.
+func (e *Environment) ClusterClient(t *testing.T, readOnly bool) *kafkaclient.Client {
+	t.Helper()
+
+	cluster := &config.Cluster{
+		Name:     "test",
+		Brokers:  []string{e.Broker()},
+		ReadOnly: readOnly,
+	}
+
+	if len(e.authOptions) > 0 {
+		cluster.SASL = []*config.SASL{{
+			Mechanism: config.MechanismScramSHA256,
+			User:      SASLUser,
+			Password:  SASLPassword,
+		}}
+	}
+
+	client, err := kafkaclient.New(cluster)
+	if err != nil {
+		t.Fatalf("connect a tool client to the test broker: %v", err)
+	}
+
+	t.Cleanup(client.Close)
+
+	return client
+}
+
 // SchemaRegistry returns the host address of the Schema Registry.
 func (e *Environment) SchemaRegistry() string {
 	return e.schemaRegistry
@@ -484,6 +520,77 @@ func (e *Environment) deleteTrackedTopics(ctx context.Context) {
 // that must not collide with other test cases sharing the broker.
 func (e *Environment) UniqueName(prefix string) string {
 	return fmt.Sprintf("%s-%d", prefix, time.Now().UnixNano())
+}
+
+// TopicExists reports whether the broker currently has the exact topic.
+func (e *Environment) TopicExists(t *testing.T, topic string) bool {
+	t.Helper()
+
+	details, err := e.admin.ListTopics(t.Context(), topic)
+	if err != nil {
+		t.Fatalf("read topic %s: %v", topic, err)
+	}
+
+	detail, ok := details[topic]
+	if !ok {
+		return false
+	}
+
+	if detail.Err != nil {
+		if errors.Is(detail.Err, kerr.UnknownTopicOrPartition) {
+			return false
+		}
+
+		t.Fatalf("read topic %s: %v", topic, detail.Err)
+	}
+
+	return true
+}
+
+// PartitionCount reads a topic's current partition count from the broker.
+func (e *Environment) PartitionCount(t *testing.T, topic string) int {
+	t.Helper()
+
+	details, err := e.admin.ListTopics(t.Context(), topic)
+	if err != nil {
+		t.Fatalf("read topic %s: %v", topic, err)
+	}
+
+	detail, ok := details[topic]
+	if !ok {
+		t.Fatalf("topic %s does not exist", topic)
+	}
+
+	if detail.Err != nil {
+		t.Fatalf("read topic %s: %v", topic, detail.Err)
+	}
+
+	return len(detail.Partitions)
+}
+
+// TopicConfig reads one effective topic configuration value from the broker.
+func (e *Environment) TopicConfig(t *testing.T, topic string, key string) string {
+	t.Helper()
+
+	resources, err := e.admin.DescribeTopicConfigs(t.Context(), topic)
+	if err != nil {
+		t.Fatalf("describe configs for topic %s: %v", topic, err)
+	}
+
+	resource, err := resources.On(topic, nil)
+	if err != nil {
+		t.Fatalf("read config resource for topic %s: %v", topic, err)
+	}
+
+	for _, entry := range resource.Configs {
+		if entry.Key == key {
+			return entry.MaybeValue()
+		}
+	}
+
+	t.Fatalf("topic %s does not report config %s", topic, key)
+
+	return ""
 }
 
 // Message describes a record to produce in a test. Every field is optional

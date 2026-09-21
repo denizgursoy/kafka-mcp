@@ -44,6 +44,25 @@ func (s *RegistrationSuite) SetupSuite() {
 				Name:    "writable",
 				Brokers: []string{"127.0.0.1:19092"},
 			},
+			"limited": {
+				Name:    "limited",
+				Brokers: []string{"127.0.0.1:19092"},
+				Tools: map[string]bool{
+					"create_topic": false,
+					"list_topics":  false,
+					"get_message":  true,
+				},
+			},
+			"typo": {
+				Name:    "typo",
+				Brokers: []string{"127.0.0.1:19092"},
+				Tools:   map[string]bool{"create_topics": false},
+			},
+			"silent": {
+				Name:    "silent",
+				Brokers: []string{"127.0.0.1:19092"},
+				Tools:   map[string]bool{"server_config": false},
+			},
 		},
 	}
 
@@ -71,7 +90,8 @@ func (s *RegistrationSuite) exposed(cluster string) (listed, reported []string) 
 	// test. The implementation name and version are main's business and bear
 	// on nothing here.
 	server := mcp.NewServer(&mcp.Implementation{Name: "kafka-mcp-" + cluster, Version: "test"}, nil)
-	Register(server, s.cfg, s.clusters, cluster)
+	s.Require().NoError(Register(server, s.cfg, s.clusters, cluster),
+		"registration must accept a valid configuration for cluster %q, or the endpoint serves nothing", cluster)
 
 	serverSession, err := server.Connect(ctx, serverTransport, nil)
 	s.Require().NoError(err,
@@ -165,5 +185,68 @@ func (s *RegistrationSuite) TestExposedTools() {
 
 		s.Require().Equal(listed, reported,
 			"the reported list must match the registrations on every endpoint, not only on the one that drops tools")
+	})
+
+	s.Run("a writable cluster with nothing disabled exposes every tool this server has", func() {
+		listed, _ := s.exposed("writable")
+
+		expected := Names()
+		sort.Strings(expected)
+
+		s.Require().Equal(expected, listed,
+			"Names is what a cluster's tools configuration is checked against, so a tool missing from it could never be switched off, and a name in it that nothing registers would look like a switch that does nothing")
+	})
+}
+
+func (s *RegistrationSuite) TestDisabledTools() {
+	s.Run("a disabled tool is not exposed", func() {
+		listed, _ := s.exposed("limited")
+
+		s.Require().NotContains(listed, "create_topic",
+			"a tool switched off in the cluster's configuration must not be registered, which is the whole point of the setting")
+		s.Require().NotContains(listed, "list_topics",
+			"reading is not exempt: the configuration withholds whatever it names, including tools read_only would have allowed")
+	})
+
+	s.Run("server_config agrees about what was withheld", func() {
+		listed, reported := s.exposed("limited")
+
+		s.Require().Equal(listed, reported,
+			"a disabled tool must disappear from both the protocol listing and server_config, or a caller would be told about a tool it can never call")
+	})
+
+	s.Run("tools left alone or set to true are untouched", func() {
+		listed, _ := s.exposed("limited")
+
+		s.Require().Contains(listed, "get_message",
+			"an explicit true must keep the tool, since the map is a list of exceptions rather than an allow-list")
+		s.Require().Contains(listed, "add_partitions",
+			"a writable cluster that disabled other tools must keep the ones it did not name, or one switch would quietly withhold the rest")
+		s.Require().Contains(listed, "server_config",
+			"server_config is how the caller discovers what is left, so it survives every other tool being withheld")
+	})
+}
+
+func (s *RegistrationSuite) TestRejectsAnUnusableToolConfiguration() {
+	s.Run("an unknown tool name stops the server", func() {
+		server := mcp.NewServer(&mcp.Implementation{Name: "kafka-mcp-typo", Version: "test"}, nil)
+
+		err := Register(server, s.cfg, s.clusters, "typo")
+
+		s.Require().Error(err,
+			"a misspelled tool name switches nothing off, so the tool it was meant to withhold would stay exposed: that must fail at startup rather than at the call that discovers it")
+		s.Require().Contains(err.Error(), "create_topics",
+			"the error must name the key from the file, so the operator can find and fix it")
+	})
+
+	s.Run("disabling server_config stops the server", func() {
+		server := mcp.NewServer(&mcp.Implementation{Name: "kafka-mcp-silent", Version: "test"}, nil)
+
+		err := Register(server, s.cfg, s.clusters, "silent")
+
+		s.Require().Error(err,
+			"without server_config a session cannot tell a withheld tool from a missing feature, or learn the cluster is read-only, so the configuration is refused rather than honoured")
+		s.Require().Contains(err.Error(), "server_config",
+			"the error must name the tool it refuses to withhold")
 	})
 }

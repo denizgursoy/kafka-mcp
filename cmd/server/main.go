@@ -62,9 +62,19 @@ func run(ctx context.Context) error {
 	servers := make(map[string]*mcp.Server, len(cfg.Clusters))
 
 	for _, name := range cfg.ClusterNames() {
-		servers[name] = newServer(cfg, clusters, name)
+		server, err := newServer(cfg, clusters, name)
+		if err != nil {
+			return fmt.Errorf("serve cluster %q: %w", name, err)
+		}
 
-		slog.Info("serving cluster", "cluster", name, "path", pathPrefix+name, "read_only", cfg.Clusters[name].ReadOnly)
+		servers[name] = server
+
+		slog.Info("serving cluster",
+			"cluster", name,
+			"path", pathPrefix+name,
+			"read_only", cfg.Clusters[name].ReadOnly,
+			"disabled_tools", cfg.Clusters[name].DisabledTools(),
+		)
 	}
 
 	// The SDK turns a nil server into a 400, so an unknown cluster needs no
@@ -99,12 +109,14 @@ func run(ctx context.Context) error {
 // newServer builds the MCP server for one cluster.
 //
 // Which tools that server ends up with is not decided here: internal/tools
-// owns it, so adding or gating a tool never touches main.
+// owns it, so adding or gating a tool never touches main. What main does own
+// is refusing to start when registration rejects the configuration, because a
+// server that started anyway would serve a cluster with the wrong tools.
 func newServer(
 	cfg *config.Config,
 	clusters *kafkaclient.Registry,
 	name string,
-) *mcp.Server {
+) (*mcp.Server, error) {
 
 	server := mcp.NewServer(
 		&mcp.Implementation{
@@ -122,7 +134,9 @@ func newServer(
 		nil,
 	)
 
-	tools.Register(server, cfg, clusters, name)
+	if err := tools.Register(server, cfg, clusters, name); err != nil {
+		return nil, err
+	}
 
-	return server
+	return server, nil
 }

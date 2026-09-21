@@ -207,6 +207,7 @@ far too slow.
 | `Admin()`                     | `*kadm.Client` connected to the broker         |
 | `Kafka()`                     | `*kgo.Client` for record-level operations      |
 | `Reader()`                    | `*records.Reader` for tools that read messages |
+| `ClusterClient(t, readOnly)`  | Production-shaped client for testing a tool    |
 | `Broker()`                    | Host address for `kgo.SeedBrokers`             |
 | `SchemaRegistry()`            | Schema Registry host address                   |
 | `AdminAPI()`                  | Redpanda Admin API host address                |
@@ -219,6 +220,9 @@ far too slow.
 | `ConsumeAndCommit(t, topic, group, n)` | Consume and commit n records as a real group member |
 | `DeleteTopics(t, topics...)`  | Delete topics early                            |
 | `UniqueName(prefix)`          | Unique name for topics, groups, and so on      |
+| `TopicExists(t, topic)`       | Whether the broker has the exact topic         |
+| `PartitionCount(t, topic)`    | Current partition count from broker metadata   |
+| `TopicConfig(t, topic, key)`  | One effective topic config value               |
 
 Helpers that create or assert on broker state take the **running test's**
 `*testing.T` (`s.T()`), not the suite's, so a failure aborts the test that is
@@ -318,12 +322,20 @@ func Register(server *mcp.Server, admin *kadm.Client) {
 else about it:
 
 ```go
-listtopics.Register(server, kafka.Admin())
+endpoint.add("list_topics", func() { listtopics.Register(server, kafka.Admin()) })
 ```
 
-The tool's name goes in the `names` slice in the same function, because
-`server_config` reports that list and the MCP server cannot be asked what it
-holds. Registering a tool without listing it there makes `server_config` lie.
+The name is passed with the registration rather than kept in a second list,
+because `server_config` reports what the endpoint exposes and the MCP server
+cannot be asked what it holds. `add` skips a tool the cluster switched off in
+its `tools` configuration and records the name only when it registered, so the
+two can never disagree.
+
+The name also goes in `tools.Names()`, which is every tool this server has,
+whatever a given endpoint exposes. That list is what a cluster's `tools`
+configuration is validated against, so a tool missing from it could never be
+switched off. `tools_test.go` asserts a writable cluster with nothing disabled
+exposes exactly `Names()`, so the two cannot drift.
 
 No tool names, descriptions, schemas, handlers or Kafka logic in `cmd/server`.
 Adding a tool must never mean touching `main`, which knows only that
@@ -418,11 +430,20 @@ at the compose broker and is what local runs use.
   tool that writes to a cluster chosen per call (`copy_message`), stay
   registered everywhere.
 - `server_config` reports the tools of **its own endpoint**. Its list is built
-  in `tools.Register` beside the registrations, because the MCP server offers no
-  way to read back what was added. A conditional registration that is not
-  matched there makes `server_config` lie about a protected cluster, which is
-  worse than not reporting the list at all. `internal/tools/tools_test.go`
-  asserts the two agree on both a read-only and a writable cluster.
+  in `tools.Register` by the same call that registers each tool, because the MCP
+  server offers no way to read back what was added. A registration that does not
+  go through `endpoint.add` makes `server_config` lie about what the endpoint
+  has, which is worse than not reporting the list at all.
+  `internal/tools/tools_test.go` asserts the two agree on a read-only cluster, a
+  writable one, and one that switches tools off.
+- A cluster may withhold individual tools with a `tools` map in its
+  configuration, keyed by tool name. Absence means enabled, so a deployment
+  lists only what it withholds. The names are checked against `tools.Names()` at
+  startup and an unknown one stops the server, because a typo would leave the
+  tool it was meant to withhold exposed. `server_config` may not be switched
+  off: without it a session cannot tell a withheld tool from a missing feature.
+  This narrows an endpoint and never widens one — `read_only` still decides
+  first.
 - `read_only` is enforced by this server and never delegated to Kafka ACLs.
   Many clusters have no ACLs at all, so a tool that relies on the broker to
   refuse it has no protection there. Where ACLs do exist they are a second and

@@ -84,7 +84,8 @@ Show the user that preview before going further.
 Tell the user plainly:
 
 - **This cannot be undone.** Kafka cannot reduce a partition count. Undoing it
-  means creating a new topic and migrating the data.
+  means creating a new topic with the count you wanted
+  ([create-topic.md](create-topic.md)) and migrating the data to it.
 - If the topic is keyed, **ordering for existing keys will break**, and say
   which field the key appears to be.
 - Which consumer groups will rebalance.

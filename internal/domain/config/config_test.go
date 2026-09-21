@@ -360,10 +360,52 @@ func (s *ConfigSuite) TestSortsClusterNames() {
 		"cluster names must be sorted, because Go map order is random and list_clusters would otherwise return a different order every call")
 }
 
+func (s *ConfigSuite) TestPerClusterToolSwitches() {
+	path := s.write(`{
+		"clusters": {
+			"prod": {
+				"broker": "a:9092",
+				"tools": {"create_topic": false, "commit_offset": false, "list_topics": true}
+			},
+			"local": {"broker": "b:9092"}
+		}
+	}`)
+
+	loaded, err := s.load(path)
+
+	s.Require().NoError(err, "a config that switches tools off must load")
+
+	s.Run("a tool set to false is disabled", func() {
+		s.Require().False(loaded.Clusters["prod"].ToolEnabled("create_topic"),
+			"the whole purpose of the setting is that the named tool is not exposed")
+	})
+
+	s.Run("a tool the map does not mention stays enabled", func() {
+		s.Require().True(loaded.Clusters["prod"].ToolEnabled("consumer_lag"),
+			"the map lists exceptions, so a deployment states what it withholds rather than having to relist every tool and silently lose whatever is added later")
+	})
+
+	s.Run("a tool set to true stays enabled", func() {
+		s.Require().True(loaded.Clusters["prod"].ToolEnabled("list_topics"),
+			"an explicit true must read the same as an absent key, or the map would behave as an allow-list on the clusters that use it")
+	})
+
+	s.Run("a cluster with no tool settings enables everything", func() {
+		s.Require().True(loaded.Clusters["local"].ToolEnabled("create_topic"),
+			"a cluster that says nothing about tools must keep them all, or adding the setting to one cluster would change another")
+	})
+
+	s.Run("the disabled tools are reported in a stable order", func() {
+		s.Require().Equal([]string{"commit_offset", "create_topic"}, loaded.Clusters["prod"].DisabledTools(),
+			"Go map order is random, and a startup log that lists the same tools in a different order every run cannot be compared between restarts")
+	})
+}
+
 func (s *ConfigSuite) TestLoadsLocalYAML() {
 	loaded, err := s.load(filepath.Join("..", "..", "..", "kafka-mcp.local.yaml"))
 	s.Require().NoError(err, "the committed local YAML must work with CONFIG_FILE")
-	s.Require().Equal(":8090", loaded.HTTP.Address, "local HTTP must avoid the Console port")
+	s.Require().Equal("127.0.0.1:8090", loaded.HTTP.Address,
+		"the committed local configuration must bind the loopback address on the port that avoids the Console")
 	s.Require().Equal([]string{"localhost:19092"}, loaded.Clusters["local"].Brokers,
 		"the local config must reach the compose broker's published port")
 }

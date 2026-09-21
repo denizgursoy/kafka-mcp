@@ -154,11 +154,12 @@ func DefaultCORS() mcors.Cors {
 
 // cluster holds a cluster's input before splitting the comma-separated brokers.
 type cluster struct {
-	Security *Security `cfg:"security"`
-	Broker   string    `cfg:"broker"`
-	ReadOnly bool      `cfg:"read_only"`
-	TLS      *TLS      `cfg:"tls"`
-	SASL     *SASL     `cfg:"sasl"`
+	Security *Security       `cfg:"security"`
+	Broker   string          `cfg:"broker"`
+	ReadOnly bool            `cfg:"read_only"`
+	TLS      *TLS            `cfg:"tls"`
+	SASL     *SASL           `cfg:"sasl"`
+	Tools    map[string]bool `cfg:"tools"`
 }
 
 // file mirrors the whole config file.
@@ -184,6 +185,48 @@ type Cluster struct {
 	// block is a list of one, and `security.sasl` is the list it declares.
 	// franz-go is handed all of them and settles on one the broker offers.
 	SASL []*SASL `cfg:"sasl"`
+
+	// Tools turns individual tools off for this cluster, keyed by tool name:
+	//
+	//	tools:
+	//	  create_topic: false
+	//
+	// A tool the map does not mention stays on, so a deployment states only
+	// what it wants to withhold rather than having to list the whole set and
+	// silently losing whatever is added later.
+	//
+	// This is a narrowing, never a widening: a tool that read_only already
+	// withholds is not brought back by setting it to true here. The names are
+	// checked at startup against the tools that exist, because a typo that
+	// quietly left a tool enabled would be the one failure mode worth having
+	// this for.
+	Tools map[string]bool `cfg:"tools"`
+}
+
+// ToolEnabled reports whether this cluster's endpoint should expose a tool.
+//
+// Absence means enabled: the map lists exceptions, so a cluster that says
+// nothing about a tool gets it.
+func (c *Cluster) ToolEnabled(name string) bool {
+	enabled, listed := c.Tools[name]
+
+	return !listed || enabled
+}
+
+// DisabledTools lists the tools this cluster withholds by configuration,
+// sorted, so a startup log or an error can name them in a stable order.
+func (c *Cluster) DisabledTools() []string {
+	disabled := make([]string, 0, len(c.Tools))
+
+	for name, enabled := range c.Tools {
+		if !enabled {
+			disabled = append(disabled, name)
+		}
+	}
+
+	sort.Strings(disabled)
+
+	return disabled
 }
 
 // Config is the effective configuration the server runs with.
@@ -280,6 +323,7 @@ func resolveCluster(name string, parsed *cluster) (*Cluster, error) {
 		Brokers:  splitBrokers(parsed.Broker),
 		ReadOnly: parsed.ReadOnly,
 		TLS:      parsed.TLS,
+		Tools:    parsed.Tools,
 	}
 
 	if len(resolved.Brokers) == 0 {

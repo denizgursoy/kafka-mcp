@@ -5,8 +5,6 @@ import (
 
 	"github.com/stretchr/testify/suite"
 
-	"github.com/denizgursoy/kafka-mcp/internal/domain/config"
-	"github.com/denizgursoy/kafka-mcp/internal/domain/kafkaclient"
 	"github.com/denizgursoy/kafka-mcp/internal/domain/testenv"
 	"github.com/denizgursoy/kafka-mcp/internal/tools/addpartitions"
 )
@@ -29,43 +27,12 @@ func (s *AddPartitionsSuite) TearDownSuite() {
 	s.env.Stop()
 }
 
-// client builds a client against the test broker, optionally read-only.
-func (s *AddPartitionsSuite) client(readOnly bool) *kafkaclient.Client {
-	s.T().Helper()
-
-	client, err := kafkaclient.New(&config.Cluster{
-		Name:     "test",
-		Brokers:  []string{s.env.Broker()},
-		ReadOnly: readOnly,
-	})
-	s.Require().NoError(err, "connecting to the test broker must succeed")
-
-	s.T().Cleanup(client.Close)
-
-	return client
-}
-
-// partitionCount reads the topic's current partition count straight from the
-// broker, so a test can prove what actually happened rather than trusting the
-// tool's own report.
-func (s *AddPartitionsSuite) partitionCount(topic string) int {
-	s.T().Helper()
-
-	details, err := s.env.Admin().ListTopics(s.T().Context(), topic)
-	s.Require().NoError(err, "reading the topic back must succeed")
-
-	detail, ok := details[topic]
-	s.Require().True(ok, "the topic must exist to be counted")
-
-	return len(detail.Partitions)
-}
-
 func (s *AddPartitionsSuite) TestDryRunDoesNotChangeTheTopic() {
 	topic := s.env.CreateTopicWithPartitions(s.T(), "add-dry-run", 2)
 
 	out, err := addpartitions.Run(
 		s.T().Context(),
-		s.client(false),
+		s.env.ClusterClient(s.T(), false),
 		s.env.Reader(),
 		addpartitions.Input{Topic: topic, Partitions: 6},
 	)
@@ -73,7 +40,7 @@ func (s *AddPartitionsSuite) TestDryRunDoesNotChangeTheTopic() {
 	s.Require().NoError(err, "a dry run against a valid request must succeed")
 
 	s.Run("the topic is untouched", func() {
-		s.Require().Equal(2, s.partitionCount(topic),
+		s.Require().Equal(2, s.env.PartitionCount(s.T(), topic),
 			"a dry run must change nothing: a preview that silently applied would be the worst possible bug in an irreversible operation")
 	})
 
@@ -97,7 +64,7 @@ func (s *AddPartitionsSuite) TestConfirmAddsPartitions() {
 
 	out, err := addpartitions.Run(
 		s.T().Context(),
-		s.client(false),
+		s.env.ClusterClient(s.T(), false),
 		s.env.Reader(),
 		addpartitions.Input{Topic: topic, Partitions: 3, Confirm: true},
 	)
@@ -105,7 +72,7 @@ func (s *AddPartitionsSuite) TestConfirmAddsPartitions() {
 	s.Require().NoError(err, "a confirmed request must succeed")
 
 	s.Run("the broker now reports the new count", func() {
-		s.Require().Equal(3, s.partitionCount(topic),
+		s.Require().Equal(3, s.env.PartitionCount(s.T(), topic),
 			"the partitions must actually exist on the broker, which is the only proof the operation worked")
 	})
 
@@ -122,7 +89,7 @@ func (s *AddPartitionsSuite) TestRefusesToReducePartitions() {
 
 	_, err := addpartitions.Run(
 		s.T().Context(),
-		s.client(false),
+		s.env.ClusterClient(s.T(), false),
 		s.env.Reader(),
 		addpartitions.Input{Topic: topic, Partitions: 1, Confirm: true},
 	)
@@ -131,7 +98,7 @@ func (s *AddPartitionsSuite) TestRefusesToReducePartitions() {
 		"Kafka cannot remove partitions, so asking for fewer must fail with a clear reason rather than an obscure broker rejection")
 	s.Require().Contains(err.Error(), "cannot reduce",
 		"the error must say why it is impossible, so the caller does not simply retry")
-	s.Require().Equal(3, s.partitionCount(topic),
+	s.Require().Equal(3, s.env.PartitionCount(s.T(), topic),
 		"a refused request must leave the topic exactly as it was")
 }
 
@@ -140,7 +107,7 @@ func (s *AddPartitionsSuite) TestRefusesToReduceEvenInADryRun() {
 
 	_, err := addpartitions.Run(
 		s.T().Context(),
-		s.client(false),
+		s.env.ClusterClient(s.T(), false),
 		s.env.Reader(),
 		addpartitions.Input{Topic: topic, Partitions: 2},
 	)
@@ -154,7 +121,7 @@ func (s *AddPartitionsSuite) TestEqualCountIsANoOp() {
 
 	out, err := addpartitions.Run(
 		s.T().Context(),
-		s.client(false),
+		s.env.ClusterClient(s.T(), false),
 		s.env.Reader(),
 		addpartitions.Input{Topic: topic, Partitions: 2, Confirm: true},
 	)
@@ -163,7 +130,7 @@ func (s *AddPartitionsSuite) TestEqualCountIsANoOp() {
 		"asking for the count a topic already has is not an error, which is what makes the target-count form safe to repeat")
 	s.Require().False(out.Applied,
 		"nothing changed, so nothing may be reported as applied")
-	s.Require().Equal(2, s.partitionCount(topic),
+	s.Require().Equal(2, s.env.PartitionCount(s.T(), topic),
 		"the topic must be untouched")
 }
 
@@ -172,7 +139,7 @@ func (s *AddPartitionsSuite) TestReadOnlyBlocksTheChange() {
 
 	_, err := addpartitions.Run(
 		s.T().Context(),
-		s.client(true),
+		s.env.ClusterClient(s.T(), true),
 		s.env.Reader(),
 		addpartitions.Input{Topic: topic, Partitions: 4, Confirm: true},
 	)
@@ -181,7 +148,7 @@ func (s *AddPartitionsSuite) TestReadOnlyBlocksTheChange() {
 		"a read-only server must refuse to change the cluster, which is the whole purpose of the setting")
 	s.Require().Contains(err.Error(), "read-only",
 		"the error must name the reason so the operator knows to look at the configuration, not at Kafka")
-	s.Require().Equal(1, s.partitionCount(topic),
+	s.Require().Equal(1, s.env.PartitionCount(s.T(), topic),
 		"a refused change must leave the topic as it was")
 }
 
@@ -190,7 +157,7 @@ func (s *AddPartitionsSuite) TestReadOnlyStillAllowsADryRun() {
 
 	out, err := addpartitions.Run(
 		s.T().Context(),
-		s.client(true),
+		s.env.ClusterClient(s.T(), true),
 		s.env.Reader(),
 		addpartitions.Input{Topic: topic, Partitions: 4},
 	)
@@ -199,7 +166,7 @@ func (s *AddPartitionsSuite) TestReadOnlyStillAllowsADryRun() {
 		"a preview changes nothing, so a read-only server can still answer what a change would do")
 	s.Require().False(out.Applied,
 		"a preview must never be reported as applied")
-	s.Require().Equal(1, s.partitionCount(topic),
+	s.Require().Equal(1, s.env.PartitionCount(s.T(), topic),
 		"the topic must be untouched by a preview")
 }
 
@@ -213,7 +180,7 @@ func (s *AddPartitionsSuite) TestKeyedTopicRequiresAcknowledgement() {
 
 	_, err := addpartitions.Run(
 		s.T().Context(),
-		s.client(false),
+		s.env.ClusterClient(s.T(), false),
 		s.env.Reader(),
 		addpartitions.Input{Topic: topic, Partitions: 3, Confirm: true},
 	)
@@ -222,7 +189,7 @@ func (s *AddPartitionsSuite) TestKeyedTopicRequiresAcknowledgement() {
 		"adding partitions to a keyed topic breaks ordering for existing keys, so it must not happen without the caller saying they understand")
 	s.Require().Contains(err.Error(), "acknowledge_key_ordering",
 		"the error must name the parameter that unblocks it, so the caller knows what to do next")
-	s.Require().Equal(1, s.partitionCount(topic),
+	s.Require().Equal(1, s.env.PartitionCount(s.T(), topic),
 		"a refused change must leave the topic as it was")
 }
 
@@ -233,7 +200,7 @@ func (s *AddPartitionsSuite) TestKeyedTopicProceedsWithAcknowledgement() {
 
 	out, err := addpartitions.Run(
 		s.T().Context(),
-		s.client(false),
+		s.env.ClusterClient(s.T(), false),
 		s.env.Reader(),
 		addpartitions.Input{
 			Topic:                  topic,
@@ -246,7 +213,7 @@ func (s *AddPartitionsSuite) TestKeyedTopicProceedsWithAcknowledgement() {
 	s.Require().NoError(err,
 		"an explicit acknowledgement must allow the change: the tool warns, it does not forbid")
 	s.Require().True(out.Applied, "the change must have been applied")
-	s.Require().Equal(3, s.partitionCount(topic),
+	s.Require().Equal(3, s.env.PartitionCount(s.T(), topic),
 		"the partitions must exist on the broker")
 }
 
@@ -260,7 +227,7 @@ func (s *AddPartitionsSuite) TestUnkeyedTopicNeedsNoAcknowledgement() {
 
 	out, err := addpartitions.Run(
 		s.T().Context(),
-		s.client(false),
+		s.env.ClusterClient(s.T(), false),
 		s.env.Reader(),
 		addpartitions.Input{Topic: topic, Partitions: 2, Confirm: true},
 	)
@@ -279,7 +246,7 @@ func (s *AddPartitionsSuite) TestWarnsAboutKeyedMessagesInADryRun() {
 
 	out, err := addpartitions.Run(
 		s.T().Context(),
-		s.client(false),
+		s.env.ClusterClient(s.T(), false),
 		s.env.Reader(),
 		addpartitions.Input{Topic: topic, Partitions: 3},
 	)
@@ -294,7 +261,7 @@ func (s *AddPartitionsSuite) TestWarnsAboutKeyedMessagesInADryRun() {
 func (s *AddPartitionsSuite) TestErrorsOnUnknownTopic() {
 	_, err := addpartitions.Run(
 		s.T().Context(),
-		s.client(false),
+		s.env.ClusterClient(s.T(), false),
 		s.env.Reader(),
 		addpartitions.Input{Topic: s.env.UniqueName("missing"), Partitions: 3},
 	)
@@ -308,7 +275,7 @@ func (s *AddPartitionsSuite) TestErrorsOnZeroPartitions() {
 
 	_, err := addpartitions.Run(
 		s.T().Context(),
-		s.client(false),
+		s.env.ClusterClient(s.T(), false),
 		s.env.Reader(),
 		addpartitions.Input{Topic: topic, Partitions: 0},
 	)

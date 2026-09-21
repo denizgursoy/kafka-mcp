@@ -29,22 +29,6 @@ func (s *CommitOffsetSuite) TearDownSuite() {
 	s.env.Stop()
 }
 
-// client builds a client against the test broker, optionally read-only.
-func (s *CommitOffsetSuite) client(readOnly bool) *kafkaclient.Client {
-	s.T().Helper()
-
-	client, err := kafkaclient.New(&config.Cluster{
-		Name:     "test",
-		Brokers:  []string{s.env.Broker()},
-		ReadOnly: readOnly,
-	})
-	s.Require().NoError(err, "connecting to the test broker must succeed")
-
-	s.T().Cleanup(client.Close)
-
-	return client
-}
-
 // committed reads the group's committed offset straight from the broker, so a
 // test proves what actually happened rather than trusting the tool's report.
 func (s *CommitOffsetSuite) committed(group string, topic string) int64 {
@@ -84,7 +68,7 @@ func (s *CommitOffsetSuite) TestDryRunDoesNotMoveTheOffset() {
 
 	out, err := commitoffset.Run(
 		s.T().Context(),
-		s.client(false),
+		s.env.ClusterClient(s.T(), false),
 		commitoffset.Input{Topic: topic, Group: group, Partition: 0, Offset: 8},
 	)
 
@@ -112,7 +96,7 @@ func (s *CommitOffsetSuite) TestConfirmMovesTheOffsetForward() {
 
 	out, err := commitoffset.Run(
 		s.T().Context(),
-		s.client(false),
+		s.env.ClusterClient(s.T(), false),
 		commitoffset.Input{
 			Topic:     topic,
 			Group:     group,
@@ -135,7 +119,7 @@ func (s *CommitOffsetSuite) TestConfirmMovesTheOffsetBackward() {
 
 	out, err := commitoffset.Run(
 		s.T().Context(),
-		s.client(false),
+		s.env.ClusterClient(s.T(), false),
 		commitoffset.Input{
 			Topic:     topic,
 			Group:     group,
@@ -158,7 +142,7 @@ func (s *CommitOffsetSuite) TestRefusesAnOffsetBeyondTheEnd() {
 
 	_, err := commitoffset.Run(
 		s.T().Context(),
-		s.client(false),
+		s.env.ClusterClient(s.T(), false),
 		commitoffset.Input{
 			Topic:     topic,
 			Group:     group,
@@ -179,7 +163,7 @@ func (s *CommitOffsetSuite) TestRefusesANegativeOffset() {
 
 	_, err := commitoffset.Run(
 		s.T().Context(),
-		s.client(false),
+		s.env.ClusterClient(s.T(), false),
 		commitoffset.Input{
 			Topic:     topic,
 			Group:     group,
@@ -200,7 +184,7 @@ func (s *CommitOffsetSuite) TestReadOnlyRefusesTheCommit() {
 
 	_, err := commitoffset.Run(
 		s.T().Context(),
-		s.client(true),
+		s.env.ClusterClient(s.T(), true),
 		commitoffset.Input{
 			Topic:     topic,
 			Group:     group,
@@ -223,7 +207,7 @@ func (s *CommitOffsetSuite) TestReadOnlyStillAllowsADryRun() {
 
 	out, err := commitoffset.Run(
 		s.T().Context(),
-		s.client(true),
+		s.env.ClusterClient(s.T(), true),
 		commitoffset.Input{Topic: topic, Group: group, Partition: 0, Offset: 7},
 	)
 
@@ -241,7 +225,7 @@ func (s *CommitOffsetSuite) TestErrorsOnUnknownGroup() {
 
 	_, err := commitoffset.Run(
 		s.T().Context(),
-		s.client(false),
+		s.env.ClusterClient(s.T(), false),
 		commitoffset.Input{
 			Topic:     topic,
 			Group:     s.env.UniqueName("never-existed"),
@@ -258,7 +242,7 @@ func (s *CommitOffsetSuite) TestErrorsOnUnknownGroup() {
 func (s *CommitOffsetSuite) TestErrorsOnUnknownTopic() {
 	_, err := commitoffset.Run(
 		s.T().Context(),
-		s.client(false),
+		s.env.ClusterClient(s.T(), false),
 		commitoffset.Input{
 			Topic:     s.env.UniqueName("missing"),
 			Group:     s.env.UniqueName("group"),
