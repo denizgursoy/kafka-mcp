@@ -14,12 +14,12 @@ to select a YAML or JSON file. `into` manages the process lifecycle, `ada` serve
 HTTP with context-driven shutdown, and `logi` initializes structured logging.
 
 ```sh
-make up                                  # local Redpanda + Console
+make env-up                                  # local Redpanda + Console
 make run                                 # serves kafka-mcp.local.yaml
 ```
 
 `kafka-mcp.local.yaml` is committed and points at the compose broker, so a
-clone works without writing any configuration. `make up` publishes the broker
+clone works without writing any configuration. `make env-up` publishes the broker
 on `localhost:19092`, the Schema Registry on `localhost:18081` and the Redpanda
 Console on <http://localhost:8080>.
 
