@@ -89,6 +89,59 @@ func (s *ConfigSuite) TestLoadsSeveralClusters() {
 	})
 }
 
+func (s *ConfigSuite) TestHTTPBasePath() {
+	s.Run("normalizes a configured base path", func() {
+		loaded, err := s.load(s.write(`{
+			"http": {"base_path": "platform/kafka/"},
+			"clusters": {"local": {"broker": "localhost:19092"}}
+		}`))
+
+		s.Require().NoError(err, "a relative-looking base path must be accepted for convenient configuration")
+		s.Require().Equal("/platform/kafka", loaded.HTTP.BasePath,
+			"the server needs one canonical form so route registration cannot produce missing or doubled slashes")
+	})
+
+	s.Run("defaults to the root", func() {
+		loaded, err := s.load(s.write(`{"clusters": {"local": {"broker": "localhost:19092"}}}`))
+
+		s.Require().NoError(err, "omitting the base path must preserve the existing root-mounted endpoints")
+		s.Require().Empty(loaded.HTTP.BasePath,
+			"an empty base path keeps existing deployments on /mcp and /healthz")
+	})
+
+	s.Run("treats a slash as the root", func() {
+		loaded, err := s.load(s.write(`{
+			"http": {"base_path": "/"},
+			"clusters": {"local": {"broker": "localhost:19092"}}
+		}`))
+
+		s.Require().NoError(err, "a slash is the conventional spelling of the HTTP root")
+		s.Require().Empty(loaded.HTTP.BasePath,
+			"root must use the same canonical representation as an omitted base path")
+	})
+
+	s.Run("canonicalizes repeated root slashes", func() {
+		loaded, err := s.load(s.write(`{
+			"http": {"base_path": "////"},
+			"clusters": {"local": {"broker": "localhost:19092"}}
+		}`))
+
+		s.Require().NoError(err, "repeated slashes still describe the HTTP root")
+		s.Require().Empty(loaded.HTTP.BasePath,
+			"root must not retain a slash that would create //mcp and //healthz routes")
+	})
+
+	s.Run("rejects query and fragment syntax", func() {
+		_, err := s.load(s.write(`{
+			"http": {"base_path": "/kafka?tenant=prod"},
+			"clusters": {"local": {"broker": "localhost:19092"}}
+		}`))
+
+		s.Require().Error(err,
+			"a base path is only a URL path; accepting query syntax would register a route different from the configured value")
+	})
+}
+
 func (s *ConfigSuite) TestRequiresConfiguration() {
 	_, err := s.load("")
 
@@ -412,10 +465,13 @@ func (s *ConfigSuite) TestLoadsLocalYAML() {
 
 func (s *ConfigSuite) TestEnvironmentOverridesFile() {
 	s.T().Setenv("KAFKA_MCP_HTTP_ADDRESS", ":9001")
+	s.T().Setenv("KAFKA_MCP_HTTP_BASE_PATH", "/gateway/kafka/")
 	path := s.write(`{"http":{"address":":8090"},"clusters":{"local":{"broker":"localhost:19092"}}}`)
 	loaded, err := s.load(path)
 	s.Require().NoError(err, "chu environment overrides must work after loading the file")
 	s.Require().Equal(":9001", loaded.HTTP.Address, "the prefixed environment setting must override the file")
+	s.Require().Equal("/gateway/kafka", loaded.HTTP.BasePath,
+		"the base path must be configurable from the environment for container deployments that do not mount a config file")
 }
 
 func (s *ConfigSuite) TestRejectsNullCluster() {

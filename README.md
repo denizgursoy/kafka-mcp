@@ -37,6 +37,7 @@ uses 8080, and running both is the normal case.
 ```yaml
 http:
   address: ":8090"
+  base_path: /kafka-mcp # optional; endpoints become /kafka-mcp/mcp/... and /kafka-mcp/healthz
 output_dir: /var/tmp/kafka-mcp
 clusters:
   prod:
@@ -58,8 +59,11 @@ clusters:
     broker: kafka-preprod:9093
 ```
 
-Each key under `clusters` names both the cluster and the path it is served on,
-so `prod` is reached at `/mcp/prod`. Only `broker` is required per cluster.
+Each key under `clusters` names both the cluster and the path it is served on.
+With the example `http.base_path`, `prod` is reached at
+`/kafka-mcp/mcp/prod`; without it, the existing `/mcp/prod` path is used. The
+base path also prefixes the liveness endpoint (`/kafka-mcp/healthz`). A leading
+or trailing slash is optional. Only `broker` is required per cluster.
 
 A cluster may also switch individual tools off, by name:
 
@@ -94,12 +98,14 @@ Run a custom configuration with `CONFIG_FILE=/path/to/config.yaml go run ./cmd/s
 Without `CONFIG_FILE`, chu discovers `kafka-mcp.{toml,yaml,yml,json}` in the
 working directory or `/etc`. Its standard loader order is defaults, file, HTTP,
 then environment; environment overrides use the `KAFKA_MCP_` prefix (for example,
-`KAFKA_MCP_HTTP_ADDRESS=:9000`). Logging can be configured with `LOG_LEVEL` and
-`LOG_PRETTY`.
+`KAFKA_MCP_HTTP_ADDRESS=:9000` or
+`KAFKA_MCP_HTTP_BASE_PATH=/kafka-mcp`). Logging can be configured with
+`LOG_LEVEL` and `LOG_PRETTY`.
 
 At least one cluster with a broker is required. `http.address` defaults to
-`:8080`, and `output_dir` defaults to the system temp directory. Exports are
-confined to that directory: `output_file` takes a file name, never a path.
+`:8080`, `http.base_path` defaults to the HTTP root, and `output_dir` defaults
+to the system temp directory. Exports are confined to that directory:
+`output_file` takes a file name, never a path.
 
 Keep secrets out of the file with `{env:VAR}` or `password_file`. Unknown fields
 are ignored by chu.

@@ -35,9 +35,9 @@ var (
 	date    = "-"
 )
 
-// pathPrefix is where the per-cluster endpoints are mounted. A cluster named
-// "prod" is served at /mcp/prod.
-const pathPrefix = "/mcp/"
+// mcpPathSuffix is appended to the configured HTTP base path. With no base
+// path, a cluster named "prod" is served at /mcp/prod.
+const mcpPathSuffix = "/mcp/"
 
 func main() {
 	into.Init(run,
@@ -60,6 +60,7 @@ func run(ctx context.Context) error {
 	defer clusters.Close()
 
 	servers := make(map[string]*mcp.Server, len(cfg.Clusters))
+	mcpPathPrefix := cfg.HTTP.BasePath + mcpPathSuffix
 
 	for _, name := range cfg.ClusterNames() {
 		server, err := newServer(cfg, clusters, name)
@@ -71,17 +72,28 @@ func run(ctx context.Context) error {
 
 		slog.Info("serving cluster",
 			"cluster", name,
-			"path", pathPrefix+name,
+			"path", mcpPathPrefix+name,
 			"read_only", cfg.Clusters[name].ReadOnly,
 			"disabled_tools", cfg.Clusters[name].DisabledTools(),
 		)
 	}
 
+	server := newHTTPServer(cfg, servers)
+
+	return server.StartWithContext(ctx, cfg.HTTP.Address)
+}
+
+// newHTTPServer mounts every public endpoint below the configured base path.
+// cfg.Load canonicalizes that path to either empty or a leading-slash path
+// without a trailing slash.
+func newHTTPServer(cfg *config.Config, servers map[string]*mcp.Server) *ada.Server {
+	mcpPathPrefix := cfg.HTTP.BasePath + mcpPathSuffix
+
 	// The SDK turns a nil server into a 400, so an unknown cluster needs no
 	// special case here.
 	handler := mcp.NewStreamableHTTPHandler(
 		func(request *http.Request) *mcp.Server {
-			return servers[strings.TrimPrefix(request.URL.Path, pathPrefix)]
+			return servers[strings.TrimPrefix(request.URL.Path, mcpPathPrefix)]
 		},
 		nil,
 	)
@@ -95,15 +107,15 @@ func run(ctx context.Context) error {
 		mlog.Middleware(),
 		mtelemetry.Middleware(),
 	)
-	server.HandleWildcard(pathPrefix, handler)
+	server.HandleWildcard(mcpPathPrefix, handler)
 
 	// A liveness endpoint that needs no MCP session, so a container
 	// orchestrator can tell the process is up without speaking the protocol.
-	server.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+	server.HandleFunc(cfg.HTTP.BasePath+"/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		fmt.Fprintln(w, "ok")
 	})
 
-	return server.StartWithContext(ctx, cfg.HTTP.Address)
+	return server
 }
 
 // newServer builds the MCP server for one cluster.

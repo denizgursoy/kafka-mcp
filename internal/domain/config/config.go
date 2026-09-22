@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"path"
 	"regexp"
 	"sort"
 	"strings"
@@ -89,7 +90,8 @@ type SASLSCRAM struct {
 
 // HTTP controls where the server listens.
 type HTTP struct {
-	Address string `cfg:"address" default:":8080"`
+	Address  string `cfg:"address" default:":8080"`
+	BasePath string `cfg:"base_path"`
 
 	// CORS is ada's own CORS configuration, filled straight from the config
 	// file. Its `cfg` tags are the config keys, so the middleware gains an
@@ -284,6 +286,12 @@ func Load(ctx context.Context) (*Config, error) {
 		Clusters:  make(map[string]*Cluster, len(parsed.Clusters)),
 	}
 
+	basePath, err := normalizeBasePath(cfg.HTTP.BasePath)
+	if err != nil {
+		return nil, err
+	}
+	cfg.HTTP.BasePath = basePath
+
 	// Exports still need somewhere to go, and the temp directory needs no
 	// configuration to be usable.
 	if cfg.OutputDir == "" {
@@ -300,6 +308,26 @@ func Load(ctx context.Context) (*Config, error) {
 	}
 
 	return cfg, nil
+}
+
+// normalizeBasePath returns either an empty string for the HTTP root or an
+// absolute path without a trailing slash. Keeping one representation makes it
+// safe for the server to append /mcp and /healthz without doubled slashes.
+func normalizeBasePath(value string) (string, error) {
+	value = strings.TrimSpace(value)
+	if value == "" || value == "/" {
+		return "", nil
+	}
+	if strings.ContainsAny(value, "?#") {
+		return "", fmt.Errorf("config: http.base_path must contain only a URL path, not a query or fragment")
+	}
+
+	cleaned := path.Clean("/" + strings.TrimLeft(value, "/"))
+	if cleaned == "/" {
+		return "", nil
+	}
+
+	return cleaned, nil
 }
 
 func resolveCluster(name string, parsed *cluster) (*Cluster, error) {
