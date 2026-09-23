@@ -46,7 +46,7 @@ func (s *ConfigSuite) TestLoadsSeveralClusters() {
 		"http": {"address": ":9000"},
 		"output_dir": "/var/tmp/exports",
 		"clusters": {
-			"prod":    {"broker": "kafka-1:9093,kafka-2:9093", "read_only": true},
+			"prod":    {"broker": ["kafka-1:9093", "kafka-2:9093"], "read_only": true},
 			"preprod": {"broker": "kafka-preprod:9093"}
 		}
 	}`)
@@ -64,9 +64,11 @@ func (s *ConfigSuite) TestLoadsSeveralClusters() {
 			"a cluster must be addressable by the name it was given in the file")
 	})
 
-	s.Run("brokers are split into a list", func() {
+	s.Run("broker lists are preserved", func() {
 		s.Require().Equal([]string{"kafka-1:9093", "kafka-2:9093"}, loaded.Clusters["prod"].Brokers,
-			"a comma-separated broker list must be split, because franz-go takes seeds individually")
+			"each configured broker must remain a separate seed for franz-go")
+		s.Require().Equal([]string{"kafka-preprod:9093"}, loaded.Clusters["preprod"].Brokers,
+			"a scalar broker must decode as a one-element list so the concise single-broker form keeps working")
 	})
 
 	s.Run("read only is per cluster", func() {
@@ -92,7 +94,7 @@ func (s *ConfigSuite) TestLoadsSeveralClusters() {
 func (s *ConfigSuite) TestLoadsSeveralEndpointsForOneCluster() {
 	loaded, err := s.load(s.write(`{
 		"clusters": {
-			"prod": {"broker": "kafka-1:9093,kafka-2:9093"}
+			"prod": {"broker": ["kafka-1:9093", "kafka-2:9093"]}
 		},
 		"endpoints": {
 			"prod-read": {

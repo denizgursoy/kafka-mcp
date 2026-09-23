@@ -18,7 +18,9 @@ http:
 output_dir: /var/tmp/kafka-mcp
 clusters:
   prod:
-    broker: kafka-1:9093,kafka-2:9093
+    broker:
+      - kafka-1:9093
+      - kafka-2:9093
     security:
       tls:
         enabled: true
@@ -117,6 +119,9 @@ At least one cluster with a broker is required. `http.address` defaults to
 `:8090`, `http.base_path` defaults to the HTTP root, and `output_dir` defaults
 to the system temp directory. Exports are confined to that directory:
 `output_file` takes a file name, never a path.
+
+`broker` accepts either one address as a scalar or several addresses as a YAML
+list. Each address is passed to Kafka as a separate seed broker.
 
 Keep secrets out of the file with `{env:VAR}` or `password_file`. Unknown fields
 are ignored by chu.

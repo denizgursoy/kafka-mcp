@@ -156,10 +156,10 @@ func DefaultCORS() mcors.Cors {
 	}
 }
 
-// cluster holds a cluster's input before splitting the comma-separated brokers.
+// cluster holds a cluster's input before validation and normalization.
 type cluster struct {
 	Security *Security       `cfg:"security"`
-	Broker   string          `cfg:"broker"`
+	Broker   []string        `cfg:"broker"`
 	ReadOnly bool            `cfg:"read_only"`
 	TLS      *TLS            `cfg:"tls"`
 	SASL     *SASL           `cfg:"sasl"`
@@ -517,7 +517,7 @@ func resolveCluster(name string, parsed *cluster) (*Cluster, error) {
 
 	resolved := &Cluster{
 		Name:     name,
-		Brokers:  splitBrokers(parsed.Broker),
+		Brokers:  normalizeBrokers(parsed.Broker),
 		ReadOnly: parsed.ReadOnly,
 		TLS:      parsed.TLS,
 		Tools:    parsed.Tools,
@@ -678,10 +678,10 @@ func interpolate(value string, name string) (string, error) {
 	return resolved, nil
 }
 
-func splitBrokers(value string) []string {
-	brokers := make([]string, 0, 1)
+func normalizeBrokers(values []string) []string {
+	brokers := make([]string, 0, len(values))
 
-	for _, broker := range strings.Split(value, ",") {
+	for _, broker := range values {
 		if trimmed := strings.TrimSpace(broker); trimmed != "" {
 			brokers = append(brokers, trimmed)
 		}
