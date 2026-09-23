@@ -92,7 +92,7 @@ type SASLSCRAM struct {
 
 // HTTP controls where the server listens.
 type HTTP struct {
-	Address  string `cfg:"address" default:":8080"`
+	Address  string `cfg:"address" default:":8090"`
 	BasePath string `cfg:"base_path"`
 
 	// CORS is ada's own CORS configuration, filled straight from the config

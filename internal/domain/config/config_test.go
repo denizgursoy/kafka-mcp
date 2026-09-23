@@ -332,7 +332,7 @@ func (s *ConfigSuite) TestDefaultsTheListenAddress() {
 	loaded, err := s.load(path)
 
 	s.Require().NoError(err, "omitting the http block must be allowed")
-	s.Require().Equal(":8080", loaded.HTTP.Address,
+	s.Require().Equal(":8090", loaded.HTTP.Address,
 		"the server must listen somewhere, and a default address means a minimal config still runs")
 }
 

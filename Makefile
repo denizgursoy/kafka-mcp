@@ -31,6 +31,12 @@ env-logs: ## Show logs from environment
 env-ps: ## Show status of environment
 	$(COMPOSE) ps
 
+.PHONY: test
+test: ## Run unit tests
+	@echo "> Running unit tests"
+	go test -p 1 -v -race -cover -coverpkg=./... -coverprofile=coverage.out -covermode=atomic ./...
+	go tool cover -func=coverage.out
+
 .PHONY: build
 build: ## Build the Linux amd64 Go binary
 	@echo "> Building $(PROJECT) binary with goreleaser"
