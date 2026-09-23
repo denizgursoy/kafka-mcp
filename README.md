@@ -18,7 +18,7 @@ http:
 output_dir: /var/tmp/kafka-mcp
 clusters:
   prod:
-    broker:
+    brokers:
       - kafka-1:9093
       - kafka-2:9093
     security:
@@ -34,7 +34,7 @@ clusters:
             user: kafka-mcp-readonly
             pass: "{env:KAFKA_PASSWORD}" # or password_file: /run/secrets/kafka
   preprod:
-    broker: kafka-preprod:9093
+    brokers: kafka-preprod:9093
 endpoints:
   prod-read:
     cluster: prod
@@ -98,7 +98,7 @@ A minimal local file:
 ```yaml
 clusters:
   local:
-    broker: localhost:19092
+    brokers: localhost:19092
 endpoints:
   local:
     cluster: local
@@ -120,7 +120,7 @@ At least one cluster with a broker is required. `http.address` defaults to
 to the system temp directory. Exports are confined to that directory:
 `output_file` takes a file name, never a path.
 
-`broker` accepts either one address as a scalar or several addresses as a YAML
+`brokers` accepts either one address as a scalar or several addresses as a YAML
 list. Each address is passed to Kafka as a separate seed broker.
 
 Keep secrets out of the file with `{env:VAR}` or `password_file`. Unknown fields

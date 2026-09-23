@@ -8,7 +8,7 @@ http:
 output_dir: /tmp/kafka-mcp-exports
 clusters:
   local:
-    broker: localhost:19092
+    brokers: localhost:19092
 endpoints:
   local:
     cluster: local

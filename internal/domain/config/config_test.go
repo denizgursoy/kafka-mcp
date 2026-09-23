@@ -46,8 +46,8 @@ func (s *ConfigSuite) TestLoadsSeveralClusters() {
 		"http": {"address": ":9000"},
 		"output_dir": "/var/tmp/exports",
 		"clusters": {
-			"prod":    {"broker": ["kafka-1:9093", "kafka-2:9093"], "read_only": true},
-			"preprod": {"broker": "kafka-preprod:9093"}
+			"prod":    {"brokers": ["kafka-1:9093", "kafka-2:9093"], "read_only": true},
+			"preprod": {"brokers": "kafka-preprod:9093"}
 		}
 	}`)
 
@@ -94,7 +94,7 @@ func (s *ConfigSuite) TestLoadsSeveralClusters() {
 func (s *ConfigSuite) TestLoadsSeveralEndpointsForOneCluster() {
 	loaded, err := s.load(s.write(`{
 		"clusters": {
-			"prod": {"broker": ["kafka-1:9093", "kafka-2:9093"]}
+			"prod": {"brokers": ["kafka-1:9093", "kafka-2:9093"]}
 		},
 		"endpoints": {
 			"prod-read": {
@@ -134,7 +134,7 @@ func (s *ConfigSuite) TestLegacyClustersBecomeEndpoints() {
 	loaded, err := s.load(s.write(`{
 		"clusters": {
 			"prod": {
-				"broker": "kafka:9093",
+				"brokers": "kafka:9093",
 				"read_only": true,
 				"tools": {"copy_message": false}
 			}
@@ -156,7 +156,7 @@ func (s *ConfigSuite) TestLegacyClustersBecomeEndpoints() {
 func (s *ConfigSuite) TestRejectsInvalidEndpoints() {
 	s.Run("unknown cluster", func() {
 		_, err := s.load(s.write(`{
-			"clusters": {"prod": {"broker": "kafka:9093"}},
+			"clusters": {"prod": {"brokers": "kafka:9093"}},
 			"endpoints": {"read": {"cluster": "missing", "path": "/mcp"}}
 		}`))
 
@@ -168,7 +168,7 @@ func (s *ConfigSuite) TestRejectsInvalidEndpoints() {
 
 	s.Run("duplicate normalized path", func() {
 		_, err := s.load(s.write(`{
-			"clusters": {"prod": {"broker": "kafka:9093"}},
+			"clusters": {"prod": {"brokers": "kafka:9093"}},
 			"endpoints": {
 				"read": {"cluster": "prod", "path": "/mcp"},
 				"write": {"cluster": "prod", "path": "mcp/"}
@@ -181,7 +181,7 @@ func (s *ConfigSuite) TestRejectsInvalidEndpoints() {
 
 	s.Run("health route", func() {
 		_, err := s.load(s.write(`{
-			"clusters": {"prod": {"broker": "kafka:9093"}},
+			"clusters": {"prod": {"brokers": "kafka:9093"}},
 			"endpoints": {"read": {"cluster": "prod", "path": "/healthz"}}
 		}`))
 
@@ -194,7 +194,7 @@ func (s *ConfigSuite) TestHTTPBasePath() {
 	s.Run("normalizes a configured base path", func() {
 		loaded, err := s.load(s.write(`{
 			"http": {"base_path": "platform/kafka/"},
-			"clusters": {"local": {"broker": "localhost:19092"}}
+			"clusters": {"local": {"brokers": "localhost:19092"}}
 		}`))
 
 		s.Require().NoError(err, "a relative-looking base path must be accepted for convenient configuration")
@@ -203,7 +203,7 @@ func (s *ConfigSuite) TestHTTPBasePath() {
 	})
 
 	s.Run("defaults to the root", func() {
-		loaded, err := s.load(s.write(`{"clusters": {"local": {"broker": "localhost:19092"}}}`))
+		loaded, err := s.load(s.write(`{"clusters": {"local": {"brokers": "localhost:19092"}}}`))
 
 		s.Require().NoError(err, "omitting the base path must preserve the existing root-mounted endpoints")
 		s.Require().Empty(loaded.HTTP.BasePath,
@@ -213,7 +213,7 @@ func (s *ConfigSuite) TestHTTPBasePath() {
 	s.Run("treats a slash as the root", func() {
 		loaded, err := s.load(s.write(`{
 			"http": {"base_path": "/"},
-			"clusters": {"local": {"broker": "localhost:19092"}}
+			"clusters": {"local": {"brokers": "localhost:19092"}}
 		}`))
 
 		s.Require().NoError(err, "a slash is the conventional spelling of the HTTP root")
@@ -224,7 +224,7 @@ func (s *ConfigSuite) TestHTTPBasePath() {
 	s.Run("canonicalizes repeated root slashes", func() {
 		loaded, err := s.load(s.write(`{
 			"http": {"base_path": "////"},
-			"clusters": {"local": {"broker": "localhost:19092"}}
+			"clusters": {"local": {"brokers": "localhost:19092"}}
 		}`))
 
 		s.Require().NoError(err, "repeated slashes still describe the HTTP root")
@@ -235,7 +235,7 @@ func (s *ConfigSuite) TestHTTPBasePath() {
 	s.Run("rejects query and fragment syntax", func() {
 		_, err := s.load(s.write(`{
 			"http": {"base_path": "/kafka?tenant=prod"},
-			"clusters": {"local": {"broker": "localhost:19092"}}
+			"clusters": {"local": {"brokers": "localhost:19092"}}
 		}`))
 
 		s.Require().Error(err,
@@ -261,7 +261,7 @@ func (s *ConfigSuite) TestDiscoversConfigurationFiles() {
 			"the user configuration directory must exist for the discovery case to be meaningful")
 		s.Require().NoError(os.WriteFile(
 			filepath.Join(configDir, "kafka-mcp.json"),
-			[]byte(`{"clusters":{"user":{"broker":"user:9092"}}}`),
+			[]byte(`{"clusters":{"user":{"brokers":"user:9092"}}}`),
 			0o600,
 		), "the fallback configuration must be written before loading it")
 
@@ -285,12 +285,12 @@ func (s *ConfigSuite) TestDiscoversConfigurationFiles() {
 			"the lower-priority user configuration must exist so the case proves precedence")
 		s.Require().NoError(os.WriteFile(
 			filepath.Join(configDir, "kafka-mcp.json"),
-			[]byte(`{"clusters":{"user":{"broker":"user:9092"}}}`),
+			[]byte(`{"clusters":{"user":{"brokers":"user:9092"}}}`),
 			0o600,
 		), "the lower-priority user configuration must be written before loading")
 		s.Require().NoError(os.WriteFile(
 			filepath.Join(workingDir, "kafka-mcp.json"),
-			[]byte(`{"clusters":{"working":{"broker":"working:9092"}}}`),
+			[]byte(`{"clusters":{"working":{"brokers":"working:9092"}}}`),
 			0o600,
 		), "the working-directory configuration must be written before loading")
 
@@ -329,7 +329,7 @@ func (s *ConfigSuite) TestRequiresABrokerPerCluster() {
 }
 
 func (s *ConfigSuite) TestDefaultsTheListenAddress() {
-	path := s.write(`{"clusters": {"local": {"broker": "localhost:19092"}}}`)
+	path := s.write(`{"clusters": {"local": {"brokers": "localhost:19092"}}}`)
 
 	loaded, err := s.load(path)
 
@@ -344,7 +344,7 @@ func (s *ConfigSuite) TestDefaultsTheListenAddress() {
 // client cannot reach the server" and nothing more.
 func (s *ConfigSuite) TestCORSDefaults() {
 	s.Run("an absent cors block keeps every default", func() {
-		loaded, err := s.load(s.write(`{"clusters": {"local": {"broker": "localhost:19092"}}}`))
+		loaded, err := s.load(s.write(`{"clusters": {"local": {"brokers": "localhost:19092"}}}`))
 
 		s.Require().NoError(err, "omitting the cors block must be allowed")
 		s.Require().Equal(config.DefaultCORS(), loaded.HTTP.CORS,
@@ -354,7 +354,7 @@ func (s *ConfigSuite) TestCORSDefaults() {
 	s.Run("setting one key keeps the others", func() {
 		loaded, err := s.load(s.write(`{
 			"http": {"cors": {"allow_origins": ["https://allowed.example"]}},
-			"clusters": {"local": {"broker": "localhost:19092"}}
+			"clusters": {"local": {"brokers": "localhost:19092"}}
 		}`))
 
 		s.Require().NoError(err, "narrowing the origins must be allowed")
@@ -371,7 +371,7 @@ func (s *ConfigSuite) TestCORSDefaults() {
 	s.Run("private network access can be turned off", func() {
 		loaded, err := s.load(s.write(`{
 			"http": {"cors": {"allow_private_network": false}},
-			"clusters": {"local": {"broker": "localhost:19092"}}
+			"clusters": {"local": {"brokers": "localhost:19092"}}
 		}`))
 
 		s.Require().NoError(err, "disabling private network access must be allowed")
@@ -429,7 +429,7 @@ func (s *ConfigSuite) TestCORSDefaults() {
 }
 
 func (s *ConfigSuite) TestOutputDirectoryFallsBackToTheTempDirectory() {
-	path := s.write(`{"clusters": {"local": {"broker": "localhost:19092"}}}`)
+	path := s.write(`{"clusters": {"local": {"brokers": "localhost:19092"}}}`)
 
 	loaded, err := s.load(path)
 
@@ -444,10 +444,10 @@ func (s *ConfigSuite) TestResolvesPasswordPerCluster() {
 	path := s.write(`{
 		"clusters": {
 			"prod": {
-				"broker": "kafka:9093",
+				"brokers": "kafka:9093",
 				"sasl": {"mechanism": "scram-sha-256", "user": "ali", "password": "{env:PROD_PASSWORD}"}
 			},
-			"local": {"broker": "localhost:19092"}
+			"local": {"brokers": "localhost:19092"}
 		}
 	}`)
 
@@ -468,7 +468,7 @@ func (s *ConfigSuite) TestErrorsWhenTheInterpolatedVariableIsMissing() {
 	path := s.write(`{
 		"clusters": {
 			"prod": {
-				"broker": "kafka:9093",
+				"brokers": "kafka:9093",
 				"sasl": {"mechanism": "plain", "user": "ali", "password": "{env:PROD_PASSWORD}"}
 			}
 		}
@@ -489,7 +489,7 @@ func (s *ConfigSuite) TestReadsPasswordFromAFile() {
 	path := s.write(`{
 		"clusters": {
 			"prod": {
-				"broker": "kafka:9093",
+				"brokers": "kafka:9093",
 				"sasl": {"mechanism": "plain", "user": "ali", "password_file": "` + secret + `"}
 			}
 		}
@@ -505,7 +505,7 @@ func (s *ConfigSuite) TestReadsPasswordFromAFile() {
 }
 
 func (s *ConfigSuite) TestIgnoresUnknownKeys() {
-	path := s.write(`{"extra": true, "clusters": {"prod": {"broker": "kafka:9093", "unused": true}}}`)
+	path := s.write(`{"extra": true, "clusters": {"prod": {"brokers": "kafka:9093", "unused": true}}}`)
 
 	loaded, err := s.load(path)
 
@@ -533,7 +533,7 @@ func (s *ConfigSuite) TestErrorsWhenTheFileIsMissing() {
 func (s *ConfigSuite) TestRejectsAnUnknownSASLMechanism() {
 	path := s.write(`{
 		"clusters": {
-			"prod": {"broker": "kafka:9093", "sasl": {"mechanism": "kerberos", "user": "ali", "password": "x"}}
+			"prod": {"brokers": "kafka:9093", "sasl": {"mechanism": "kerberos", "user": "ali", "password": "x"}}
 		}
 	}`)
 
@@ -545,7 +545,7 @@ func (s *ConfigSuite) TestRejectsAnUnknownSASLMechanism() {
 
 func (s *ConfigSuite) TestRejectsSASLWithoutCredentials() {
 	path := s.write(`{
-		"clusters": {"prod": {"broker": "kafka:9093", "sasl": {"mechanism": "plain"}}}
+		"clusters": {"prod": {"brokers": "kafka:9093", "sasl": {"mechanism": "plain"}}}
 	}`)
 
 	_, err := s.load(path)
@@ -557,9 +557,9 @@ func (s *ConfigSuite) TestRejectsSASLWithoutCredentials() {
 func (s *ConfigSuite) TestSortsClusterNames() {
 	path := s.write(`{
 		"clusters": {
-			"preprod": {"broker": "b:9092"},
-			"local":   {"broker": "c:9092"},
-			"prod":    {"broker": "a:9092"}
+			"preprod": {"brokers": "b:9092"},
+			"local":   {"brokers": "c:9092"},
+			"prod":    {"brokers": "a:9092"}
 		}
 	}`)
 
@@ -574,10 +574,10 @@ func (s *ConfigSuite) TestPerClusterToolSwitches() {
 	path := s.write(`{
 		"clusters": {
 			"prod": {
-				"broker": "a:9092",
+				"brokers": "a:9092",
 				"tools": {"create_topic": false, "commit_offset": false, "list_topics": true}
 			},
-			"local": {"broker": "b:9092"}
+			"local": {"brokers": "b:9092"}
 		}
 	}`)
 
@@ -623,7 +623,7 @@ func (s *ConfigSuite) TestLoadsLocalYAML() {
 func (s *ConfigSuite) TestEnvironmentOverridesFile() {
 	s.T().Setenv("KAFKA_MCP_HTTP_ADDRESS", ":9001")
 	s.T().Setenv("KAFKA_MCP_HTTP_BASE_PATH", "/gateway/kafka/")
-	path := s.write(`{"http":{"address":":8090"},"clusters":{"local":{"broker":"localhost:19092"}}}`)
+	path := s.write(`{"http":{"address":":8090"},"clusters":{"local":{"brokers":"localhost:19092"}}}`)
 	loaded, err := s.load(path)
 	s.Require().NoError(err, "chu environment overrides must work after loading the file")
 	s.Require().Equal(":9001", loaded.HTTP.Address, "the prefixed environment setting must override the file")
@@ -639,7 +639,7 @@ func (s *ConfigSuite) TestRejectsNullCluster() {
 func (s *ConfigSuite) TestSecurityConfiguration() {
 	s.Run("ordered mechanisms and TLS", func() {
 		s.T().Setenv("SECURITY_PASSWORD", "secret-from-env")
-		loaded, err := s.load(s.write(`{"clusters":{"prod":{"broker":"kafka:9093","security":{
+		loaded, err := s.load(s.write(`{"clusters":{"prod":{"brokers":"kafka:9093","security":{
 			"tls":{"enabled":true,"ca_file":"ca.pem","cert_file":"client.pem","key_file":"client.key"},
 			"sasl":[
 				{"scram":{"enabled":true,"algorithm":"SCRAM-SHA-512","user":"alice","pass":"{env:SECURITY_PASSWORD}","zid":"delegate","is_token":true}},
@@ -659,42 +659,42 @@ func (s *ConfigSuite) TestSecurityConfiguration() {
 	})
 	s.Run("secret file", func() {
 		secret := s.write("mounted-secret\n")
-		loaded, err := s.load(s.write(`{"clusters":{"prod":{"broker":"kafka:9093","security":{"sasl":[{"plain":{"enabled":true,"user":"alice","password_file":"` + secret + `"}}]}}}}`))
+		loaded, err := s.load(s.write(`{"clusters":{"prod":{"brokers":"kafka:9093","security":{"sasl":[{"plain":{"enabled":true,"user":"alice","password_file":"` + secret + `"}}]}}}}`))
 		s.Require().NoError(err, "mounted secrets must remain usable in the new layout")
 		s.Require().Len(loaded.Clusters["prod"].SASL, 1, "one enabled entry must resolve to one mechanism")
 		s.Require().Equal("mounted-secret", loaded.Clusters["prod"].SASL[0].Password, "mounted secret newlines must not become part of the password")
 	})
 	s.Run("disabled mechanisms", func() {
-		loaded, err := s.load(s.write(`{"clusters":{"local":{"broker":"localhost:9092","security":{"sasl":[{"scram":{"algorithm":"invalid","pass":"{env:UNUSED_SECRET}"}}]}}}}`))
+		loaded, err := s.load(s.write(`{"clusters":{"local":{"brokers":"localhost:9092","security":{"sasl":[{"scram":{"algorithm":"invalid","pass":"{env:UNUSED_SECRET}"}}]}}}}`))
 		s.Require().NoError(err, "disabled entries must not require credentials or resolve unused secrets")
 		s.Require().Empty(loaded.Clusters["local"].SASL, "no enabled entries means a plaintext unauthenticated connection")
 	})
 	s.Run("mixed layouts", func() {
-		_, err := s.load(s.write(`{"clusters":{"prod":{"broker":"kafka:9093","tls":{"enabled":true},"security":{}}}}`))
+		_, err := s.load(s.write(`{"clusters":{"prod":{"brokers":"kafka:9093","tls":{"enabled":true},"security":{}}}}`))
 		s.Require().ErrorContains(err, "legacy", "mixed layouts must fail instead of silently ignoring TLS")
 	})
 	s.Run("ambiguous entry", func() {
-		_, err := s.load(s.write(`{"clusters":{"prod":{"broker":"kafka:9093","security":{"sasl":[{"plain":{"enabled":true},"scram":{"enabled":true}}]}}}}`))
+		_, err := s.load(s.write(`{"clusters":{"prod":{"brokers":"kafka:9093","security":{"sasl":[{"plain":{"enabled":true},"scram":{"enabled":true}}]}}}}`))
 		s.Require().ErrorContains(err, "only one", "one list entry must not silently choose between two enabled identities")
 	})
 	s.Run("invalid algorithm", func() {
-		_, err := s.load(s.write(`{"clusters":{"prod":{"broker":"kafka:9093","security":{"sasl":[{"scram":{"enabled":true,"algorithm":"PLAIN","user":"a","pass":"b"}}]}}}}`))
+		_, err := s.load(s.write(`{"clusters":{"prod":{"brokers":"kafka:9093","security":{"sasl":[{"scram":{"enabled":true,"algorithm":"PLAIN","user":"a","pass":"b"}}]}}}}`))
 		s.Require().ErrorContains(err, "scram requires", "SCRAM cannot silently downgrade to PLAIN")
 	})
 	s.Run("missing credentials", func() {
-		_, err := s.load(s.write(`{"clusters":{"prod":{"broker":"kafka:9093","security":{"sasl":[{"plain":{"enabled":true,"user":"alice"}}]}}}}`))
+		_, err := s.load(s.write(`{"clusters":{"prod":{"brokers":"kafka:9093","security":{"sasl":[{"plain":{"enabled":true,"user":"alice"}}]}}}}`))
 		s.Require().ErrorContains(err, "no password", "enabled authentication must not silently become anonymous")
 	})
 	s.Run("conflicting secret sources", func() {
-		_, err := s.load(s.write(`{"clusters":{"prod":{"broker":"kafka:9093","security":{"sasl":[{"plain":{"enabled":true,"user":"alice","pass":"secret","password_file":"secret.txt"}}]}}}}`))
+		_, err := s.load(s.write(`{"clusters":{"prod":{"brokers":"kafka:9093","security":{"sasl":[{"plain":{"enabled":true,"user":"alice","pass":"secret","password_file":"secret.txt"}}]}}}}`))
 		s.Require().ErrorContains(err, "both password and password_file", "ambiguous secret sources must be rejected before connecting")
 	})
 	s.Run("incomplete client certificate", func() {
-		_, err := s.load(s.write(`{"clusters":{"prod":{"broker":"kafka:9093","security":{"tls":{"enabled":true,"cert_file":"client.pem"}}}}}`))
+		_, err := s.load(s.write(`{"clusters":{"prod":{"brokers":"kafka:9093","security":{"tls":{"enabled":true,"cert_file":"client.pem"}}}}}`))
 		s.Require().ErrorContains(err, "supplied together", "a missing private key must not silently disable mTLS")
 	})
 	s.Run("duplicate mechanisms", func() {
-		_, err := s.load(s.write(`{"clusters":{"prod":{"broker":"kafka:9093","security":{"sasl":[{"plain":{"enabled":true,"user":"a","pass":"b"}},{"plain":{"enabled":true,"user":"c","pass":"d"}}]}}}}`))
+		_, err := s.load(s.write(`{"clusters":{"prod":{"brokers":"kafka:9093","security":{"sasl":[{"plain":{"enabled":true,"user":"a","pass":"b"}},{"plain":{"enabled":true,"user":"c","pass":"d"}}]}}}}`))
 		s.Require().ErrorContains(err, "duplicate", "mechanism fallback is not a way to retry different passwords")
 	})
 }
@@ -702,7 +702,7 @@ func (s *ConfigSuite) TestSecurityConfiguration() {
 func (s *ConfigSuite) TestOAuthConfiguration() {
 	s.Run("client credentials and duration", func() {
 		s.T().Setenv("OAUTH_SECRET", "client-secret-value")
-		loaded, err := s.load(s.write(`{"clusters":{"prod":{"broker":"kafka:9093","security":{"sasl":[{"oauth":{"enabled":true,"token_url":"https://idp.example/token","client_id":"kafka-mcp","client_secret":"{env:OAUTH_SECRET}","scopes":["kafka"],"timeout":"3s","zid":"delegate","extensions":{"tenant":"test"}}}]}}}}`))
+		loaded, err := s.load(s.write(`{"clusters":{"prod":{"brokers":"kafka:9093","security":{"sasl":[{"oauth":{"enabled":true,"token_url":"https://idp.example/token","client_id":"kafka-mcp","client_secret":"{env:OAUTH_SECRET}","scopes":["kafka"],"timeout":"3s","zid":"delegate","extensions":{"tenant":"test"}}}]}}}}`))
 		s.Require().NoError(err, "OAuth client credentials must load using wkafka's configuration names")
 		s.Require().Len(loaded.Clusters["prod"].SASL, 1, "one enabled OAuth entry must resolve to one mechanism")
 		auth := loaded.Clusters["prod"].SASL[0]
@@ -717,7 +717,7 @@ func (s *ConfigSuite) TestOAuthConfiguration() {
 	})
 	s.Run("static token", func() {
 		s.T().Setenv("OAUTH_TOKEN", "static-token-secret")
-		loaded, err := s.load(s.write(`{"clusters":{"prod":{"broker":"kafka:9093","security":{"sasl":[{"oauth":{"enabled":true,"token":"{env:OAUTH_TOKEN}"}}]}}}}`))
+		loaded, err := s.load(s.write(`{"clusters":{"prod":{"brokers":"kafka:9093","security":{"sasl":[{"oauth":{"enabled":true,"token":"{env:OAUTH_TOKEN}"}}]}}}}`))
 		s.Require().NoError(err, "static tokens must not require client credentials")
 		s.Require().Len(loaded.Clusters["prod"].SASL, 1, "a static token must still resolve to one mechanism")
 		s.Require().Equal("static-token-secret", loaded.Clusters["prod"].SASL[0].OAuth.Token, "token placeholders must be resolved before authentication")
@@ -726,27 +726,27 @@ func (s *ConfigSuite) TestOAuthConfiguration() {
 		s.Require().NotContains(string(data), "static-token-secret", "static bearer tokens must never be reported")
 	})
 	s.Run("missing token source", func() {
-		_, err := s.load(s.write(`{"clusters":{"prod":{"broker":"kafka:9093","security":{"sasl":[{"oauth":{"enabled":true}}]}}}}`))
+		_, err := s.load(s.write(`{"clusters":{"prod":{"brokers":"kafka:9093","security":{"sasl":[{"oauth":{"enabled":true}}]}}}}`))
 		s.Require().ErrorContains(err, "exactly one", "enabled OAuth must have a usable token source")
 	})
 	s.Run("mixed sources", func() {
-		_, err := s.load(s.write(`{"clusters":{"prod":{"broker":"kafka:9093","security":{"sasl":[{"oauth":{"enabled":true,"token":"token","client_id":"client"}}]}}}}`))
+		_, err := s.load(s.write(`{"clusters":{"prod":{"brokers":"kafka:9093","security":{"sasl":[{"oauth":{"enabled":true,"token":"token","client_id":"client"}}]}}}}`))
 		s.Require().ErrorContains(err, "exactly one", "static tokens must not silently override client credentials")
 	})
 	s.Run("missing client secret", func() {
-		_, err := s.load(s.write(`{"clusters":{"prod":{"broker":"kafka:9093","security":{"sasl":[{"oauth":{"enabled":true,"token_url":"https://idp/token","client_id":"client"}}]}}}}`))
+		_, err := s.load(s.write(`{"clusters":{"prod":{"brokers":"kafka:9093","security":{"sasl":[{"oauth":{"enabled":true,"token_url":"https://idp/token","client_id":"client"}}]}}}}`))
 		s.Require().ErrorContains(err, "required", "incomplete client credentials must fail at startup")
 	})
 	s.Run("invalid endpoint", func() {
-		_, err := s.load(s.write(`{"clusters":{"prod":{"broker":"kafka:9093","security":{"sasl":[{"oauth":{"enabled":true,"token_url":"file:///token","client_id":"client","client_secret":"secret"}}]}}}}`))
+		_, err := s.load(s.write(`{"clusters":{"prod":{"brokers":"kafka:9093","security":{"sasl":[{"oauth":{"enabled":true,"token_url":"file:///token","client_id":"client","client_secret":"secret"}}]}}}}`))
 		s.Require().ErrorContains(err, "HTTP or HTTPS", "token endpoints must be absolute HTTP URLs")
 	})
 	s.Run("negative timeout", func() {
-		_, err := s.load(s.write(`{"clusters":{"prod":{"broker":"kafka:9093","security":{"sasl":[{"oauth":{"enabled":true,"token":"token","timeout":"-1s"}}]}}}}`))
+		_, err := s.load(s.write(`{"clusters":{"prod":{"brokers":"kafka:9093","security":{"sasl":[{"oauth":{"enabled":true,"token":"token","timeout":"-1s"}}]}}}}`))
 		s.Require().ErrorContains(err, "negative", "negative token timeouts are invalid configuration")
 	})
 	s.Run("OAuth and SCRAM in one entry", func() {
-		_, err := s.load(s.write(`{"clusters":{"prod":{"broker":"kafka:9093","security":{"sasl":[{"oauth":{"enabled":true,"token":"token"},"scram":{"enabled":true}}]}}}}`))
+		_, err := s.load(s.write(`{"clusters":{"prod":{"brokers":"kafka:9093","security":{"sasl":[{"oauth":{"enabled":true,"token":"token"},"scram":{"enabled":true}}]}}}}`))
 		s.Require().ErrorContains(err, "only one", "OAuth must participate in the per-entry exclusivity check")
 	})
 }

@@ -159,7 +159,7 @@ func DefaultCORS() mcors.Cors {
 // cluster holds a cluster's input before validation and normalization.
 type cluster struct {
 	Security *Security       `cfg:"security"`
-	Broker   []string        `cfg:"broker"`
+	Brokers  []string        `cfg:"brokers"`
 	ReadOnly bool            `cfg:"read_only"`
 	TLS      *TLS            `cfg:"tls"`
 	SASL     *SASL           `cfg:"sasl"`
@@ -517,7 +517,7 @@ func resolveCluster(name string, parsed *cluster) (*Cluster, error) {
 
 	resolved := &Cluster{
 		Name:     name,
-		Brokers:  normalizeBrokers(parsed.Broker),
+		Brokers:  normalizeBrokers(parsed.Brokers),
 		ReadOnly: parsed.ReadOnly,
 		TLS:      parsed.TLS,
 		Tools:    parsed.Tools,
