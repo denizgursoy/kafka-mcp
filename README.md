@@ -4,15 +4,17 @@
 [![Coverage](https://img.shields.io/sonar/coverage/denizgursoy_kafka-mcp?logo=sonarcloud&server=https%3A%2F%2Fsonarcloud.io&style=flat-square)](https://sonarcloud.io/summary/overall?id=denizgursoy_kafka-mcp)
 
 An MCP server that exposes Kafka debugging as tools an LLM can call. It speaks
-MCP over HTTP and talks to Kafka with [franz-go](https://github.com/twmb/franz-go).
+MCP over stdio by default, optionally serves streamable HTTP, and talks to Kafka
+with [franz-go](https://github.com/twmb/franz-go).
 
-One server can serve several Kafka clusters. Each is served on its own path, so
-a session is bound to one cluster by the endpoint it connects to rather than by
-a parameter a caller could forget to send.
+One process can connect to several Kafka clusters. In stdio mode, one endpoint
+is selected for the session. In HTTP mode, each endpoint has its own path, so a
+session is bound to one cluster by how it connects rather than by a parameter a
+caller could forget to send.
 
 ## Configuration
 
-`kafka-mcp.{toml,yaml,yml,json}` in the working directory, `~/.config/kafka-mcp/` or `/etc` configures the server.
+`kafka-mcp.{toml,yaml,yml,json}` in the working directory, `~/.config/kafka-mcp/` or `/etc` configures the server. The `http` block is used only with `--server`.
 
 ```yaml
 http:
@@ -56,11 +58,12 @@ endpoints:
 ```
 
 `clusters` owns Kafka connection details: brokers, TLS and SASL. `endpoints`
-owns the MCP route and policy. Several endpoints may reference one cluster, so
+owns the policy and, in HTTP mode, the MCP route. Stdio selects an endpoint by
+name and does not use its path. Several endpoints may reference one cluster, so
 the example reuses one production connection at `/kafka-mcp/mcp` in read-only
 mode and `/kafka-mcp/mcp/rw` in writable mode. Paths are exact: `/mcp` does not
-capture `/mcp/rw`. `description` is optional and is reported by
-`server_config` so a caller knows what the endpoint is intended for.
+capture `/mcp/rw`. `description` is optional and is reported by `server_config`
+so a caller knows what the endpoint is intended for.
 
 `http.base_path` prefixes endpoint paths and the liveness route. A leading or
 trailing slash on an endpoint path is optional. Paths must be unique and may
@@ -108,7 +111,10 @@ endpoints:
     path: /mcp/local
 ```
 
-Run a custom configuration with `CONFIG_FILE=/path/to/config.yaml go run ./cmd/server`.
+Run a custom configuration over stdio with
+`CONFIG_FILE=/path/to/config.yaml go run ./cmd/server`. If it defines several
+endpoints, select one with `--endpoint <name>`. Add `--server` to serve every
+configured endpoint over HTTP instead; `--endpoint` is not used in HTTP mode.
 Without `CONFIG_FILE`, chu discovers `kafka-mcp.{toml,yaml,yml,json}` first in
 the working directory, then in the operating system's user config directory
 (`~/.config/kafka-mcp/` on Linux), and finally in `/etc`. It uses the first
@@ -230,7 +236,28 @@ write. A less obvious path such as `/mcp/rw` is not authentication.
 
 ## Connecting a client
 
-Register one entry per endpoint you want the client to use:
+For the default stdio transport, configure the client to launch the binary. A
+configuration with one endpoint needs no arguments:
+
+```jsonc
+{
+  "mcp": {
+    "kafka-local": {
+      "type": "local",
+      "command": ["kafka-mcp"],
+      "environment": {"CONFIG_FILE": "/path/to/kafka-mcp.yaml"}
+    }
+  }
+}
+```
+
+When the file contains several endpoints, add the endpoint selection to the
+command, for example `"command": ["kafka-mcp", "--endpoint", "prod-read"]`.
+The process refuses to start without it so it cannot silently connect a session
+to the wrong cluster or permission policy.
+
+To use HTTP, start `kafka-mcp --server` and register one remote client entry per
+endpoint:
 
 ```jsonc
 {
@@ -738,7 +765,7 @@ one is right.
 | ---------------------- | ---------------------------------------- |
 | `make up` / `make down`| Start / stop Redpanda and Console        |
 | `make build`           | Build with goreleaser into `dist/`       |
-| `make run`             | Run the server from source               |
+| `make run`             | Run the HTTP server from source          |
 | `go test ./...`        | All tests, including container tests     |
 | `go test -short ./...` | Tests that need no containers            |
 | `go vet ./...`         | Vet all packages                         |
@@ -747,7 +774,7 @@ Tests run against real containers started by `internal/domain/testenv` (a Redpan
 broker plus Console), so Docker must be available for the full suite.
 
 
-### Start the server
+### Start the HTTP server
 
 Requires Go 1.27 or later. Configuration is loaded with `chu`; set `CONFIG_FILE`
 to select a YAML or JSON file. `into` manages the process lifecycle, `ada` serves
@@ -755,7 +782,7 @@ HTTP with context-driven shutdown, and `logi` initializes structured logging.
 
 ```sh
 make env-up                                  # local Redpanda + Console
-make run                                 # serves kafka-mcp.local.yaml
+make run                                     # runs with --server and serves kafka-mcp.local.yaml
 ```
 
 `kafka-mcp.local.yaml` is committed and points at the compose broker, so a

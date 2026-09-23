@@ -48,8 +48,8 @@ build-container: build ## Build the container image with test tag
 
 .PHONY: run
 run: export CONFIG_FILE ?= kafka-mcp.local.yaml
-run: ## Run the application
-	go run -ldflags="-X main.date=$(BUILD_DATE) -X main.commit=$(BUILD_COMMIT) -X main.version=$(VERSION)" $(MAIN_FILE)
+run: ## Run the HTTP server
+	go run -ldflags="-X main.date=$(BUILD_DATE) -X main.commit=$(BUILD_COMMIT) -X main.version=$(VERSION)" $(MAIN_FILE) --server
 
 .PHONY: help
 help: ## Display this help screen

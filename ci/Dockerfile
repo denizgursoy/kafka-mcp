@@ -6,3 +6,4 @@ RUN apk --no-cache --no-progress add tzdata ca-certificates
 
 COPY kafka-mcp /
 ENTRYPOINT [ "/kafka-mcp" ]
+CMD [ "--server" ]

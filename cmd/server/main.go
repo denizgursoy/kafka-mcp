@@ -1,4 +1,5 @@
-// Command server runs the Kafka MCP server over HTTP.
+// Command server runs the Kafka MCP server over stdio, or over HTTP when
+// --server is set.
 //
 // A deployment may serve several Kafka clusters and several endpoint policies.
 // Each endpoint has its own path and is bound to one cluster, so a caller
@@ -7,9 +8,13 @@ package main
 
 import (
 	"context"
+	"errors"
+	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
+	"strings"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/rakunlabs/ada"
@@ -34,17 +39,75 @@ var (
 	date    = "-"
 )
 
+type options struct {
+	server   bool
+	endpoint string
+}
+
+func selectStdioEndpoint(cfg *config.Config, requested string) (string, error) {
+	names := cfg.EndpointNames()
+	if requested != "" {
+		if cfg.Endpoints[requested] == nil {
+			return "", fmt.Errorf(
+				"stdio endpoint %q is not configured; choose one of: %s",
+				requested,
+				strings.Join(names, ", "),
+			)
+		}
+
+		return requested, nil
+	}
+
+	if len(names) == 0 {
+		return "", fmt.Errorf("stdio requires at least one configured endpoint")
+	}
+	if len(names) > 1 {
+		return "", fmt.Errorf(
+			"stdio requires --endpoint when more than one endpoint is configured; choose one of: %s",
+			strings.Join(names, ", "),
+		)
+	}
+
+	return names[0], nil
+}
+
+func isNormalStdioClose(err error) bool {
+	// The SDK currently wraps a clean stdin EOF as an internal JSON-RPC
+	// "server is closing" error without preserving EOF in the error chain.
+	// Accept both forms so a client ending its process is a successful shutdown.
+	return errors.Is(err, io.EOF) || err.Error() == "server is closing: EOF"
+}
+
 func main() {
-	into.Init(run,
+	serverMode := flag.Bool("server", false, "serve all configured endpoints over HTTP instead of stdio")
+	endpoint := flag.String("endpoint", "", "endpoint to expose over stdio; required when more than one is configured")
+	flag.Parse()
+
+	opts := options{server: *serverMode, endpoint: *endpoint}
+	into.Init(func(ctx context.Context) error {
+		return run(ctx, opts)
+	},
 		into.WithLogger(logi.InitializeLog(logi.WithCaller(false))),
 		into.WithMsgf("kafka-mcp version:[%s] commit:[%s] buildDate:[%s]", version, commit, date),
 	)
 }
 
-func run(ctx context.Context) error {
+func run(ctx context.Context, opts options) error {
+	if opts.server && opts.endpoint != "" {
+		return fmt.Errorf("--endpoint is only valid in stdio mode; omit it when using --server")
+	}
+
 	cfg, err := config.Load(ctx)
 	if err != nil {
 		return fmt.Errorf("load configuration: %w", err)
+	}
+
+	endpointName := ""
+	if !opts.server {
+		endpointName, err = selectStdioEndpoint(cfg, opts.endpoint)
+		if err != nil {
+			return err
+		}
 	}
 
 	clusters, err := kafkaclient.NewRegistry(cfg)
@@ -54,6 +117,36 @@ func run(ctx context.Context) error {
 
 	defer clusters.Close()
 
+	if !opts.server {
+		server, err := newServer(cfg, clusters, endpointName)
+		if err != nil {
+			return fmt.Errorf("initialize stdio endpoint %q: %w", endpointName, err)
+		}
+
+		endpoint := cfg.Endpoints[endpointName]
+		slog.Info("serving endpoint over stdio",
+			"endpoint", endpointName,
+			"cluster", endpoint.Cluster,
+			"description", endpoint.Description,
+			"read_only", endpoint.ReadOnly,
+			"disabled_tools", endpoint.DisabledTools(),
+		)
+
+		if err := server.Run(ctx, &mcp.StdioTransport{}); err != nil {
+			if isNormalStdioClose(err) || (ctx.Err() != nil && errors.Is(err, ctx.Err())) {
+				return nil
+			}
+
+			return fmt.Errorf("serve endpoint %q over stdio: %w", endpointName, err)
+		}
+
+		return nil
+	}
+
+	return runHTTP(ctx, cfg, clusters)
+}
+
+func runHTTP(ctx context.Context, cfg *config.Config, clusters *kafkaclient.Registry) error {
 	servers := make(map[string]*mcp.Server, len(cfg.Endpoints))
 
 	for _, name := range cfg.EndpointNames() {
