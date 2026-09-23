@@ -1,24 +1,11 @@
 # kafka-mcp
 
-[![License](https://img.shields.io/github/license/denizgursoy/kafka-mcp?color=blue&style=flat-square)](https://raw.githubusercontent.com/denizgursoy/kafka-mcp/main/LICENSE)
-[![Coverage](https://img.shields.io/sonar/coverage/denizgursoy_kafka-mcp?logo=sonarcloud&server=https%3A%2F%2Fsonarcloud.io&style=flat-square)](https://sonarcloud.io/summary/overall?id=denizgursoy_kafka-mcp)
-
 An MCP server that exposes Kafka debugging as tools an LLM can call. It speaks
 MCP over HTTP and talks to Kafka with [franz-go](https://github.com/twmb/franz-go).
 
 One server can serve several Kafka clusters. Each is served on its own path, so
 a session is bound to one cluster by the endpoint it connects to rather than by
 a parameter a caller could forget to send.
-
-Run with docker or binary
-
-```sh
-docker run -d --restart=always --name kafka-mcp -p 8090:8090 \
-  -v /path/to/kafka-mcp.yaml:/etc/kafka-mcp/kafka-mcp.yaml \
-  denizgursoy/kafka-mcp:latest
-```
-
-Add to your 
 
 ## Configuration
 
