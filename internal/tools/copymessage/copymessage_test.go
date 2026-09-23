@@ -491,3 +491,28 @@ func (s *CopyMessageSuite) TestErrorsOnAnUnknownDestinationCluster() {
 	s.Require().Contains(err.Error(), "never-configured",
 		"the error must quote the unknown name, since a typo is the likeliest cause")
 }
+
+func (s *CopyMessageSuite) TestBatchCopiesSeveralMessagesInInputOrder() {
+	source := s.env.CreateTopic(s.T(), "copy-batch-source")
+	destination := s.env.CreateTopic(s.T(), "copy-batch-destination")
+	s.env.Produce(s.T(), source,
+		testenv.Message{Value: "first"},
+		testenv.Message{Value: "second"},
+	)
+
+	out, err := copymessage.RunBatch(
+		s.T().Context(), s.client(false), "here",
+		[]copymessage.Item{
+			{SourceTopic: source, SourcePartition: 0, SourceOffset: 0, DestinationTopic: destination},
+			{SourceTopic: source, SourcePartition: 0, SourceOffset: 1, DestinationTopic: destination},
+		},
+		true,
+	)
+
+	s.Require().NoError(err, "copying a valid batch must succeed")
+	s.Require().Equal(2, out.Succeeded, "both source messages must be copied")
+	s.Require().Zero(out.Failed, "a valid batch must not report failed items")
+	s.Require().EqualValues(2, s.endOffset(destination), "the destination must contain both copies")
+	s.Require().EqualValues(0, out.Results[0].Result.WrittenOffset, "the first result must correspond to the first input")
+	s.Require().EqualValues(1, out.Results[1].Result.WrittenOffset, "the second result must correspond to the second input")
+}

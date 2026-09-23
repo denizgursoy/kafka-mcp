@@ -58,6 +58,12 @@ worse than one more question.
 **Report partition and offset with any message.** That triple is what
 identifies a message for every follow-up call; content alone does not.
 
+**Batch independent repetitions.** When the same step applies to several
+topics, messages or partitions, use the tool's `items` array instead of making
+one call per item. Results stay in input order and carry per-item errors. A
+write batch is never atomic: preview it first, explain every valid change, and
+set the one top-level `confirm` only after the user approves the whole set.
+
 **Say what was not measured.** An incomplete scan, an unsampled rate, a
 partition returning an error — each is a different answer from "nothing there",
 and reporting it as absence is how these investigations produce confident wrong

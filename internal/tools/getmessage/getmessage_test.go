@@ -197,3 +197,23 @@ func (s *GetMessageSuite) TestErrorsWhenBrokerUnreachable() {
 	s.Require().Error(err,
 		"an unreachable broker must surface as an error, not as a missing message")
 }
+
+func (s *GetMessageSuite) TestBatchReadsSeveralAddressesAndKeepsPartialErrors() {
+	topic := s.env.CreateTopic(s.T(), "get-batch")
+	s.env.Produce(s.T(), topic,
+		testenv.Message{Value: "zero"},
+		testenv.Message{Value: "one"},
+	)
+
+	out, err := getmessage.RunBatch(s.T().Context(), s.env.Reader(), []getmessage.Item{
+		{Topic: topic, Partition: 0, Offset: 1},
+		{Topic: topic, Partition: 0, Offset: 99},
+		{Topic: topic, Partition: 0, Offset: 0},
+	})
+
+	s.Require().NoError(err, "an invalid address must be reported on its item rather than hide successful reads")
+	s.Require().Len(out.Results, 3, "every address must have one result in input order")
+	s.Require().Equal("one", out.Results[0].Result.Message.Value, "the first result must match the first address")
+	s.Require().NotEmpty(out.Results[1].Error, "the offset past the end must be reported as an item error")
+	s.Require().Equal("zero", out.Results[2].Result.Message.Value, "a later valid item must still be read after an earlier failure")
+}

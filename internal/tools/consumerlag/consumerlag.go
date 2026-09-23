@@ -9,14 +9,25 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/twmb/franz-go/pkg/kadm"
+
+	"github.com/denizgursoy/kafka-mcp/internal/domain/batch"
 )
+
+// Item is one topic/group measurement in a batch request.
+type Item struct {
+	Topic           string `json:"topic" jsonschema:"Topic to measure lag on."`
+	Group           string `json:"group,omitempty" jsonschema:"Optional consumer group. Defaults to every group for the topic."`
+	SampleSeconds   int    `json:"sample_seconds,omitempty" jsonschema:"Optional consume-rate sample window in seconds. Defaults to 5."`
+	SkipConsumeRate bool   `json:"skip_consume_rate,omitempty" jsonschema:"Optional. Return immediately without consume-rate sampling."`
+}
 
 // Input is the argument set accepted by the consumer_lag tool.
 type Input struct {
-	Topic           string `json:"topic" jsonschema:"Topic to measure lag on. Matched exactly and case-sensitively."`
+	Topic           string `json:"topic,omitempty" jsonschema:"Topic to measure for a single operation. Omit when items is used."`
 	Group           string `json:"group,omitempty" jsonschema:"Optional consumer group. Defaults to every group that consumes or holds committed offsets for the topic."`
 	SampleSeconds   int    `json:"sample_seconds,omitempty" jsonschema:"Optional number of seconds to sample the consume rate over. Defaults to 5. The call blocks for this long, because Kafka stores no history of past commits and the rate can only be measured by comparing two readings."`
 	SkipConsumeRate bool   `json:"skip_consume_rate,omitempty" jsonschema:"Optional. When true, return immediately without sampling the consume rate. No completion estimate can be produced, because there is no rate to divide the lag by."`
+	Items           []Item `json:"items,omitempty" jsonschema:"Optional batch of 1 to 100 topic/group measurements. Do not combine with single-operation fields. Sampling windows run concurrently with bounded parallelism."`
 }
 
 // PartitionLag is the lag of one partition within a group.
@@ -60,6 +71,13 @@ type Output struct {
 	Groups      []GroupLag   `json:"groups"`
 }
 
+type BatchOutput = batch.Output[Output]
+
+type Response struct {
+	*Output
+	*BatchOutput
+}
+
 // Statuses reported for a group.
 const (
 	statusCaughtUp    = "caught_up"
@@ -73,7 +91,7 @@ const (
 const defaultSampleSeconds = 5
 
 const description = `
-Measure consumer lag, production and consumption rates, and whether a topic's
+Measure consumer lag for one topic or up to 100 items, production and consumption rates, and whether a topic's
 backlog is caught up, draining, growing, stalled or has no active consumers.
 Returns an ETA only when lag is shrinking.
 
@@ -86,23 +104,46 @@ func Register(server *mcp.Server, admin *kadm.Client) {
 	mcp.AddTool(
 		server,
 		&mcp.Tool{
-			Name:        "consumer_lag",
-			Description: description,
+			Name:         "consumer_lag",
+			Description:  description,
+			OutputSchema: batch.OutputSchema[Output](),
 		},
 		func(
 			ctx context.Context,
 			req *mcp.CallToolRequest,
 			input Input,
-		) (*mcp.CallToolResult, Output, error) {
+		) (*mcp.CallToolResult, Response, error) {
+
+			if input.Items != nil {
+				if input.Topic != "" || input.Group != "" || input.SampleSeconds != 0 || input.SkipConsumeRate {
+					return nil, Response{}, fmt.Errorf("consumer lag: items cannot be combined with single-operation fields")
+				}
+				out, err := RunBatch(ctx, admin, input.Items)
+				if err != nil {
+					return nil, Response{}, fmt.Errorf("consumer lag batch: %w", err)
+				}
+				return nil, Response{BatchOutput: &out}, nil
+			}
 
 			out, err := Run(ctx, admin, input)
 			if err != nil {
-				return nil, Output{}, fmt.Errorf("consumer lag: %w", err)
+				return nil, Response{}, fmt.Errorf("consumer lag: %w", err)
 			}
 
-			return nil, out, nil
+			return nil, Response{Output: &out}, nil
 		},
 	)
+}
+
+// RunBatch measures independent topic/group pairs with bounded concurrency, so
+// several sampling windows do not add their wait times together.
+func RunBatch(ctx context.Context, admin *kadm.Client, items []Item) (BatchOutput, error) {
+	return batch.Run(ctx, items, batch.MaxItems, func(ctx context.Context, item Item) (Output, error) {
+		return Run(ctx, admin, Input{
+			Topic: item.Topic, Group: item.Group, SampleSeconds: item.SampleSeconds,
+			SkipConsumeRate: item.SkipConsumeRate,
+		})
+	})
 }
 
 // Run measures lag, throughput and the time remaining for a topic's consumers.

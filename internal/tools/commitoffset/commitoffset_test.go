@@ -270,3 +270,27 @@ func (s *CommitOffsetSuite) TestErrorsWhenBrokerUnreachable() {
 	s.Require().Error(err,
 		"an unreachable broker must surface as an error, not as a commit that appears to have succeeded")
 }
+
+func (s *CommitOffsetSuite) TestBatchCommitsSeveralOffsetsAndReportsItemErrors() {
+	firstTopic, firstGroup := s.stuckGroup("commit-batch-first", 8, 2)
+	secondTopic, secondGroup := s.stuckGroup("commit-batch-second", 8, 3)
+
+	out, err := commitoffset.RunBatch(
+		s.T().Context(),
+		s.env.ClusterClient(s.T(), false),
+		[]commitoffset.Item{
+			{Topic: firstTopic, Group: firstGroup, Partition: 0, Offset: 6},
+			{Topic: secondTopic, Group: secondGroup, Partition: 0, Offset: 5},
+			{Topic: secondTopic, Group: secondGroup, Partition: 99, Offset: 5},
+		},
+		true,
+	)
+
+	s.Require().NoError(err, "a structurally valid batch must return per-item results even when one item is invalid")
+	s.Require().Len(out.Results, 3, "every requested offset must have a result in input order")
+	s.Require().Equal(2, out.Succeeded, "the two valid offsets must be committed")
+	s.Require().Equal(1, out.Failed, "the invalid partition must be isolated as one failed item")
+	s.Require().EqualValues(6, s.committed(firstGroup, firstTopic), "the first valid offset must be applied")
+	s.Require().EqualValues(5, s.committed(secondGroup, secondTopic), "the second valid offset must be applied")
+	s.Require().Contains(out.Results[2].Error, "partition 99", "the failed item must explain which partition was invalid")
+}

@@ -283,3 +283,23 @@ func (s *AddPartitionsSuite) TestErrorsOnZeroPartitions() {
 	s.Require().Error(err,
 		"a missing or zero target must be refused, or an omitted parameter would read as a request to remove every partition")
 }
+
+func (s *AddPartitionsSuite) TestBatchAddsPartitionsToSeveralTopics() {
+	first := s.env.CreateTopicWithPartitions(s.T(), "add-batch-first", 1)
+	second := s.env.CreateTopicWithPartitions(s.T(), "add-batch-second", 2)
+
+	out, err := addpartitions.RunBatch(
+		s.T().Context(), s.env.ClusterClient(s.T(), false), s.env.Reader(),
+		[]addpartitions.Item{
+			{Topic: first, Partitions: 3},
+			{Topic: second, Partitions: 4},
+		},
+		true,
+	)
+
+	s.Require().NoError(err, "a valid partition batch must succeed")
+	s.Require().Equal(2, out.Succeeded, "both topic changes must be applied")
+	s.Require().False(out.Atomic, "partition changes cannot be rolled back together and must not be presented as atomic")
+	s.Require().Equal(3, s.env.PartitionCount(s.T(), first), "the first topic must reach its own target")
+	s.Require().Equal(4, s.env.PartitionCount(s.T(), second), "the second topic must reach its own target")
+}

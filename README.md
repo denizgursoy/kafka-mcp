@@ -331,6 +331,25 @@ ACLs, `read_only: true` is the available protection.
 
 ## Tools
 
+### Batch operations
+
+`describe_topic`, `sample_messages`, `get_message`, `consumer_lag`,
+`add_partitions`, `create_topic`, `commit_offset` and `copy_message` accept an
+optional `items` array as an alternative to their single-operation fields. The
+message-heavy tools accept at most 20 items; lag and administrative tools
+accept at most 100.
+
+Batch results stay in input order. Each entry has `index` and either `result`
+or `error`, followed by `succeeded`, `failed` and `atomic: false`. An item error
+does not hide successful items. Batch writes first preview every item, then
+apply the valid items only when the top-level `confirm` is true. They are not
+transactions: Kafka cannot roll back a topic, partition, offset or produced
+message after a later item fails. Duplicate write targets are refused before
+anything changes.
+
+Do not combine `items` with the tool's single-operation fields. Existing single
+calls keep their original input and output shape.
+
 ### `list_clusters`
 
 Lists the clusters this server serves, with whether each is reachable and
@@ -374,6 +393,7 @@ and how far back the topic can hold data at all.
 | Parameter | Type   | Required | Meaning              |
 | --------- | ------ | -------- | -------------------- |
 | `topic`   | string | yes      | Topic to describe    |
+| `items`   | object[] | no     | Up to 20 topic objects; alternative to `topic` |
 
 ```json
 {"topic": "orders", "partition_count": 1, "message_count": 3,
@@ -401,6 +421,7 @@ search.
 | `sample_size`     | int    | no       | Messages to read in total. Default 20    |
 | `partitions`      | int[]  | no       | Restrict to these partitions             |
 | `max_value_bytes` | int    | no       | Value bytes per message. Default 512     |
+| `items`           | object[] | no     | Up to 20 topic sample requests           |
 
 ```json
 {"value_formats": {"json": 20, "text": 0, "binary": 0},
@@ -508,6 +529,7 @@ Reads one message at an exact offset, plus optional neighbours.
 | `offset`          | int    | yes      | Exact offset to read                          |
 | `context`         | int    | no       | Also return this many messages either side    |
 | `max_value_bytes` | int    | no       | Value bytes to return. Default 4096           |
+| `items`           | object[] | no     | Up to 20 exact message addresses             |
 
 ```json
 {"name": "get_message", "arguments": {"topic": "orders", "partition": 0, "offset": 17, "context": 1}}
@@ -545,6 +567,7 @@ and consumed, and when the backlog will clear.
 | `group`              | string | no       | Defaults to every group consuming the topic                  |
 | `sample_seconds`     | int    | no       | Consume-rate sample window. Default 5. **The call blocks**   |
 | `skip_consume_rate`  | bool   | no       | Return immediately, without a rate or estimate               |
+| `items`              | object[] | no     | Up to 100 topic/group measurements                            |
 
 ```json
 {"topic": "orders", "total_lag": 4200,
@@ -595,6 +618,7 @@ count. Not exposed on a read-only endpoint.
 | `confirm` | bool | no | Default false: preview only, nothing changes |
 | `acknowledge_key_ordering` | bool | no | Required when messages are keyed |
 | `sample_size` | int | no | Messages inspected for keys. Default 20 |
+| `items` | object[] | no | Up to 100 topic targets; `confirm` stays top-level |
 
 Without `confirm` it reports what would happen: current and target counts,
 whether messages are keyed, which consumer groups will rebalance, and warnings.
@@ -616,6 +640,7 @@ Not exposed on a read-only endpoint.
 | `replication_factor` | int | no | Omit for the broker default on Kafka 2.4+. Cannot exceed the broker count |
 | `configs` | map | no | Topic-level config, such as `retention.ms` or `cleanup.policy` |
 | `confirm` | bool | no | Default false: the broker validates the request and creates nothing |
+| `items` | object[] | no | Up to 100 topic specifications; `confirm` stays top-level |
 
 Without `confirm` the request is sent to the broker with `ValidateOnly`, so the
 preview reports the cluster's own answer — an invalid name, an unknown config
@@ -647,6 +672,7 @@ messages are never processed. Not exposed on a read-only endpoint.
 | `offset` | int | yes | The offset the group reads next. To skip offset 42, commit 43 |
 | `confirm` | bool | no | Default false: preview only, nothing changes |
 | `allow_active_members` | bool | no | Proceed despite running consumers |
+| `items` | object[] | no | Up to 100 offset moves; active-member acknowledgement is per item |
 
 The group must have no active members. A running consumer keeps its position in
 memory and only reads the committed offset when it joins, so a commit made
@@ -665,6 +691,7 @@ the cluster already holds.
 | `destination_topic` | string | yes | Where to write it. Must already exist |
 | `destination_cluster` | string | no | Another cluster to write to. Defaults to this endpoint's own |
 | `confirm` | bool | no | Default false: preview only, nothing is written |
+| `items` | object[] | no | Up to 20 copies; destination and preview limit are per item |
 
 Set `destination_cluster` to copy into another cluster this server serves,
 which is how a production message is taken into a preproduction topic to be

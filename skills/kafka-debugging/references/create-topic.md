@@ -102,6 +102,11 @@ partition count and replication factor **read back from the cluster**, so
 verify they are what was intended, particularly when either was omitted and the
 broker chose.
 
+When several related topics are needed (for example main, retry and dead-letter
+topics), put their separate specifications in `items`. Preview the whole batch,
+then use top-level `confirm: true`. Creation is not atomic: report any per-item
+error and never imply successful topics were rolled back.
+
 If the broker refuses with an authorization error, the fix is a Kafka ACL:
 creating a topic needs `CREATE` on the topic or the cluster for the principal
 this server connects as. That is a request to whoever administers the cluster,

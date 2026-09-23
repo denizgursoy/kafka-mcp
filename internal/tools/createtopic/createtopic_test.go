@@ -227,3 +227,24 @@ func (s *CreateTopicSuite) TestPreviewSurfacesABrokerRejection() {
 	s.Require().False(s.env.TopicExists(s.T(), topic),
 		"a rejected preview must leave nothing behind, including a partially created topic")
 }
+
+func (s *CreateTopicSuite) TestBatchCreatesSeveralTopics() {
+	first := s.env.UniqueName("create-batch-first")
+	second := s.env.UniqueName("create-batch-second")
+	defer s.env.DeleteTopics(s.T(), first, second)
+
+	out, err := createtopic.RunBatch(
+		s.T().Context(), s.env.ClusterClient(s.T(), false),
+		[]createtopic.Item{
+			{Topic: first, Partitions: 1, ReplicationFactor: 1},
+			{Topic: second, Partitions: 2, ReplicationFactor: 1},
+		},
+		true,
+	)
+
+	s.Require().NoError(err, "creating a structurally valid batch must succeed")
+	s.Require().Equal(2, out.Succeeded, "both valid topics must be created")
+	s.Require().False(out.Atomic, "Kafka does not make a multi-topic batch transactional and the response must say so")
+	s.Require().True(s.env.TopicExists(s.T(), first), "the first topic must exist")
+	s.Require().Equal(2, s.env.PartitionCount(s.T(), second), "the second topic must keep its own requested partition count")
+}

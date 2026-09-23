@@ -10,19 +10,30 @@ import (
 	"github.com/twmb/franz-go/pkg/kadm"
 	"github.com/twmb/franz-go/pkg/kerr"
 
+	"github.com/denizgursoy/kafka-mcp/internal/domain/batch"
 	"github.com/denizgursoy/kafka-mcp/internal/domain/kafkaclient"
 )
 
+// Item is one consumer offset move in a batch request.
+type Item struct {
+	Topic              string `json:"topic" jsonschema:"Topic whose offset is being moved."`
+	Group              string `json:"group" jsonschema:"Consumer group to move. It must already exist."`
+	Partition          int32  `json:"partition" jsonschema:"Partition to move."`
+	Offset             int64  `json:"offset" jsonschema:"Offset the group reads next."`
+	AllowActiveMembers bool   `json:"allow_active_members,omitempty" jsonschema:"Optional acknowledgement that active consumers may overwrite this commit."`
+}
+
 // Input is the argument set accepted by the commit_offset tool.
 type Input struct {
-	Topic     string `json:"topic" jsonschema:"Topic whose offset is being moved. Matched exactly and case-sensitively."`
-	Group     string `json:"group" jsonschema:"Consumer group to move. It must already exist."`
+	Topic     string `json:"topic,omitempty" jsonschema:"Topic for a single offset move. Omit when items is used."`
+	Group     string `json:"group,omitempty" jsonschema:"Consumer group for a single offset move. Omit when items is used."`
 	Partition int32  `json:"partition" jsonschema:"Partition to move."`
 	// Offset is absolute rather than relative so there is no ambiguity about
 	// what a caller meant, and repeating the same call cannot drift.
-	Offset             int64 `json:"offset" jsonschema:"The offset the group will read from next, exactly as Kafka stores it. To skip the message at offset 42, commit 43. Must be within the partition's start and end offsets."`
-	Confirm            bool  `json:"confirm,omitempty" jsonschema:"Optional. When false or omitted, nothing is changed and the response describes what would happen. Must be true to actually move the offset."`
-	AllowActiveMembers bool  `json:"allow_active_members,omitempty" jsonschema:"Optional. Required when the group has active members. A running consumer keeps its position in memory and will usually overwrite this commit, so the change is likely to have no effect unless the consumers are restarted straight afterwards."`
+	Offset             int64  `json:"offset" jsonschema:"The offset the group will read from next, exactly as Kafka stores it. To skip the message at offset 42, commit 43. Must be within the partition's start and end offsets."`
+	Confirm            bool   `json:"confirm,omitempty" jsonschema:"Optional. When false or omitted, nothing is changed and the response describes what would happen. Must be true to actually move the offset."`
+	AllowActiveMembers bool   `json:"allow_active_members,omitempty" jsonschema:"Optional. Required when the group has active members. A running consumer keeps its position in memory and will usually overwrite this commit, so the change is likely to have no effect unless the consumers are restarted straight afterwards."`
+	Items              []Item `json:"items,omitempty" jsonschema:"Optional batch of 1 to 100 offset moves. Do not combine with single-operation fields. confirm applies to the whole batch; item failures are reported separately and successful changes are not rolled back."`
 }
 
 // Output is the result returned by the commit_offset tool.
@@ -45,8 +56,15 @@ type Output struct {
 	Note     string   `json:"note,omitempty"`
 }
 
+type BatchOutput = batch.Output[Output]
+
+type Response struct {
+	*Output
+	*BatchOutput
+}
+
 const description = `
-Move one consumer group's committed offset for one partition. The response
+Move one committed offset, or up to 100 offsets through items. The response
 previews how many messages would be skipped or replayed; offset is the next
 message the group will read.
 
@@ -60,23 +78,85 @@ func Register(server *mcp.Server, kafka *kafkaclient.Client) {
 	mcp.AddTool(
 		server,
 		&mcp.Tool{
-			Name:        "commit_offset",
-			Description: description,
+			Name:         "commit_offset",
+			Description:  description,
+			OutputSchema: batch.OutputSchema[Output](),
 		},
 		func(
 			ctx context.Context,
 			req *mcp.CallToolRequest,
 			input Input,
-		) (*mcp.CallToolResult, Output, error) {
+		) (*mcp.CallToolResult, Response, error) {
+
+			if input.Items != nil {
+				if input.Topic != "" || input.Group != "" || input.Partition != 0 || input.Offset != 0 || input.AllowActiveMembers {
+					return nil, Response{}, fmt.Errorf("commit offset: items cannot be combined with single-operation fields")
+				}
+				out, err := RunBatch(ctx, kafka, input.Items, input.Confirm)
+				if err != nil {
+					return nil, Response{}, fmt.Errorf("commit offsets: %w", err)
+				}
+				return nil, Response{BatchOutput: &out}, nil
+			}
 
 			out, err := Run(ctx, kafka, input)
 			if err != nil {
-				return nil, Output{}, fmt.Errorf("commit offset: %w", err)
+				return nil, Response{}, fmt.Errorf("commit offset: %w", err)
 			}
 
-			return nil, out, nil
+			return nil, Response{Output: &out}, nil
 		},
 	)
+}
+
+// RunBatch previews every item before applying any valid item. Applying is not
+// atomic: Kafka cannot roll back offset commits that succeeded before another
+// item failed.
+func RunBatch(ctx context.Context, kafka *kafkaclient.Client, items []Item, confirm bool) (BatchOutput, error) {
+	if err := batch.Validate(len(items), batch.MaxItems); err != nil {
+		return BatchOutput{}, err
+	}
+	seen := make(map[string]struct{}, len(items))
+	for _, item := range items {
+		key := fmt.Sprintf("%s\x00%s\x00%d", item.Group, item.Topic, item.Partition)
+		if _, ok := seen[key]; ok {
+			return BatchOutput{}, fmt.Errorf("duplicate offset target for group %q topic %q partition %d", item.Group, item.Topic, item.Partition)
+		}
+		seen[key] = struct{}{}
+	}
+
+	out, err := batch.Run(ctx, items, batch.MaxItems, func(ctx context.Context, item Item) (Output, error) {
+		return Run(ctx, kafka, commitInput(item, false))
+	})
+	if err != nil || !confirm {
+		return out, err
+	}
+
+	out.Succeeded, out.Failed = 0, 0
+	for index, item := range items {
+		if out.Results[index].Error != "" {
+			out.Failed++
+			continue
+		}
+		value, applyErr := Run(ctx, kafka, commitInput(item, true))
+		if applyErr != nil {
+			out.Results[index].Result = nil
+			out.Results[index].Error = applyErr.Error()
+			out.Failed++
+			continue
+		}
+		out.Results[index].Result = &value
+		out.Succeeded++
+		if value.Applied {
+			out.Applied++
+		}
+	}
+	return out, nil
+}
+
+func commitInput(item Item, confirm bool) Input {
+	return Input{Topic: item.Topic, Group: item.Group, Partition: item.Partition, Offset: item.Offset,
+		Confirm: confirm, AllowActiveMembers: item.AllowActiveMembers}
 }
 
 // Run previews or applies a change to a group's committed offset.

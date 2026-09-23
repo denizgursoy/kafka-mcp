@@ -142,7 +142,9 @@ there is another poison message, and this whole sequence repeats.
 - A repeatedly poisoned topic is usually a producer or schema problem. After
   the second or third skip, say so: skipping is a way to restore service, not
   a fix.
-- `commit_offset` moves one partition. A consumer stuck on several partitions
-  needs one call per partition, each previewed separately.
+- `commit_offset` moves one partition per item. A consumer stuck on several
+  partitions should use one `items` batch, previewed with top-level `confirm`
+  omitted and applied only after every skip count has been approved. Valid
+  commits are not rolled back if another item fails.
 - Moving the offset backward is the same tool and replays messages instead of
   skipping them, which produces duplicates rather than losing data.

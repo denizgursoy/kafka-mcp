@@ -102,6 +102,10 @@ keyed topic without it.
 `partitions` is the **final total**, not the number to add. Asking for 6 on a
 topic that already has 6 does nothing, so repeating a call is safe.
 
+For several topics, use one `items` batch and put each final target and keyed
+ordering acknowledgement on its own item. Preview the whole batch first.
+Partition changes are not atomic and successful items cannot be rolled back.
+
 If the broker refuses with an authorization error, the fix is a Kafka ACL:
 adding partitions needs ALTER on the topic for the principal this server
 connects as. That is a request to whoever administers the cluster, not

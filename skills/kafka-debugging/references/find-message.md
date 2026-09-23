@@ -154,6 +154,10 @@ with its topic, partition and offset for the full message, and set `context` to
 show surrounding messages when the user is debugging ordering or a stuck
 consumer.
 
+When several matches need their full values, pass their addresses as `items`
+to one `get_message` call. Keep the returned item errors beside their indexes;
+one expired or invalid offset does not invalidate the messages that were read.
+
 Always report partition and offset alongside the content: that is what
 identifies the message for any follow-up.
 

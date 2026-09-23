@@ -288,3 +288,19 @@ func (s *DescribeTopicSuite) TestReportsExplicitlySetRetention() {
 			"a compacted topic keeps only the latest value per key, so a caller must see this before concluding a message is missing")
 	})
 }
+
+func (s *DescribeTopicSuite) TestBatchDescribesSeveralTopicsWithPartialErrors() {
+	first := s.env.CreateTopicWithPartitions(s.T(), "describe-batch-first", 1)
+	second := s.env.CreateTopicWithPartitions(s.T(), "describe-batch-second", 2)
+
+	out, err := describetopic.RunBatch(
+		s.T().Context(), s.env.Admin(), s.env.Reader(),
+		[]describetopic.Item{{Topic: first}, {Topic: s.env.UniqueName("missing")}, {Topic: second}},
+	)
+
+	s.Require().NoError(err, "one missing topic must not hide descriptions of topics that exist")
+	s.Require().Len(out.Results, 3, "results must stay aligned with the requested topics")
+	s.Require().Equal(1, out.Results[0].Result.PartitionCount, "the first topic must be described")
+	s.Require().NotEmpty(out.Results[1].Error, "the missing topic must carry its own error")
+	s.Require().Equal(2, out.Results[2].Result.PartitionCount, "the final valid topic must still be described")
+}

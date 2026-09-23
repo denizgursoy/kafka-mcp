@@ -335,3 +335,23 @@ func (s *ConsumerLagSuite) TestErrorsWhenBrokerUnreachable() {
 	s.Require().Error(err,
 		"an unreachable broker must surface as an error, not as a topic with no lag")
 }
+
+func (s *ConsumerLagSuite) TestBatchMeasuresSeveralTopics() {
+	first := s.env.CreateTopic(s.T(), "lag-batch-first")
+	second := s.env.CreateTopic(s.T(), "lag-batch-second")
+	s.env.Produce(s.T(), first, s.messages(3)...)
+	s.env.Produce(s.T(), second, s.messages(5)...)
+	firstGroup := s.env.UniqueName("lag-batch-first-group")
+	secondGroup := s.env.UniqueName("lag-batch-second-group")
+	s.env.ConsumeAndCommit(s.T(), first, firstGroup, 1)
+	s.env.ConsumeAndCommit(s.T(), second, secondGroup, 2)
+
+	out, err := consumerlag.RunBatch(s.T().Context(), s.env.Admin(), []consumerlag.Item{
+		{Topic: first, Group: firstGroup, SkipConsumeRate: true},
+		{Topic: second, Group: secondGroup, SkipConsumeRate: true},
+	})
+
+	s.Require().NoError(err, "measuring a valid topic batch must succeed")
+	s.Require().EqualValues(2, out.Results[0].Result.TotalLag, "the first result must contain the first topic's lag")
+	s.Require().EqualValues(3, out.Results[1].Result.TotalLag, "the second result must contain the second topic's lag")
+}

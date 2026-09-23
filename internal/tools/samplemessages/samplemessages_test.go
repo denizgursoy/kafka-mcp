@@ -278,3 +278,19 @@ func itoa(n int) string {
 
 	return string(digits)
 }
+
+func (s *SampleMessagesSuite) TestBatchSamplesSeveralTopics() {
+	first := s.env.CreateTopic(s.T(), "sample-batch-first")
+	second := s.env.CreateTopic(s.T(), "sample-batch-second")
+	s.env.Produce(s.T(), first, testenv.Message{Value: `{"kind":"first"}`})
+	s.env.Produce(s.T(), second, testenv.Message{Value: "plain text"})
+
+	out, err := samplemessages.RunBatch(
+		s.T().Context(), s.env.Admin(), s.env.Reader(),
+		[]samplemessages.Item{{Topic: first}, {Topic: second}},
+	)
+
+	s.Require().NoError(err, "sampling a valid topic batch must succeed")
+	s.Require().Equal(1, out.Results[0].Result.ValueFormats.JSON, "the first result must describe the JSON topic")
+	s.Require().Equal(1, out.Results[1].Result.ValueFormats.Text, "the second result must describe the text topic")
+}
