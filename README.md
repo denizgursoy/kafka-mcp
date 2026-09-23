@@ -1,5 +1,8 @@
 # kafka-mcp
 
+[![License](https://img.shields.io/github/license/denizgursoy/kafka-mcp?color=blue&style=flat-square)](https://raw.githubusercontent.com/denizgursoy/kafka-mcp/main/LICENSE)
+[![Coverage](https://img.shields.io/sonar/coverage/denizgursoy_kafka-mcp?logo=sonarcloud&server=https%3A%2F%2Fsonarcloud.io&style=flat-square)](https://sonarcloud.io/summary/overall?id=denizgursoy_kafka-mcp)
+
 An MCP server that exposes Kafka debugging as tools an LLM can call. It speaks
 MCP over HTTP and talks to Kafka with [franz-go](https://github.com/twmb/franz-go).
 
