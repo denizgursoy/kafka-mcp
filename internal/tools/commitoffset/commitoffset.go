@@ -46,32 +46,13 @@ type Output struct {
 }
 
 const description = `
-Move a consumer group's committed offset for one partition.
+Move one consumer group's committed offset for one partition. The response
+previews how many messages would be skipped or replayed; offset is the next
+message the group will read.
 
-This decides which messages a group will and will not process. Moving the
-offset forward skips messages, and they are never processed. Moving it
-backward replays messages that were already processed, which produces
-duplicates. Neither can be undone by Kafka.
-
-Nothing changes unless "confirm" is true. Without it the response describes
-what would happen: the current offset, the target, how many messages would be
-skipped or replayed, the group's state, and any warnings.
-
-"offset" is absolute and means the offset the group reads next, exactly as
-Kafka stores it. To skip the message at offset 42, commit 43.
-
-The group must have no active members. A running consumer holds its position
-in memory and only reads the committed offset when it joins a group, so a
-commit made while it is running is usually overwritten by its next commit,
-leaving the group exactly where it was. Stop the consumers first. Setting
-"allow_active_members" proceeds anyway, which is only sensible if the
-consumers are restarted immediately afterwards.
-
-The commit is refused on a read-only server. That protection belongs to this
-server and is applied whether or not the cluster has ACLs of its own.
-
-Committing needs the group's offset-commit permission. If the broker refuses,
-the answer is a Kafka ACL for the principal this server connects as.
+No change is made unless confirm is true. Active groups are refused unless
+allow_active_members is true, because running consumers may overwrite the
+commit. Requires Kafka offset-commit permission.
 `
 
 // Register adds the commit_offset tool to the MCP server.

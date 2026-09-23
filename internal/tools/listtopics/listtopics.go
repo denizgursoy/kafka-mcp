@@ -23,12 +23,8 @@ type Output struct {
 }
 
 const description = `
-List the Kafka topics on the connected cluster.
-
-Returns the matching topic names sorted alphabetically and their count.
-If "search" is provided, only topics whose name contains that text are
-returned, matched case-insensitively. If "search" is omitted, every topic
-is returned.
+List topic names on the endpoint's cluster, sorted alphabetically. Optionally
+filter them by a case-insensitive substring. Returns names and count.
 `
 
 // Register adds the list_topics tool to the MCP server. The tool owns its own

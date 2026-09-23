@@ -34,26 +34,10 @@ type Output struct {
 
 const description = `
 List the consumer groups on the cluster, with their state, member count and the
-topics they consume.
-
-Use this to find out who consumes a topic before measuring lag with
-consumer_lag.
-
-"state" matters when interpreting lag:
-
-  Stable              the group has active members consuming
-  Empty               the group exists and may still hold committed offsets,
-                      but no member is consuming, so its lag will not shrink
-  PreparingRebalance  members are joining or leaving
-  Dead                the group is gone
-
-A group in state Empty can still report lag, because committed offsets outlive
-the consumers that made them. Lag that is not moving is explained by the state,
-not by a slow consumer.
-
-Kafka has no index from topic to group, so filtering by "topic" lists every
-group on the cluster and describes each one. That is fine for ordinary
-clusters, but it is not a free call on a cluster with very many groups.
+topics they consume. Filter by exact topic or group state. Empty groups may
+still hold committed offsets and lag; they have no active consumers to drain
+it. Topic filtering may inspect every group because Kafka has no topic-to-group
+index.
 `
 
 // Register adds the list_consumer_groups tool to the MCP server.

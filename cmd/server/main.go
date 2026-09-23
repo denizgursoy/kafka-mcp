@@ -1,8 +1,8 @@
 // Command server runs the Kafka MCP server over HTTP.
 //
-// A deployment may serve several Kafka clusters. Each is served on its own
-// path, so a session is bound to one cluster by the endpoint it connects to
-// rather than by a parameter a caller could forget to send.
+// A deployment may serve several Kafka clusters and several endpoint policies.
+// Each endpoint has its own path and is bound to one cluster, so a caller
+// cannot redirect ordinary tools with a parameter it could forget to send.
 package main
 
 import (
@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
-	"strings"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/rakunlabs/ada"
@@ -35,10 +34,6 @@ var (
 	date    = "-"
 )
 
-// mcpPathSuffix is appended to the configured HTTP base path. With no base
-// path, a cluster named "prod" is served at /mcp/prod.
-const mcpPathSuffix = "/mcp/"
-
 func main() {
 	into.Init(run,
 		into.WithLogger(logi.InitializeLog(logi.WithCaller(false))),
@@ -59,22 +54,24 @@ func run(ctx context.Context) error {
 
 	defer clusters.Close()
 
-	servers := make(map[string]*mcp.Server, len(cfg.Clusters))
-	mcpPathPrefix := cfg.HTTP.BasePath + mcpPathSuffix
+	servers := make(map[string]*mcp.Server, len(cfg.Endpoints))
 
-	for _, name := range cfg.ClusterNames() {
+	for _, name := range cfg.EndpointNames() {
 		server, err := newServer(cfg, clusters, name)
 		if err != nil {
-			return fmt.Errorf("serve cluster %q: %w", name, err)
+			return fmt.Errorf("serve endpoint %q: %w", name, err)
 		}
 
 		servers[name] = server
+		endpoint := cfg.Endpoints[name]
 
-		slog.Info("serving cluster",
-			"cluster", name,
-			"path", mcpPathPrefix+name,
-			"read_only", cfg.Clusters[name].ReadOnly,
-			"disabled_tools", cfg.Clusters[name].DisabledTools(),
+		slog.Info("serving endpoint",
+			"endpoint", name,
+			"cluster", endpoint.Cluster,
+			"path", cfg.HTTP.BasePath+endpoint.Path,
+			"description", endpoint.Description,
+			"read_only", endpoint.ReadOnly,
+			"disabled_tools", endpoint.DisabledTools(),
 		)
 	}
 
@@ -87,13 +84,14 @@ func run(ctx context.Context) error {
 // cfg.Load canonicalizes that path to either empty or a leading-slash path
 // without a trailing slash.
 func newHTTPServer(cfg *config.Config, servers map[string]*mcp.Server) *ada.Server {
-	mcpPathPrefix := cfg.HTTP.BasePath + mcpPathSuffix
+	byPath := make(map[string]*mcp.Server, len(cfg.Endpoints))
+	for name, endpoint := range cfg.Endpoints {
+		byPath[cfg.HTTP.BasePath+endpoint.Path] = servers[name]
+	}
 
-	// The SDK turns a nil server into a 400, so an unknown cluster needs no
-	// special case here.
 	handler := mcp.NewStreamableHTTPHandler(
 		func(request *http.Request) *mcp.Server {
-			return servers[strings.TrimPrefix(request.URL.Path, mcpPathPrefix)]
+			return byPath[request.URL.Path]
 		},
 		nil,
 	)
@@ -107,7 +105,11 @@ func newHTTPServer(cfg *config.Config, servers map[string]*mcp.Server) *ada.Serv
 		mlog.Middleware(),
 		mtelemetry.Middleware(),
 	)
-	server.HandleWildcard(mcpPathPrefix, handler)
+	// Routes are exact. In particular /mcp and /mcp/rw may safely describe
+	// different permissions without the shorter path capturing the longer one.
+	for endpointPath := range byPath {
+		server.Handle(endpointPath, handler)
+	}
 
 	// A liveness endpoint that needs no MCP session, so a container
 	// orchestrator can tell the process is up without speaking the protocol.
@@ -118,12 +120,12 @@ func newHTTPServer(cfg *config.Config, servers map[string]*mcp.Server) *ada.Serv
 	return server
 }
 
-// newServer builds the MCP server for one cluster.
+// newServer builds the MCP server for one endpoint policy.
 //
 // Which tools that server ends up with is not decided here: internal/tools
 // owns it, so adding or gating a tool never touches main. What main does own
 // is refusing to start when registration rejects the configuration, because a
-// server that started anyway would serve a cluster with the wrong tools.
+// server that started anyway would serve an endpoint with the wrong tools.
 func newServer(
 	cfg *config.Config,
 	clusters *kafkaclient.Registry,
@@ -132,7 +134,7 @@ func newServer(
 
 	server := mcp.NewServer(
 		&mcp.Implementation{
-			// Naming the server after its cluster makes a misdirected client
+			// Naming the server after its endpoint makes a misdirected client
 			// visible in the initialize handshake, before any tool is called.
 			Name: "kafka-mcp-" + name,
 

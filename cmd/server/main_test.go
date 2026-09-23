@@ -21,7 +21,12 @@ func TestHTTPRoutesSuite(t *testing.T) {
 
 func (s *HTTPRoutesSuite) TestConfiguredBasePathPrefixesEveryEndpoint() {
 	server := newHTTPServer(
-		&config.Config{HTTP: config.HTTP{BasePath: "/gateway/kafka"}},
+		&config.Config{
+			HTTP: config.HTTP{BasePath: "/gateway/kafka"},
+			Endpoints: map[string]*config.Endpoint{
+				"local": {Name: "local", Cluster: "local", Path: "/mcp/local"},
+			},
+		},
 		map[string]*mcp.Server{},
 	)
 
@@ -45,8 +50,8 @@ func (s *HTTPRoutesSuite) TestConfiguredBasePathPrefixesEveryEndpoint() {
 
 		server.ServeHTTP(response, request)
 
-		s.Require().Equal(http.StatusBadRequest, response.Code,
-			"the prefixed MCP wildcard must reach the SDK, which reports an unknown cluster as a bad request")
+		s.Require().Equal(http.StatusNotFound, response.Code,
+			"an unconfigured endpoint below the base path must not be captured by a broader writable or read-only route")
 	})
 
 	s.Run("unprefixed endpoints are not exposed", func() {
@@ -72,4 +77,39 @@ func (s *HTTPRoutesSuite) TestEmptyBasePathKeepsExistingRoutes() {
 
 	s.Require().Equal(http.StatusOK, response.Code,
 		"deployments that do not configure a base path must keep their existing health URL")
+}
+
+func (s *HTTPRoutesSuite) TestConfiguredEndpointPathsAreExact() {
+	readServer := mcp.NewServer(&mcp.Implementation{Name: "read", Version: "test"}, nil)
+	writeServer := mcp.NewServer(&mcp.Implementation{Name: "write", Version: "test"}, nil)
+	cfg := &config.Config{
+		Endpoints: map[string]*config.Endpoint{
+			"read":  {Name: "read", Cluster: "prod", Path: "/mcp", ReadOnly: true},
+			"write": {Name: "write", Cluster: "prod", Path: "/mcp/rw"},
+		},
+	}
+
+	server := newHTTPServer(cfg, map[string]*mcp.Server{
+		"read":  readServer,
+		"write": writeServer,
+	})
+
+	for _, endpointPath := range []string{"/mcp", "/mcp/rw"} {
+		request := httptest.NewRequestWithContext(s.T().Context(), http.MethodPost, endpointPath, nil)
+		request.Header.Set("Content-Type", "application/json")
+		request.Header.Set("Accept", "application/json, text/event-stream")
+		response := httptest.NewRecorder()
+
+		server.ServeHTTP(response, request)
+
+		s.Require().NotEqual(http.StatusNotFound, response.Code,
+			"each configured endpoint path must be mounted even when one path is a prefix of another")
+	}
+
+	request := httptest.NewRequestWithContext(s.T().Context(), http.MethodPost, "/mcp/other", nil)
+	response := httptest.NewRecorder()
+	server.ServeHTTP(response, request)
+
+	s.Require().Equal(http.StatusNotFound, response.Code,
+		"custom endpoint routing must use exact paths so a read endpoint cannot accidentally catch a nearby path")
 }

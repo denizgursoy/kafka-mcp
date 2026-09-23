@@ -13,11 +13,11 @@ wrong in a specific way.
 
 | The user is asking | Guide |
 | ------------------ | ----- |
-| Where a message is, by id, key or a field condition | [find-message.md](find-message.md) |
-| Whether consumers are behind, how fast, when it clears | [check-lag.md](check-lag.md) |
-| Why a consumer is stuck, and how to get it moving | [skip-poison-message.md](skip-poison-message.md) |
-| Whether to add partitions, and doing it safely | [scale-partitions.md](scale-partitions.md) |
-| For a new topic, with a partition count and retention chosen on purpose | [create-topic.md](create-topic.md) |
+| Where a message is, by id, key or a field condition | [find-message](references/find-message.md) |
+| Whether consumers are behind, how fast, when it clears | [check-lag](references/check-lag.md) |
+| Why a consumer is stuck, and how to get it moving | [skip-poison-message](references/skip-poison-message.md) |
+| Whether to add partitions, and doing it safely | [scale-partitions](references/scale-partitions.md) |
+| For a new topic, with a partition count and retention chosen on purpose | [create-topic](references/create-topic.md) |
 
 ## When "the consumer is behind" is ambiguous
 
@@ -27,9 +27,9 @@ them by wording is guesswork. Call `consumer_lag` first and let `status` decide:
 | `status` | What it means | Where to go |
 | -------- | ------------- | ----------- |
 | `caught_up` | There is no lag | Answer and stop |
-| `draining` | Working, just slower than the user hoped | [check-lag.md](check-lag.md) for the ETA |
-| `growing` | Consumers cannot keep up at all | [scale-partitions.md](scale-partitions.md) |
-| `stalled` | Members present, consuming nothing | [skip-poison-message.md](skip-poison-message.md) |
+| `draining` | Working, just slower than the user hoped | [check-lag](references/check-lag.md) for the ETA |
+| `growing` | Consumers cannot keep up at all | [scale-partitions](references/scale-partitions.md) |
+| `stalled` | Members present, consuming nothing | [skip-poison-message](references/skip-poison-message.md) |
 | `no_active_consumers` | Nobody is running | Say so: starting a consumer is the fix |
 
 Adding partitions to a `stalled` group, or skipping a message from a `growing`
@@ -38,10 +38,11 @@ problem; the other adds capacity to a consumer that is not consuming.
 
 ## Rules that apply to every guide
 
-**One endpoint is one cluster.** The server serves each cluster on its own path
-under `/mcp/`, and every tool is bound to the cluster of the endpoint it was
-called on. No tool takes a cluster parameter, except `copy_message`, which
-chooses a destination, and `list_clusters`, which reports the roster.
+**One endpoint targets one cluster.** Several endpoints may target the same
+cluster with different paths, purposes and permissions. Every tool is bound to
+the cluster and policy of the endpoint it was called on. No tool takes a cluster
+parameter, except `copy_message`, which chooses a destination, and
+`list_clusters`, which reports the roster.
 
 **Check `server_config` before promising a change.** A read-only endpoint does
 not expose `add_partitions`, `commit_offset` or `create_topic` at all, and any

@@ -64,6 +64,30 @@ func (s *RegistrationSuite) SetupSuite() {
 				Tools:   map[string]bool{"server_config": false},
 			},
 		},
+		Endpoints: map[string]*config.Endpoint{
+			"readonly": {
+				Name: "readonly", Cluster: "readonly", Path: "/mcp/readonly", ReadOnly: true,
+			},
+			"writable": {
+				Name: "writable", Cluster: "writable", Path: "/mcp/writable",
+			},
+			"limited": {
+				Name: "limited", Cluster: "limited", Path: "/mcp/limited",
+				Tools: map[string]bool{
+					"create_topic": false,
+					"list_topics":  false,
+					"get_message":  true,
+				},
+			},
+			"typo": {
+				Name: "typo", Cluster: "typo", Path: "/mcp/typo",
+				Tools: map[string]bool{"create_topics": false},
+			},
+			"silent": {
+				Name: "silent", Cluster: "silent", Path: "/mcp/silent",
+				Tools: map[string]bool{"server_config": false},
+			},
+		},
 	}
 
 	clusters, err := kafkaclient.NewRegistry(s.cfg)

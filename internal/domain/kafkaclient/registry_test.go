@@ -75,6 +75,37 @@ func (s *RegistrySuite) TestUnknownClusterIsNil() {
 		"an unknown name must return nothing rather than a client for some other cluster, because the HTTP router turns a nil server into a 400 and a tool turns it into a clear error")
 }
 
+func (s *RegistrySuite) TestScopesPermissionsPerEndpoint() {
+	registry, err := kafkaclient.NewRegistry(&config.Config{
+		Clusters: map[string]*config.Cluster{
+			"prod": {Name: "prod", Brokers: []string{s.env.Broker()}},
+		},
+		Endpoints: map[string]*config.Endpoint{
+			"read":  {Name: "read", Cluster: "prod", Path: "/mcp", ReadOnly: true},
+			"write": {Name: "write", Cluster: "prod", Path: "/mcp/rw"},
+		},
+	})
+	s.Require().NoError(err,
+		"one physical Kafka connection must support several endpoint policies")
+	s.T().Cleanup(registry.Close)
+
+	s.Run("read endpoint refuses", func() {
+		client := registry.Endpoint("read")
+		s.Require().NotNil(client,
+			"the read endpoint must resolve to its cluster connection")
+		s.Require().Error(client.RequireWritable("test write"),
+			"endpoint read_only must be enforced at the mutation gate, not only by hiding tools")
+	})
+
+	s.Run("write endpoint permits", func() {
+		client := registry.Endpoint("write")
+		s.Require().NotNil(client,
+			"the write endpoint must reuse the same configured cluster")
+		s.Require().NoError(client.RequireWritable("test write"),
+			"a writable endpoint for the same cluster must not inherit the read endpoint's narrower policy")
+	})
+}
+
 func (s *RegistrySuite) TestKeepsAnUnreachableCluster() {
 	registry, err := kafkaclient.NewRegistry(&config.Config{
 		Clusters: map[string]*config.Cluster{

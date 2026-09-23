@@ -24,10 +24,33 @@ import (
 // Client owns one cluster's Kafka connection, shared by every tool bound to
 // that cluster.
 type Client struct {
-	client *kgo.Client
-	admin  *kadm.Client
-	reader *records.Reader
-	cfg    *config.Cluster
+	client   *kgo.Client
+	admin    *kadm.Client
+	reader   *records.Reader
+	cfg      *config.Cluster
+	endpoint *config.Endpoint
+}
+
+// ForEndpoint returns an endpoint-scoped view over the same Kafka connection.
+// Closing remains the registry's responsibility; the view only adds policy.
+func (c *Client) ForEndpoint(endpoint *config.Endpoint) *Client {
+	if c == nil {
+		return nil
+	}
+
+	return &Client{
+		client:   c.client,
+		admin:    c.admin,
+		reader:   c.reader,
+		cfg:      c.cfg,
+		endpoint: endpoint,
+	}
+}
+
+// Endpoint returns the policy applied to this view, or nil for a direct
+// cluster client retained for backwards-compatible tests and integrations.
+func (c *Client) Endpoint() *config.Endpoint {
+	return c.endpoint
 }
 
 // New connects to the cluster described by cfg.
@@ -137,11 +160,15 @@ func (c *Client) Name() string {
 // boundary: whoever can edit the config file can turn it off. Where real
 // enforcement is needed, it belongs in Kafka ACLs against the SASL principal.
 func (c *Client) RequireWritable(operation string) error {
-	if !c.cfg.ReadOnly {
+	readOnly := c.cfg.ReadOnly
+	where := fmt.Sprintf("cluster %q", c.cfg.Name)
+	if c.endpoint != nil {
+		readOnly = c.endpoint.ReadOnly
+		where = fmt.Sprintf("endpoint %q for cluster %q", c.endpoint.Name, c.cfg.Name)
+	}
+	if !readOnly {
 		return nil
 	}
-
-	where := fmt.Sprintf("cluster %q", c.cfg.Name)
 
 	return fmt.Errorf(
 		"%s is read-only: it is configured with read_only, so %s cannot change it",

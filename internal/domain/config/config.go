@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"os"
 	"path"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
@@ -21,6 +22,7 @@ import (
 	mcors "github.com/rakunlabs/ada/middleware/cors"
 	"github.com/rakunlabs/chu"
 	"github.com/rakunlabs/chu/loader/loaderenv"
+	"github.com/rakunlabs/chu/loader/loaderfile"
 )
 
 // SASL mechanisms the server can authenticate with.
@@ -164,18 +166,29 @@ type cluster struct {
 	Tools    map[string]bool `cfg:"tools"`
 }
 
+// endpoint is the policy and HTTP route applied to one view of a cluster.
+// Connection details deliberately stay in cluster so several endpoints can
+// reuse one Kafka client without repeating credentials.
+type endpoint struct {
+	Cluster     string          `cfg:"cluster"`
+	Path        string          `cfg:"path"`
+	Description string          `cfg:"description"`
+	ReadOnly    bool            `cfg:"read_only"`
+	Tools       map[string]bool `cfg:"tools"`
+}
+
 // file mirrors the whole config file.
 type file struct {
-	HTTP      HTTP                `cfg:"http"`
-	OutputDir string              `cfg:"output_dir"`
-	Clusters  map[string]*cluster `cfg:"clusters"`
+	HTTP      HTTP                 `cfg:"http"`
+	OutputDir string               `cfg:"output_dir"`
+	Clusters  map[string]*cluster  `cfg:"clusters"`
+	Endpoints map[string]*endpoint `cfg:"endpoints"`
 }
 
 // Cluster is one Kafka cluster the server can serve.
 type Cluster struct {
-	// Name is the key from the config file. It names the HTTP path the
-	// cluster is served on and is reported by list_clusters, so it is carried
-	// here rather than left as only a map key.
+	// Name is the key from the config file and is reported by cluster-aware
+	// tools, so it is carried here rather than left as only a map key.
 	Name string `cfg:"name"`
 
 	Brokers  []string `cfg:"brokers"`
@@ -188,7 +201,8 @@ type Cluster struct {
 	// franz-go is handed all of them and settles on one the broker offers.
 	SASL []*SASL `cfg:"sasl"`
 
-	// Tools turns individual tools off for this cluster, keyed by tool name:
+	// Tools is the legacy cluster-level tool policy. New configurations put
+	// this on Endpoint; retaining it here keeps old files safe while migrating.
 	//
 	//	tools:
 	//	  create_topic: false
@@ -205,7 +219,40 @@ type Cluster struct {
 	Tools map[string]bool `cfg:"tools"`
 }
 
-// ToolEnabled reports whether this cluster's endpoint should expose a tool.
+// Endpoint is one MCP view of a Kafka cluster. It owns the route and policy;
+// the referenced Cluster owns brokers and authentication. More than one
+// endpoint may therefore expose the same connection with different powers.
+type Endpoint struct {
+	Name        string
+	Cluster     string
+	Path        string
+	Description string
+	ReadOnly    bool
+	Tools       map[string]bool
+}
+
+// ToolEnabled reports whether this endpoint should expose a tool.
+func (e *Endpoint) ToolEnabled(name string) bool {
+	enabled, listed := e.Tools[name]
+
+	return !listed || enabled
+}
+
+// DisabledTools lists the endpoint's explicitly withheld tools in stable
+// order for startup logs and diagnostics.
+func (e *Endpoint) DisabledTools() []string {
+	disabled := make([]string, 0, len(e.Tools))
+	for name, enabled := range e.Tools {
+		if !enabled {
+			disabled = append(disabled, name)
+		}
+	}
+	sort.Strings(disabled)
+
+	return disabled
+}
+
+// ToolEnabled reports the legacy cluster-level tool policy.
 //
 // Absence means enabled: the map lists exceptions, so a cluster that says
 // nothing about a tool gets it.
@@ -215,8 +262,7 @@ func (c *Cluster) ToolEnabled(name string) bool {
 	return !listed || enabled
 }
 
-// DisabledTools lists the tools this cluster withholds by configuration,
-// sorted, so a startup log or an error can name them in a stable order.
+// DisabledTools lists tools withheld by the legacy cluster-level policy.
 func (c *Cluster) DisabledTools() []string {
 	disabled := make([]string, 0, len(c.Tools))
 
@@ -239,6 +285,10 @@ type Config struct {
 	// Clusters is keyed by cluster name.
 	Clusters map[string]*Cluster
 
+	// Endpoints is keyed by endpoint name. Every entry binds an exact HTTP
+	// path and an exposure policy to one cluster.
+	Endpoints map[string]*Endpoint
+
 	// Path is the file this came from.
 	Path string
 }
@@ -259,6 +309,17 @@ func (c *Config) ClusterNames() []string {
 	return names
 }
 
+// EndpointNames returns every configured endpoint name, sorted.
+func (c *Config) EndpointNames() []string {
+	names := make([]string, 0, len(c.Endpoints))
+	for name := range c.Endpoints {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	return names
+}
+
 // Load uses chu's default, file, HTTP and environment loaders.
 func Load(ctx context.Context) (*Config, error) {
 	var parsed file
@@ -269,7 +330,13 @@ func Load(ctx context.Context) (*Config, error) {
 	// still distinguishable from the field being absent.
 	parsed.HTTP.CORS = DefaultCORS()
 
+	configFolders := []string{"/etc"}
+	if userConfigDir, err := os.UserConfigDir(); err == nil {
+		configFolders = append([]string{filepath.Join(userConfigDir, "kafka-mcp")}, configFolders...)
+	}
+
 	if err := chu.Load(ctx, "kafka-mcp", &parsed,
+		chu.WithLoaderOption(loaderfile.New(loaderfile.WithFolders(configFolders...))),
 		chu.WithLoaderOption(loaderenv.New(loaderenv.WithPrefix("KAFKA_MCP_"))),
 	); err != nil {
 		return nil, fmt.Errorf("parse config: %w", err)
@@ -284,6 +351,7 @@ func Load(ctx context.Context) (*Config, error) {
 		HTTP:      parsed.HTTP,
 		OutputDir: parsed.OutputDir,
 		Clusters:  make(map[string]*Cluster, len(parsed.Clusters)),
+		Endpoints: make(map[string]*Endpoint),
 	}
 
 	basePath, err := normalizeBasePath(cfg.HTTP.BasePath)
@@ -307,7 +375,108 @@ func Load(ctx context.Context) (*Config, error) {
 		cfg.Clusters[name] = resolved
 	}
 
+	if len(parsed.Endpoints) == 0 {
+		// Compatibility with the original format, where each cluster was also
+		// its endpoint and was reached at /mcp/<cluster>.
+		for name, cluster := range cfg.Clusters {
+			cfg.Endpoints[name] = &Endpoint{
+				Name:     name,
+				Cluster:  name,
+				Path:     "/mcp/" + name,
+				ReadOnly: cluster.ReadOnly,
+				Tools:    copyToolPolicy(cluster.Tools),
+			}
+		}
+	} else {
+		paths := make(map[string]string, len(parsed.Endpoints))
+		for name, parsedEndpoint := range parsed.Endpoints {
+			resolved, err := resolveEndpoint(name, parsedEndpoint, cfg.Clusters)
+			if err != nil {
+				return nil, err
+			}
+			if previous, exists := paths[resolved.Path]; exists {
+				return nil, fmt.Errorf(
+					"endpoints %q and %q use the same path %q", previous, name, resolved.Path)
+			}
+			paths[resolved.Path] = name
+			cfg.Endpoints[name] = resolved
+		}
+	}
+
 	return cfg, nil
+}
+
+func resolveEndpoint(name string, parsed *endpoint, clusters map[string]*Cluster) (*Endpoint, error) {
+	if parsed == nil {
+		return nil, fmt.Errorf("endpoint %q must not be null", name)
+	}
+	if strings.TrimSpace(name) == "" {
+		return nil, fmt.Errorf("config: an endpoint name must not be empty")
+	}
+
+	cluster := clusters[parsed.Cluster]
+	if cluster == nil {
+		return nil, fmt.Errorf("endpoint %q references unknown cluster %q", name, parsed.Cluster)
+	}
+
+	endpointPath, err := normalizeEndpointPath(parsed.Path, name)
+	if err != nil {
+		return nil, err
+	}
+
+	// Legacy cluster-level policy remains a lower bound during migration: an
+	// endpoint may narrow it, but may never turn an old protection back on.
+	tools := copyToolPolicy(cluster.Tools)
+	if len(parsed.Tools) > 0 && tools == nil {
+		tools = make(map[string]bool, len(parsed.Tools))
+	}
+	for tool, enabled := range parsed.Tools {
+		if existing, listed := tools[tool]; listed && !existing {
+			continue
+		}
+		tools[tool] = enabled
+	}
+
+	return &Endpoint{
+		Name:        name,
+		Cluster:     parsed.Cluster,
+		Path:        endpointPath,
+		Description: strings.TrimSpace(parsed.Description),
+		ReadOnly:    cluster.ReadOnly || parsed.ReadOnly,
+		Tools:       tools,
+	}, nil
+}
+
+func normalizeEndpointPath(value string, name string) (string, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "/mcp/" + name, nil
+	}
+	if strings.ContainsAny(value, "?#") {
+		return "", fmt.Errorf("endpoint %q path must contain only a URL path, not a query or fragment", name)
+	}
+
+	cleaned := path.Clean("/" + strings.TrimLeft(value, "/"))
+	if cleaned == "/" {
+		return "", fmt.Errorf("endpoint %q path must not be the HTTP root", name)
+	}
+	if cleaned == "/healthz" {
+		return "", fmt.Errorf("endpoint %q path %q conflicts with the health route", name, cleaned)
+	}
+
+	return cleaned, nil
+}
+
+func copyToolPolicy(source map[string]bool) map[string]bool {
+	if len(source) == 0 {
+		return nil
+	}
+	copy := make(map[string]bool, len(source))
+	for name, enabled := range source {
+		copy[name] = enabled
+	}
+
+	return copy
 }
 
 // normalizeBasePath returns either an empty string for the HTTP root or an

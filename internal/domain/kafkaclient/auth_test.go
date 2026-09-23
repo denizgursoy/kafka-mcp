@@ -81,7 +81,7 @@ func (s *AuthenticationSuite) TestAuthenticatedConnections() {
 	s.Run("MCP reads authenticated records", func() {
 		server := mcp.NewServer(&mcp.Implementation{Name: "auth-test", Version: "1"}, nil)
 		getmessage.Register(server, client.Reader())
-		serverconfig.Register(server, client, nil, []string{"get_message", "server_config"})
+		serverconfig.Register(server, client, nil, nil, []string{"get_message", "server_config"})
 		httpServer := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return server }, nil))
 		defer httpServer.Close()
 		ctx, cancel := context.WithTimeout(s.T().Context(), 10*time.Second)

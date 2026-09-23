@@ -64,42 +64,13 @@ type Output struct {
 }
 
 const description = `
-Copy one message to another topic, preserving its key, value and headers.
+Copy an existing message, identified by topic, partition and offset, to an
+existing topic on this or another configured cluster. Preserves key, value and
+headers and adds traceable provenance headers.
 
-Use this to preserve a message before it becomes unreachable, most often
-writing a message that is blocking a consumer into a dead letter topic before
-skipping past it. It also serves copying a message from one environment into
-another to reproduce a problem.
-
-The message is named by topic, partition and offset. There is no way to supply
-content, so this tool can only duplicate a message the cluster already holds.
-
-Set "destination_cluster" to copy to another cluster this server serves, which
-is how a message is taken from production into a preproduction topic to be
-debugged safely. Omit it to copy within the cluster this endpoint serves. Use
-list_clusters to see which names are valid.
-
-read_only protects the cluster being written to. A read-only cluster can be
-the source of a copy, because copying out of it changes nothing; it cannot be
-the destination.
-
-Every copy carries provenance headers recording the cluster, topic, partition
-and offset it came from, when it was copied, by which tool, and the principal this server
-connects as. A copy is therefore traceable back to its original, which is what
-keeps a dead letter topic from becoming a pile of messages nobody can explain.
-If the original already carries one of those headers, the original is kept and
-the collision is reported, so provenance never overwrites real data.
-
-The server cannot identify a person: it is reached over stdio and every call
-looks alike, so the recorded principal is the Kafka identity it authenticates
-as, not a user.
-
-Nothing is written unless "confirm" is true. Without it the response shows the
-message that would be copied.
-
-The destination topic must already exist. This tool is refused entirely on a
-read-only server, including the preview, because writing is all it does.
-Producing needs write permission on the destination topic.
+No message is written unless confirm is true. The destination must be writable
+and requires Kafka write permission; a read-only cluster may still be the
+source.
 `
 
 // Register adds the copy_message tool to the MCP server.
@@ -155,18 +126,24 @@ func run(
 	client string,
 ) (Output, error) {
 
-	source := clusters.Get(own)
+	source := clusters.Endpoint(own)
 	if source == nil {
-		return Output{}, fmt.Errorf("unknown cluster %q", own)
+		// Direct package tests and callers predating explicit endpoints pass a
+		// cluster name. Keep that API while production uses endpoint names.
+		source = clusters.Get(own)
 	}
+	if source == nil {
+		return Output{}, fmt.Errorf("unknown endpoint or cluster %q", own)
+	}
+	sourceCluster := source.Config().Name
 
 	// The destination defaults to this endpoint's own cluster, so a copy
 	// within one cluster needs no extra parameter.
 	destination := source
-	destinationName := own
+	destinationName := sourceCluster
 
-	if input.DestinationCluster != "" && input.DestinationCluster != own {
-		destination = clusters.Get(input.DestinationCluster)
+	if input.DestinationCluster != "" && input.DestinationCluster != sourceCluster {
+		destination = clusters.Destination(input.DestinationCluster)
 		if destination == nil {
 			return Output{}, fmt.Errorf(
 				"unknown destination_cluster %q: use list_clusters to see which clusters this server serves",
@@ -194,7 +171,7 @@ func run(
 		return Output{}, fmt.Errorf("destination_topic is required")
 	}
 
-	if input.SourceTopic == input.DestinationTopic && destinationName == own {
+	if input.SourceTopic == input.DestinationTopic && destinationName == sourceCluster {
 		return Output{}, fmt.Errorf(
 			"source_topic and destination_topic are both %q: copying a topic onto itself appends a duplicate to the topic being debugged",
 			input.SourceTopic)
@@ -215,7 +192,7 @@ func run(
 	}
 
 	out := Output{
-		SourceCluster:      own,
+		SourceCluster:      sourceCluster,
 		DestinationCluster: destinationName,
 		SourceTopic:        input.SourceTopic,
 		SourcePartition:    input.SourcePartition,
@@ -225,7 +202,7 @@ func run(
 		Warnings:           []string{},
 	}
 
-	headers, added, collisions := withProvenance(record, input, own, destination, client)
+	headers, added, collisions := withProvenance(record, input, sourceCluster, destination, client)
 
 	out.ProvenanceHeaders = added
 

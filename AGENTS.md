@@ -23,7 +23,7 @@ internal/domain/          Everything shared by more than one tool
   kafkaclient/            The Kafka connections, one per cluster
   records/                Reading and rendering Kafka records
   testenv/                Test container environment (broker + Console)
-skills/kafka-debugging/   One umbrella skill, one guide per scenario
+skills/kafka-debugging/   One umbrella skill; scenario guides in references/
 docker-compose.yml        Local Redpanda + Redpanda Console
 Makefile                  Build, run and compose targets
 ```
@@ -57,15 +57,15 @@ on.
 ## Skill-driven development
 
 Tools exist to serve skills. `skills/kafka-debugging/` holds one umbrella
-`SKILL.md` that routes to a guide per scenario, and each guide describes a real
-debugging scenario. The tools are whatever those scenarios need — not a
-wishlist of Kafka features. So development starts from the skill, never from
-the tool.
+`SKILL.md` that routes to one guide per scenario under `references/`, and each
+guide describes a real debugging scenario. The tools are whatever those
+scenarios need — not a wishlist of Kafka features. So development starts from
+the skill, never from the tool.
 
-A new scenario is a new guide beside the others plus a row in the umbrella's
-routing table, not a new `SKILL.md`: a second `SKILL.md` under `skills/` would
-be discovered as a separate skill, and the discovery rule requires its `name`
-to match its directory.
+A new scenario is a new guide beside the others in `references/` plus a row in
+the umbrella's routing table, not a new `SKILL.md`: a second `SKILL.md` under
+`skills/` would be discovered as a separate skill, and the discovery rule
+requires its `name` to match its directory.
 
 When asked to build or extend a skill, work in this order and **do not write
 code before step 4**.

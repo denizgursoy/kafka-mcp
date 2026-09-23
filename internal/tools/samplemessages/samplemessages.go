@@ -75,29 +75,10 @@ const (
 )
 
 const description = `
-Read a small sample of the newest messages in a topic and report what they look
-like: the shape of their values, the JSON fields they contain, and whether the
-message key identifies the message.
-
-Use this before searching. It answers the questions that decide how to search:
-
-- "value_formats" says whether values are JSON, plain text or binary, and so
-  whether search_messages can use a structured filter at all.
-- "json_fields" lists the field paths found, with their types, ready to use in
-  a filter. A field reported only as null is a candidate for is_null.
-- "key_stats" says whether messages carry keys and whether those keys are
-  unique.
-- "key_in_value" names the value fields whose content equals the message key.
-  When this reports a field such as payload.orderId, the key is that
-  identifier, and searching with search_in ["key"] and match "exact" is both
-  precise and cheap.
-
-"sampled_ranges" reports the offsets the sample was taken from. The sample is
-of the newest messages only, so a topic whose format changed over time may hold
-older messages of a different shape.
-
-Do not use the sampled keys to guess which partition a message is on. Producers
-may set the partition explicitly, so a key does not determine it.
+Sample a topic's newest messages and summarize value formats, JSON field paths,
+key usage and sampled offset ranges. Use this to design a search_messages
+predicate. The sample describes recent data only, and keys must not be used to
+guess partitions.
 `
 
 // Register adds the sample_messages tool to the MCP server.

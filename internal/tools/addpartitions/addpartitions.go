@@ -44,31 +44,12 @@ type Output struct {
 const defaultSampleSize = 20
 
 const description = `
-Add partitions to a Kafka topic.
+Increase a topic's partition count and report the current count, affected
+consumer groups, sampled key usage and warnings. Kafka cannot remove
+partitions, and changing the count can break ordering for keyed messages.
 
-This is irreversible. Kafka can only add partitions, never remove them, so a
-mistake can be undone only by creating a new topic and migrating the data.
-
-Nothing changes unless "confirm" is true. Without it the response describes
-what would happen: the current count, the target, whether the topic holds
-keyed messages, which consumer groups are affected, and any warnings. Run it
-that way first and show the user before confirming.
-
-The risk worth understanding is key ordering. Kafka routes a keyed message by
-hashing the key modulo the partition count, so changing the count sends
-existing keys to different partitions. Messages already written stay where
-they are, and new messages for the same key land elsewhere, which means two
-consumers can process one key at the same time and out of order. For anything
-order-sensitive this is silent corruption rather than a visible failure.
-Because of that, a topic whose sampled messages carry keys requires
-"acknowledge_key_ordering" to be true as well.
-
-The key check reads a sample of recent messages, so it shows what the topic
-looks like now rather than proving what it has always held.
-
-Adding partitions requires ALTER permission on the topic. If the broker
-refuses, the answer is a Kafka ACL for the principal this server connects as,
-not a change to this server.
+No change is made unless confirm is true. Keyed samples also require
+acknowledge_key_ordering. Requires Kafka ALTER permission.
 `
 
 // Register adds the add_partitions tool to the MCP server.

@@ -89,6 +89,105 @@ func (s *ConfigSuite) TestLoadsSeveralClusters() {
 	})
 }
 
+func (s *ConfigSuite) TestLoadsSeveralEndpointsForOneCluster() {
+	loaded, err := s.load(s.write(`{
+		"clusters": {
+			"prod": {"broker": "kafka-1:9093,kafka-2:9093"}
+		},
+		"endpoints": {
+			"prod-read": {
+				"cluster": "prod",
+				"path": "/mcp",
+				"description": "Production investigation",
+				"read_only": true
+			},
+			"prod-write": {
+				"cluster": "prod",
+				"path": "/mcp/rw",
+				"description": "Approved production changes",
+				"tools": {"copy_message": false}
+			}
+		}
+	}`))
+
+	s.Require().NoError(err,
+		"one Kafka connection must be reusable by endpoints with different paths and permissions")
+	s.Require().Len(loaded.Clusters, 1,
+		"endpoint policies must not duplicate the physical Kafka cluster or its credentials")
+	s.Require().Len(loaded.Endpoints, 2,
+		"both policies must become independently addressable MCP endpoints")
+	s.Require().Equal("prod", loaded.Endpoints["prod-read"].Cluster,
+		"an endpoint must retain the cluster it binds its tools to")
+	s.Require().Equal("/mcp", loaded.Endpoints["prod-read"].Path,
+		"the configured path must survive in canonical absolute form")
+	s.Require().Equal("Production investigation", loaded.Endpoints["prod-read"].Description,
+		"the endpoint purpose must be reportable to an MCP caller")
+	s.Require().True(loaded.Endpoints["prod-read"].ReadOnly,
+		"the read endpoint must enforce its own policy even though another endpoint for the same cluster is writable")
+	s.Require().False(loaded.Endpoints["prod-write"].ToolEnabled("copy_message"),
+		"tool switches belong to the endpoint because two views of one cluster may expose different capabilities")
+}
+
+func (s *ConfigSuite) TestLegacyClustersBecomeEndpoints() {
+	loaded, err := s.load(s.write(`{
+		"clusters": {
+			"prod": {
+				"broker": "kafka:9093",
+				"read_only": true,
+				"tools": {"copy_message": false}
+			}
+		}
+	}`))
+
+	s.Require().NoError(err,
+		"the existing configuration shape must keep working while deployments migrate to explicit endpoints")
+	s.Require().Contains(loaded.Endpoints, "prod",
+		"an old cluster entry must gain an implicit endpoint with the same stable name")
+	s.Require().Equal("/mcp/prod", loaded.Endpoints["prod"].Path,
+		"the compatibility endpoint must preserve the URL existing MCP clients use")
+	s.Require().True(loaded.Endpoints["prod"].ReadOnly,
+		"compatibility must never drop a write protection from an existing deployment")
+	s.Require().False(loaded.Endpoints["prod"].ToolEnabled("copy_message"),
+		"compatibility must preserve tool restrictions as well as routing")
+}
+
+func (s *ConfigSuite) TestRejectsInvalidEndpoints() {
+	s.Run("unknown cluster", func() {
+		_, err := s.load(s.write(`{
+			"clusters": {"prod": {"broker": "kafka:9093"}},
+			"endpoints": {"read": {"cluster": "missing", "path": "/mcp"}}
+		}`))
+
+		s.Require().Error(err,
+			"an endpoint that is not bound to a configured cluster could only fail later on every tool call")
+		s.Require().Contains(err.Error(), "missing",
+			"the error must name the bad reference so the operator can repair it")
+	})
+
+	s.Run("duplicate normalized path", func() {
+		_, err := s.load(s.write(`{
+			"clusters": {"prod": {"broker": "kafka:9093"}},
+			"endpoints": {
+				"read": {"cluster": "prod", "path": "/mcp"},
+				"write": {"cluster": "prod", "path": "mcp/"}
+			}
+		}`))
+
+		s.Require().Error(err,
+			"two endpoint names must not silently compete for the same HTTP route after path normalization")
+	})
+
+	s.Run("health route", func() {
+		_, err := s.load(s.write(`{
+			"clusters": {"prod": {"broker": "kafka:9093"}},
+			"endpoints": {"read": {"cluster": "prod", "path": "/healthz"}}
+		}`))
+
+		s.Require().Error(err,
+			"an MCP endpoint must not replace the unauthenticated liveness route")
+	})
+}
+
 func (s *ConfigSuite) TestHTTPBasePath() {
 	s.Run("normalizes a configured base path", func() {
 		loaded, err := s.load(s.write(`{
@@ -149,6 +248,62 @@ func (s *ConfigSuite) TestRequiresConfiguration() {
 		"the server must refuse to start without configured clusters rather than guessing a broker")
 	s.Require().Contains(err.Error(), "CONFIG_FILE",
 		"the error must name the variable that points at the file, so the operator knows what to set")
+}
+
+func (s *ConfigSuite) TestDiscoversConfigurationFiles() {
+	s.Run("user config directory is the fallback", func() {
+		workingDir := s.T().TempDir()
+		userConfigDir := s.T().TempDir()
+		configDir := filepath.Join(userConfigDir, "kafka-mcp")
+		s.Require().NoError(os.MkdirAll(configDir, 0o700),
+			"the user configuration directory must exist for the discovery case to be meaningful")
+		s.Require().NoError(os.WriteFile(
+			filepath.Join(configDir, "kafka-mcp.json"),
+			[]byte(`{"clusters":{"user":{"broker":"user:9092"}}}`),
+			0o600,
+		), "the fallback configuration must be written before loading it")
+
+		s.T().Chdir(workingDir)
+		s.T().Setenv("CONFIG_FILE", "")
+		s.T().Setenv("XDG_CONFIG_HOME", userConfigDir)
+
+		loaded, err := config.Load(s.T().Context())
+
+		s.Require().NoError(err,
+			"a user-level configuration must make the server usable outside the directory that contains the file")
+		s.Require().Contains(loaded.Clusters, "user",
+			"the fallback must come from the kafka-mcp directory under the operating system's user config directory")
+	})
+
+	s.Run("working directory takes precedence", func() {
+		workingDir := s.T().TempDir()
+		userConfigDir := s.T().TempDir()
+		configDir := filepath.Join(userConfigDir, "kafka-mcp")
+		s.Require().NoError(os.MkdirAll(configDir, 0o700),
+			"the lower-priority user configuration must exist so the case proves precedence")
+		s.Require().NoError(os.WriteFile(
+			filepath.Join(configDir, "kafka-mcp.json"),
+			[]byte(`{"clusters":{"user":{"broker":"user:9092"}}}`),
+			0o600,
+		), "the lower-priority user configuration must be written before loading")
+		s.Require().NoError(os.WriteFile(
+			filepath.Join(workingDir, "kafka-mcp.json"),
+			[]byte(`{"clusters":{"working":{"broker":"working:9092"}}}`),
+			0o600,
+		), "the working-directory configuration must be written before loading")
+
+		s.T().Chdir(workingDir)
+		s.T().Setenv("CONFIG_FILE", "")
+		s.T().Setenv("XDG_CONFIG_HOME", userConfigDir)
+
+		loaded, err := config.Load(s.T().Context())
+
+		s.Require().NoError(err, "a configuration in the working directory must load")
+		s.Require().Contains(loaded.Clusters, "working",
+			"project-local configuration must override the user's fallback configuration")
+		s.Require().NotContains(loaded.Clusters, "user",
+			"chu selects the first matching file rather than merging configurations from multiple directories")
+	})
 }
 
 func (s *ConfigSuite) TestRequiresAtLeastOneCluster() {

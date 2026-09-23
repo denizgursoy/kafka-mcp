@@ -86,64 +86,14 @@ const (
 )
 
 const description = `
-Search a Kafka topic by running a JavaScript filter over its messages, and
-return the matches with their partition, offset, timestamp, key, value and
-headers.
+Search message key, value, headers or metadata with a JavaScript predicate.
+The script returns true for a match and receives value (parsed JSON or text),
+key, headers, partition, offset and timestamp. Omit it to match all messages.
 
-Kafka cannot search server-side, so this reads messages and filters them
-client-side. Every search is therefore bounded, and the result reports what was
-actually covered: "scanned_messages", "scanned_ranges" and "stopped_reason".
-
-The "script" argument decides what matches. Return true to keep a message:
-
-  return key === 'order-123'
-  return value.eventType === 'NEW' && value.payload.amount >= 500
-  return value.payload.cancelledAt === null
-  return headers['correlation-id'] === 'corr-999'
-  return /ORD-\d{4}/.test(value)
-
-In scope are value, key, headers, partition, offset and timestamp. "value" is
-the parsed JSON document, or the raw text when the message is not JSON, so a
-log topic is searched with ordinary string methods. A missing field is
-undefined while a field set to null is null, so the two can be told apart.
-Omitting the script matches every message, bounded by max_matches.
-
-Prefer the narrowest condition available. When the key identifies the message,
-compare it exactly with "return key === '...'": a bare id such as 123 also
-appears inside unrelated numbers in the value, and those false positives can
-fill max_matches and hide the message actually wanted. Use sample_messages
-first to learn whether the key carries the identifier.
-
-A script that throws on a message is counted in "script_errors" and the scan
-continues, so a broken script is not mistaken for an absence of matches. A
-script is stopped if it exceeds the search timeout, but it is not bounded by
-memory: something like 'x'.repeat(1e12) can exhaust the server process.
-
-"stopped_reason" is one of:
-  range_exhausted - the whole requested range was read
-  max_matches     - stopped after enough matches were found
-  max_scanned     - hit the max_messages_scanned ceiling
-  timeout         - hit the timeout_seconds ceiling
-
-"complete" is true only when the range was exhausted. An empty match list is
-only conclusive when complete is true; otherwise the message may exist outside
-the part that was scanned. Narrow the search with partitions, an offset range
-or a time range and try again.
-
-"parallelism" splits each partition's offsets between that many readers, so a
-topic with a single partition is parallelised too. It is worth setting for
-count_only, output_file or a full scan. A narrow newest-first search is usually
-faster without it, because a sequential scan can stop after the newest chunk
-while parallel readers have already read the older ones.
-
-When a query may match a great many messages, set "count_only" first to learn
-how many there are without fetching any, then ask the user what they want
-before returning bodies. For large result sets, "output_file" writes every
-match to a file instead of returning them.
-
-Use describe_topic first to see how large the topic is, and get_message
-afterwards to read a match in full, since values here are truncated to
-max_value_bytes.
+Kafka has no server-side search, so scans are bounded. Check complete,
+stopped_reason and scanned_ranges before treating no matches as conclusive.
+Use count_only or output_file for large result sets. Scripts are time-limited
+but not memory-sandboxed; keep predicates simple.
 `
 
 // Register adds the search_messages tool to the MCP server.

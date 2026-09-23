@@ -9,3 +9,8 @@ output_dir: /tmp/kafka-mcp-exports
 clusters:
   local:
     broker: localhost:19092
+endpoints:
+  local:
+    cluster: local
+    path: /mcp/local
+    description: Local Redpanda debugging

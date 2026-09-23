@@ -52,36 +52,12 @@ type Output struct {
 }
 
 const description = `
-Describe one Kafka topic: how many partitions it has, the offset range of each
-partition, how many messages it holds, the timestamps of its oldest and newest
-messages, and its full configuration.
+Describe a topic's partitions, offset ranges, approximate message count,
+oldest/newest timestamps and complete effective configuration. Config entries
+identify whether values are inherited or topic-specific.
 
-Use this before searching a topic. It tells you how much data a search would
-have to scan, which partition and offset or time range to narrow it to, and how
-far back the topic can hold data at all.
-
-"message_count" per partition is end_offset minus start_offset. It counts
-offsets rather than surviving records, so it can overcount if records were
-deleted by retention or compaction. A partition whose start and end offsets are
-equal is empty. The timestamps are omitted for an empty topic.
-
-"configs" lists every topic configuration entry. Values are returned as the
-strings Kafka reports, and -1 means unlimited for the retention and size
-settings. Two entries matter most when deciding whether a message can still
-exist:
-
-  retention.ms    how long messages are kept, so a search for anything older
-                  than this will find nothing however wide the scan
-  cleanup.policy  "delete" discards old messages, while "compact" keeps only
-                  the most recent message per key, so earlier values of a key
-                  are gone even within the retention window
-
-"source" says where a value comes from, and "is_default" is true when the
-value is inherited rather than set on the topic itself. Retention is enforced
-per log segment, so messages can outlive retention.ms until their segment is
-eligible for deletion.
-
-Fails if the topic does not exist.
+Message counts are offset spans and may overcount after retention or
+compaction. Fails if the topic does not exist.
 `
 
 // Register adds the describe_topic tool to the MCP server.

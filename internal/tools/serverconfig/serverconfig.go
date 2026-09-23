@@ -22,6 +22,9 @@ type Input struct{}
 // client and may be logged or shown to a model, so a secret must never be
 // able to reach it.
 type Output struct {
+	Endpoint       string                `json:"endpoint"`
+	Path           string                `json:"path"`
+	Description    string                `json:"description,omitempty"`
 	Cluster        string                `json:"cluster"`
 	Brokers        []string              `json:"brokers"`
 	Authentication string                `json:"authentication"`
@@ -37,35 +40,10 @@ type Output struct {
 }
 
 const description = `
-Report how this server is configured: which brokers it is connected to, which
-identity it authenticates as, whether it may change the cluster, and which
-tools it exposes.
-
-Use this when a result is surprising. An empty topic list means something very
-different depending on whether the server is pointed at a local broker or a
-production cluster, and this is the only way to tell from inside a session.
-
-"cluster" is the cluster this endpoint serves. A server may serve several,
-each on its own endpoint, so this is how a session confirms which one it is
-talking to rather than inferring it from a tool name the client chose.
-
-"read_only" means this server refuses operations that would change the
-cluster. It protects a cluster that has no ACLs of its own; it is not a
-security boundary, because whoever can edit the configuration can turn it off.
-
-"tools" is what this endpoint exposes, not what the deployment can do. A
-read-only cluster does not register the tools whose only purpose is to change
-it, so they are absent here and absent from the tool list. Do not tell the user
-a tool is missing when this reports read_only true: the cluster is protected,
-which is a different answer.
-
-"authentication" and "sasl_user" describe the first configured SASL option.
-"sasl_options" lists all configured mechanisms and identities in preference
-order, including optional authorization identities (zid). These are configured
-preferences, not the negotiated identity of an individual broker connection.
-Kafka ACLs apply to the authenticated identity even when read_only is false.
-
-The password is never reported.
+Report this endpoint's name, path, purpose, cluster, brokers, authentication,
+TLS, read-only policy and exposed tools. Use it to confirm the target and
+permissions before acting; several endpoints may target one cluster with
+different policies. Passwords are never returned.
 `
 
 // Register adds the server_config tool to the MCP server.
@@ -77,6 +55,7 @@ func Register(
 	server *mcp.Server,
 	kafka *kafkaclient.Client,
 	cfg *config.Config,
+	endpoint *config.Endpoint,
 	tools []string,
 ) {
 	mcp.AddTool(
@@ -91,7 +70,7 @@ func Register(
 			input Input,
 		) (*mcp.CallToolResult, Output, error) {
 
-			out, err := Run(kafka, cfg, tools)
+			out, err := Run(kafka, cfg, endpoint, tools)
 			if err != nil {
 				return nil, Output{}, fmt.Errorf("server config: %w", err)
 			}
@@ -102,19 +81,34 @@ func Register(
 }
 
 // Run reports the effective configuration of the running server.
-func Run(kafka *kafkaclient.Client, server *config.Config, tools []string) (Output, error) {
+func Run(kafka *kafkaclient.Client, server *config.Config, endpoint *config.Endpoint, tools []string) (Output, error) {
 	cfg := kafka.Config()
 
 	if cfg == nil {
 		return Output{}, fmt.Errorf("server has no configuration")
 	}
 
+	if endpoint == nil {
+		endpoint = kafka.Endpoint()
+	}
+	if endpoint == nil {
+		endpoint = &config.Endpoint{
+			Name:     cfg.Name,
+			Cluster:  cfg.Name,
+			Path:     "/mcp/" + cfg.Name,
+			ReadOnly: cfg.ReadOnly,
+		}
+	}
+
 	out := Output{
+		Endpoint:       endpoint.Name,
+		Path:           endpoint.Path,
+		Description:    endpoint.Description,
 		Cluster:        cfg.Name,
 		Brokers:        cfg.Brokers,
 		Authentication: "none",
 		TLS:            cfg.TLS != nil && cfg.TLS.Enabled,
-		ReadOnly:       cfg.ReadOnly,
+		ReadOnly:       endpoint.ReadOnly,
 		Tools:          append([]string{}, tools...),
 		Note: "read_only protects a cluster without ACLs and can be turned off by " +
 			"anyone who can edit the configuration. Real authorisation comes from " +
@@ -125,6 +119,7 @@ func Run(kafka *kafkaclient.Client, server *config.Config, tools []string) (Outp
 		out.OutputDir = server.OutputDir
 		out.ConfigFile = server.Path
 		out.HTTPAddress = server.HTTP.Address
+		out.Path = server.HTTP.BasePath + endpoint.Path
 	}
 
 	out.SASLOptions = cfg.AuthenticationOptions()

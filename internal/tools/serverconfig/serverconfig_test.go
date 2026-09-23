@@ -44,6 +44,7 @@ func (s *ServerConfigSuite) TestReportsTheConnectionAndPermissions() {
 	out, err := serverconfig.Run(
 		client,
 		&config.Config{OutputDir: "/var/tmp/exports", HTTP: config.HTTP{Address: ":8080"}},
+		&config.Endpoint{Name: "prod-read", Cluster: "production", Path: "/mcp", Description: "Production investigation", ReadOnly: true},
 		[]string{"list_topics", "describe_topic"},
 	)
 
@@ -64,6 +65,15 @@ func (s *ServerConfigSuite) TestReportsTheConnectionAndPermissions() {
 			"a caller must be able to learn that writes are blocked before attempting one")
 	})
 
+	s.Run("the endpoint purpose is reported", func() {
+		s.Require().Equal("prod-read", out.Endpoint,
+			"two endpoint policies may target one cluster, so the session must identify the policy it reached")
+		s.Require().Equal("/mcp", out.Path,
+			"the caller must see the exact configured route rather than infer it from a cluster name")
+		s.Require().Equal("Production investigation", out.Description,
+			"the operator-provided purpose tells an MCP caller when this endpoint should be used")
+	})
+
 	s.Run("the registered tools are listed", func() {
 		s.Require().Equal([]string{"describe_topic", "list_topics"}, out.Tools,
 			"the tool list answers whether a running server has a given capability, and must be sorted for a stable answer")
@@ -73,7 +83,7 @@ func (s *ServerConfigSuite) TestReportsTheConnectionAndPermissions() {
 func (s *ServerConfigSuite) TestReportsWhenThereIsNoAuthentication() {
 	client := s.client(&config.Cluster{Name: "local", Brokers: []string{"localhost:19092"}})
 
-	out, err := serverconfig.Run(client, nil, nil)
+	out, err := serverconfig.Run(client, nil, nil, nil)
 
 	s.Require().NoError(err, "a cluster without authentication must still be reportable")
 	s.Require().Equal("none", out.Authentication,
@@ -95,7 +105,7 @@ func (s *ServerConfigSuite) TestReportsTheSASLPrincipal() {
 		}},
 	})
 
-	out, err := serverconfig.Run(client, nil, nil)
+	out, err := serverconfig.Run(client, nil, nil, nil)
 
 	s.Require().NoError(err, "reporting a SASL connection must succeed")
 	s.Require().Equal("scram-sha-256", out.Authentication,
@@ -117,7 +127,7 @@ func (s *ServerConfigSuite) TestNeverRevealsThePassword() {
 		}},
 	})
 
-	out, err := serverconfig.Run(client, nil, nil)
+	out, err := serverconfig.Run(client, nil, nil, nil)
 
 	s.Require().NoError(err, "reporting must succeed")
 

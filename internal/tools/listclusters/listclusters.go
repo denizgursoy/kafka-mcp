@@ -36,23 +36,9 @@ type Output struct {
 
 const description = `
 List the Kafka clusters this server serves, with whether each is reachable and
-whether it accepts writes.
-
-Every cluster is served on its own endpoint, and this tool reports the same
-roster from all of them. Use it to discover what a cross-cluster copy may
-target: copy_message takes a destination_cluster, and the name must come from
-this list.
-
-"connected" is checked when you call, not recorded at startup, so a cluster
-that has gone down since the server started is reported honestly.
-
-"read_only" means that cluster refuses changes. A read-only cluster can still
-be the source of a copy, because copying out of it changes nothing; it cannot
-be the destination.
-
-Only the name, reachability and writability are reported. Broker addresses and
-credentials are deliberately not, because this tool is reachable from every
-endpoint.
+whether it accepts writes. Connectivity is checked at call time. Use returned
+names as copy_message destination_cluster values. Broker and credential details
+are not exposed.
 `
 
 // Register adds the list_clusters tool to the MCP server.
@@ -104,7 +90,7 @@ func Run(ctx context.Context, clusters *kafkaclient.Registry) (Output, error) {
 
 		out.Clusters[i] = Cluster{
 			Name:     name,
-			ReadOnly: client.Config().ReadOnly,
+			ReadOnly: clusters.ReadOnly(name),
 		}
 
 		wait.Add(1)

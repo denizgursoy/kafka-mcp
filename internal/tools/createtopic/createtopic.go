@@ -57,31 +57,13 @@ type Output struct {
 }
 
 const description = `
-Create a Kafka topic.
+Create a Kafka topic with optional partition count, replication factor and
+topic-level configs. Omitted values use broker defaults. Existing topics are
+refused rather than modified.
 
-Nothing is created unless "confirm" is true. Without it the request is sent to
-the broker for validation only: the broker checks the name, the replication
-factor against the number of brokers, and every config key, and the response
-says whether the creation would succeed. Run it that way first and show the
-user, because two of the choices are hard to take back.
-
-"partitions" is the one worth thinking about. Kafka can add partitions to a
-topic later but can never remove them, and adding them moves keyed messages to
-different partitions, so a count chosen carelessly is a problem that only
-shows up under load. Both counts are optional: omit them to take the broker's
-defaults on Kafka 2.4 or newer, which is the better answer when there is
-nothing to base a number on. Older brokers require both counts explicitly.
-
-"configs" sets topic-level configuration at creation time, such as
-retention.ms or cleanup.policy. Keys not given are inherited from the cluster
-defaults and can be changed later; the partition count is the part that cannot.
-
-A topic that already exists is refused rather than adjusted. Use add_partitions
-to change an existing topic's partition count.
-
-Creating a topic requires CREATE permission on the topic or the cluster. If
-the broker refuses, the answer is a Kafka ACL for the principal this server
-connects as, not a change to this server.
+No topic is created unless confirm is true; otherwise the broker only validates
+the request. Partition counts cannot be reduced later. Requires Kafka CREATE
+permission.
 `
 
 // Register adds the create_topic tool to the MCP server.

@@ -73,34 +73,12 @@ const (
 const defaultSampleSeconds = 5
 
 const description = `
-Measure how far behind a topic's consumers are, how fast messages are being
-produced and consumed, and when the backlog will clear.
+Measure consumer lag, production and consumption rates, and whether a topic's
+backlog is caught up, draining, growing, stalled or has no active consumers.
+Returns an ETA only when lag is shrinking.
 
-Kafka stores no history of consumption, so the two rates are measured very
-differently, and the difference matters when reading the result:
-
-- "produce_rate" is measured from message timestamps over real windows: the
-  last second, the last minute and the last hour. It is historical fact.
-- "consume_rate" is sampled by reading the group's committed offset, waiting
-  "sample_seconds", and reading it again. It is a short extrapolation, not a
-  historical average, and the call blocks while it is taken. Set
-  "skip_consume_rate" to avoid the wait, at the cost of any estimate.
-
-The backlog does not drain at the consume rate. It drains at the consume rate
-minus the produce rate, because producers keep adding to it. "status" says what
-the numbers mean:
-
-  caught_up            there is no lag
-  draining             lag is shrinking, and eta_seconds says when it clears
-  growing              consumers cannot keep up, so the lag will never clear;
-                       growing_by_per_minute says how fast it is getting worse
-  stalled              members are present but nothing is being consumed
-  no_active_consumers  the group has no members, so nothing will drain it
-  not_measured         the consume rate was not sampled, so no estimate exists
-
-An estimate is reported only when the lag is genuinely shrinking. In every
-other case the reason is named instead, because a completion time that will
-never arrive is worse than no completion time at all.
+Consumption rate is sampled for sample_seconds, so the call waits that long.
+Set skip_consume_rate for an immediate result without an ETA.
 `
 
 // Register adds the consumer_lag tool to the MCP server.

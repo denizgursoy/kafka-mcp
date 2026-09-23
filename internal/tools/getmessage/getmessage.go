@@ -30,19 +30,9 @@ type Output struct {
 
 const description = `
 Read one Kafka message at an exact topic, partition and offset, and optionally
-the messages either side of it.
-
-Use this after search_messages has located an offset, to see the full message.
-Unlike search results, which are previews, this returns the value up to
-max_value_bytes and reports the original size.
-
-Set "context" to also return that many messages before and after the offset,
-which shows what a consumer saw around the message. Context is clamped to the
-partition's bounds, so asking for more than exists is not an error.
-
-Values that are not valid UTF-8 are base64 encoded and "encoding" is set to
-"base64". Fails if the partition does not exist or the offset is past the end
-of the partition.
+nearby messages for context. Returns key, value, headers, timestamp and original
+value size; binary values are base64 encoded. Fails for an invalid partition or
+an offset beyond the partition end.
 `
 
 // Register adds the get_message tool to the MCP server.

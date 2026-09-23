@@ -37,12 +37,11 @@ uses 8080, and running both is the normal case.
 ```yaml
 http:
   address: ":8090"
-  base_path: /kafka-mcp # optional; endpoints become /kafka-mcp/mcp/... and /kafka-mcp/healthz
+  base_path: /kafka-mcp # optional; prefixes every endpoint and /healthz
 output_dir: /var/tmp/kafka-mcp
 clusters:
   prod:
     broker: kafka-1:9093,kafka-2:9093
-    read_only: true
     security:
       tls:
         enabled: true
@@ -57,20 +56,49 @@ clusters:
             pass: "{env:KAFKA_PASSWORD}" # or password_file: /run/secrets/kafka
   preprod:
     broker: kafka-preprod:9093
+endpoints:
+  prod-read:
+    cluster: prod
+    path: /mcp
+    description: Production investigation and debugging
+    read_only: true
+  prod-write:
+    cluster: prod
+    path: /mcp/rw
+    description: Approved production changes
+    tools:
+      copy_message: false
+  preprod:
+    cluster: preprod
+    path: /mcp/preprod
 ```
 
-Each key under `clusters` names both the cluster and the path it is served on.
-With the example `http.base_path`, `prod` is reached at
-`/kafka-mcp/mcp/prod`; without it, the existing `/mcp/prod` path is used. The
-base path also prefixes the liveness endpoint (`/kafka-mcp/healthz`). A leading
-or trailing slash is optional. Only `broker` is required per cluster.
+`clusters` owns Kafka connection details: brokers, TLS and SASL. `endpoints`
+owns the MCP route and policy. Several endpoints may reference one cluster, so
+the example reuses one production connection at `/kafka-mcp/mcp` in read-only
+mode and `/kafka-mcp/mcp/rw` in writable mode. Paths are exact: `/mcp` does not
+capture `/mcp/rw`. `description` is optional and is reported by
+`server_config` so a caller knows what the endpoint is intended for.
 
-A cluster may also switch individual tools off, by name:
+`http.base_path` prefixes endpoint paths and the liveness route. A leading or
+trailing slash on an endpoint path is optional. Paths must be unique and may
+not be `/`, `/healthz`, or contain a query or fragment. When `path` is omitted,
+it defaults to `/mcp/<endpoint-name>`.
+
+For compatibility, a file with no `endpoints` block still creates one endpoint
+per cluster at `/mcp/<cluster-name>`. Existing cluster-level `read_only` and
+`tools` values continue to apply as a lower bound during migration; an explicit
+endpoint cannot widen them. New configurations should put both fields under
+`endpoints`.
+
+An endpoint may switch individual tools off, by name:
 
 ```yaml
-clusters:
-  prod:
-    broker: kafka-1:9093
+endpoints:
+  prod-read:
+    cluster: prod
+    path: /mcp
+    read_only: true
     tools:
       create_topic: false
       commit_offset: false
@@ -82,9 +110,9 @@ later. Names are exact and lowercase, as listed by `server_config`. They are
 checked at startup: a name that is not a tool stops the
 server, because a typo would leave the tool it was meant to withhold exposed.
 `server_config` cannot be switched off, since it is how a session learns which
-tools the endpoint has. This narrows an endpoint, it never widens one:
-`read_only: true` still withholds the writing tools regardless of what the map
-says.
+cluster and policy it reached and which tools that endpoint has. The `tools`
+map only narrows an endpoint: `read_only: true` still withholds the writing
+tools regardless of what the map says.
 
 A minimal local file:
 
@@ -92,12 +120,18 @@ A minimal local file:
 clusters:
   local:
     broker: localhost:19092
+endpoints:
+  local:
+    cluster: local
+    path: /mcp/local
 ```
 
 Run a custom configuration with `CONFIG_FILE=/path/to/config.yaml go run ./cmd/server`.
-Without `CONFIG_FILE`, chu discovers `kafka-mcp.{toml,yaml,yml,json}` in the
-working directory or `/etc`. Its standard loader order is defaults, file, HTTP,
-then environment; environment overrides use the `KAFKA_MCP_` prefix (for example,
+Without `CONFIG_FILE`, chu discovers `kafka-mcp.{toml,yaml,yml,json}` first in
+the working directory, then in the operating system's user config directory
+(`~/.config/kafka-mcp/` on Linux), and finally in `/etc`. It uses the first
+matching file rather than merging files. Its standard loader order is defaults,
+file, HTTP, then environment; environment overrides use the `KAFKA_MCP_` prefix (for example,
 `KAFKA_MCP_HTTP_ADDRESS=:9000` or
 `KAFKA_MCP_HTTP_BASE_PATH=/kafka-mcp`). Logging can be configured with
 `LOG_LEVEL` and `LOG_PRETTY`.
@@ -156,10 +190,11 @@ A cluster that cannot be reached at startup is still served, and
 `list_clusters` reports it as disconnected. One cluster being down must not
 block debugging the others.
 
-`server_config` reports which cluster an endpoint serves, and never the
-password. Its `authentication` and `sasl_user` describe the first configured
-option; `sasl_options` lists all configured identities in preference order,
-not the mechanism negotiated by an individual broker connection.
+`server_config` reports the endpoint name, exact path, description, policy and
+the cluster it serves, and never the password. Its `authentication` and
+`sasl_user` describe the first configured option; `sasl_options` lists all
+configured identities in preference order, not the mechanism negotiated by an
+individual broker connection.
 
 ### Browser clients (CORS)
 
@@ -203,13 +238,14 @@ which it should not be.
 
 **These endpoints have no authentication of their own.** An allowed origin can
 drive every tool with the server's Kafka credentials, from any page the
-browser's user happens to visit. `allow_origins` is the only barrier, so narrow
-it to the pages that should have that power, and set `read_only: true` on
-clusters that should not be written to.
+browser's user happens to visit. `allow_origins` is the only built-in HTTP
+barrier, so narrow it to the pages that should have that power, protect writable
+paths in a reverse proxy, and set `read_only: true` on endpoints that should not
+write. A less obvious path such as `/mcp/rw` is not authentication.
 
 ## Connecting a client
 
-Register one entry per cluster:
+Register one entry per endpoint you want the client to use:
 
 ```jsonc
 {
@@ -218,9 +254,9 @@ Register one entry per cluster:
       "type": "remote",
       "url": "http://localhost:8090/mcp/local"
     },
-    "kafka-prod": {
+    "kafka-prod-read": {
       "type": "remote",
-      "url": "http://localhost:8090/mcp/prod",
+      "url": "http://localhost:8090/mcp",
       "enabled": false
     }
   }
@@ -228,10 +264,10 @@ Register one entry per cluster:
 ```
 
 The key becomes the tool prefix, so these appear as `kafka-local_list_topics`
-and `kafka-prod_list_topics`. **Name the entries after the clusters they point
-at**: the prefix is the clearest signal of which cluster a call will hit, and a
-`kafka-local` entry aimed at `/mcp/prod` would be actively misleading. Use
-`server_config` to confirm rather than trusting the name.
+and `kafka-prod-read_list_topics`. Name entries after both the cluster and the
+endpoint policy: the prefix is the clearest signal of what a call can hit and
+change. Use `server_config` to confirm rather than trusting the client-side
+name.
 
 Each enabled cluster costs context: these tools are roughly 8k tokens of
 definitions. Enable only what you need, and put production behind an agent:
@@ -255,19 +291,19 @@ Three layers, and only one of them is real security:
 | Layer | Protects against | Real security? |
 | ----- | ---------------- | -------------- |
 | `confirm: true` on writes | An LLM changing things on one ambiguous request | No — a guardrail |
-| `read_only: true` | Accidental writes to a cluster with no ACLs | No — anyone who can edit the config can turn it off |
+| endpoint `read_only: true` | Accidental writes with the server's Kafka identity | No — anyone who can edit the config can turn it off |
 | **Kafka ACLs on the SASL principal** | **An unauthorised person** | **Yes — the broker decides** |
 
 ### What a read-only endpoint exposes
 
 `read_only: true` does more than refuse a write: the endpoint does not list the
 tools whose only purpose is to write. `add_partitions`, `commit_offset` and
-`create_topic` are absent from `tools/list` on a read-only cluster, so a client
+`create_topic` are absent from `tools/list` on a read-only endpoint, so a client
 never sees a tool it could not have used, and their preview cannot describe a
 change this endpoint would never apply.
 
-A writable cluster can withhold individual tools too, with the per-cluster
-`tools` map above. That is the same mechanism seen from the client: the tool is
+A writable endpoint can withhold individual tools too, with its `tools` map.
+That is the same mechanism seen from the client: the tool is
 not registered, so it is absent from `tools/list` and from `server_config`.
 
 `copy_message` stays, because `read_only` protects the cluster being written
@@ -549,14 +585,15 @@ or `not_measured`. An ETA is only given when the lag is genuinely shrinking.
 
 ### `server_config`
 
-Reports the effective configuration: brokers, environment label, authentication
-mechanism and principal, TLS, read-only state, export directory and the tools
-this server exposes. Takes no parameters. The password is never reported.
+Reports the effective configuration: endpoint name, exact path, description,
+cluster, brokers, authentication mechanism and principal, TLS, read-only state,
+export directory and the tools this endpoint exposes. Takes no parameters. The
+password is never reported.
 
 `tools` is the list for this endpoint, not for the deployment: a read-only
-cluster omits `add_partitions`, `commit_offset` and `create_topic`, because it
-does not register them, and any cluster omits whatever its `tools` configuration
-switches off.
+endpoint omits `add_partitions`, `commit_offset` and `create_topic`, because it
+does not register them, and any endpoint omits whatever its `tools`
+configuration switches off.
 
 Use it when a result is surprising: an empty topic list means something very
 different on a local broker than on production.
@@ -564,7 +601,7 @@ different on a local broker than on production.
 ### `add_partitions`
 
 Adds partitions to a topic. **Irreversible** — Kafka cannot reduce a partition
-count. Not exposed on a read-only cluster.
+count. Not exposed on a read-only endpoint.
 
 | Parameter | Type | Required | Meaning |
 | --------- | ---- | -------- | ------- |
@@ -585,7 +622,7 @@ has is refused with an explanation rather than attempted.
 ### `create_topic`
 
 Creates a topic. Refuses a topic that already exists rather than adjusting it.
-Not exposed on a read-only cluster.
+Not exposed on a read-only endpoint.
 
 | Parameter | Type | Required | Meaning |
 | --------- | ---- | -------- | ------- |
@@ -617,7 +654,7 @@ never modifies a topic it did not create.
 
 Moves a consumer group's committed offset for one partition. Forward to skip
 messages, backward to replay them. **Irreversible** in the sense that skipped
-messages are never processed. Not exposed on a read-only cluster.
+messages are never processed. Not exposed on a read-only endpoint.
 
 | Parameter | Type | Required | Meaning |
 | --------- | ---- | -------- | ------- |
@@ -655,16 +692,19 @@ preproduction topic can be traced back to its original. If the message already
 carries one of those headers, the original is kept and the collision is
 reported.
 
-`read_only` protects the cluster being **written to**. A read-only cluster can
-be the source of a copy, because copying out of it changes nothing; it cannot
-be the destination. The tool is refused entirely when the destination is
-read-only, preview included, because writing is all it does.
+For a copy within the endpoint's own cluster, its `read_only` policy protects
+the destination. A read-only endpoint can still be the source of a
+cross-cluster copy, because copying out changes nothing there. A different
+destination cluster is writable when it has at least one writable endpoint;
+`list_clusters` reports that effective state. The tool is refused entirely
+when the destination is read-only, preview included, because writing is all it
+does.
 
 ## Skills
 
 `skills/kafka-debugging/SKILL.md` is the one skill an agent loads. It routes to
-a guide beside it, rather than holding all five scenarios itself, so a session
-reads only the one it needs:
+the scenario guides under `skills/kafka-debugging/references/`, rather than
+holding all five workflows itself, so a session reads only the one it needs:
 
 - `find-message.md` — locating a message from something the user knows about it.
 - `check-lag.md` — measuring lag and throughput, and judging when a backlog will
