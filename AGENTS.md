@@ -2,6 +2,29 @@
 
 Guidance for coding agents working in this repository.
 
+## Scope of this file
+
+This file holds general rules only: how the repository is laid out, the order
+work happens in, and the conventions every tool obeys. It is not an inventory.
+
+**Adding, changing or removing a tool must not change this file.** The same goes
+for a new `testenv` helper, a new skill guide, or a new configuration field. If
+the rules here are correct, a new tool is described by the rules and needs no
+entry of its own, and the places that do list tools by name stay accurate on
+their own:
+
+| What a name lives in                  | Where it is |
+| ------------------------------------- | ----------- |
+| Which tools exist and are registered  | `internal/tools/tools.go` and the directories beside it |
+| What each tool does, for a user       | `README.md` |
+| What each tool does, for an LLM caller| the tool's own `description` and `jsonschema` tags |
+| Which helpers tests have              | `internal/domain/testenv` |
+
+Edit this file only when a rule itself changes — a new convention, a different
+workflow, a moved directory. When a rule and the code disagree, fix one of them
+deliberately; do not paper over it by adding a special case here, because a rule
+with exceptions listed by name is an inventory again.
+
 ## Project
 
 `kafka-mcp` is an MCP (Model Context Protocol) server that exposes Kafka
@@ -200,29 +223,11 @@ far too slow.
 
 ### 3b. Utilities live in `testenv`, not in test files
 
-`testenv.Environment` exposes the helpers tests need:
-
-| Method                        | Purpose                                        |
-| ----------------------------- | ---------------------------------------------- |
-| `Admin()`                     | `*kadm.Client` connected to the broker         |
-| `Kafka()`                     | `*kgo.Client` for record-level operations      |
-| `Reader()`                    | `*records.Reader` for tools that read messages |
-| `ClusterClient(t, readOnly)`  | Production-shaped client for testing a tool    |
-| `Broker()`                    | Host address for `kgo.SeedBrokers`             |
-| `SchemaRegistry()`            | Schema Registry host address                   |
-| `AdminAPI()`                  | Redpanda Admin API host address                |
-| `ConsoleURL()`                | Redpanda Console browser URL                   |
-| `CreateTopic(t, prefix)`      | Uniquely named topic, deleted by `Stop`        |
-| `CreateTopics(t, prefixes...)`| Same, for several topics at once               |
-| `CreateTopicWithPartitions(t, prefix, n)` | Topic with a chosen partition count |
-| `CreateTopicWithConfig(t, prefix, configs)` | Topic with topic-level configs   |
-| `Produce(t, topic, messages...)` | Produce records, returns their offsets      |
-| `ConsumeAndCommit(t, topic, group, n)` | Consume and commit n records as a real group member |
-| `DeleteTopics(t, topics...)`  | Delete topics early                            |
-| `UniqueName(prefix)`          | Unique name for topics, groups, and so on      |
-| `TopicExists(t, topic)`       | Whether the broker has the exact topic         |
-| `PartitionCount(t, topic)`    | Current partition count from broker metadata   |
-| `TopicConfig(t, topic, key)`  | One effective topic config value               |
+A test asserts on behaviour; it does not build broker state by hand.
+`testenv.Environment` owns that: clients for the broker, its host addresses,
+topic creation, producing, consuming as a real group member, unique naming, and
+reading back what the broker actually holds. Read the package for what it
+offers — it is the list, and a table here would only go stale.
 
 Helpers that create or assert on broker state take the **running test's**
 `*testing.T` (`s.T()`), not the suite's, so a failure aborts the test that is
@@ -413,6 +418,32 @@ at the compose broker and is what local runs use.
 
 ## Conventions
 
+- A tool whose operation names one target — a topic, a partition, an offset, a
+  group — takes an optional `items` array that repeats that operation, built on
+  `internal/domain/batch`. Debugging asks the same question of several targets
+  at once, and a caller who must spend one round trip per topic pays for the
+  tool's shape rather than for the work. A tool escapes this only when one call
+  already covers many targets, because wrapping a scan in a batch just hides
+  where the cost went.
+
+  The rules are the same for every such tool, so follow them rather than copying
+  a particular one:
+
+  - `items` is an alternative to the single-operation fields, never a
+    supplement. Combining them is an error, and the single form keeps its
+    original input and output shape so existing callers are untouched.
+  - Bound the batch with the limit in `batch` that matches the work: the
+    smaller one for anything that opens a record reader or returns messages,
+    the larger for metadata and administration.
+  - Results stay in input order and each carries `index` with either `result`
+    or `error`. One item's failure is data in the response, not an error for the
+    call, so it cannot hide the items that worked.
+  - A batch is never atomic, and says so. Kafka has no transaction spanning
+    these operations, so a write that succeeded before a later item failed
+    stays. A batch that writes previews every item first and applies only the
+    valid ones, `confirm` covering the whole batch, and refuses duplicate write
+    targets before anything changes.
+
 - A tool that changes anything — cluster configuration, consumer offsets, or
   message data — must call `kafkaclient.RequireWritable` before the call that
   mutates, so a read-only server refuses it. Put the check immediately before
@@ -427,8 +458,7 @@ at the compose broker and is what local runs use.
   can do, and a caller spends no call discovering a refusal. This decides what
   is advertised, not what is permitted: `RequireWritable` stays inside the tool,
   so a registration mistake still cannot write. A tool that only reads, and a
-  tool that writes to a cluster chosen per call (`copy_message`), stay
-  registered everywhere.
+  tool that writes to a cluster chosen per call, stay registered everywhere.
 - `server_config` reports the tools of **its own endpoint**. Its list is built
   in `tools.Register` by the same call that registers each tool, because the MCP
   server offers no way to read back what was added. A registration that does not
@@ -456,9 +486,10 @@ at the compose broker and is what local runs use.
   message can still be rescued out of a read-only production cluster.
 - One server serves several clusters, each on its own HTTP path under `/mcp/`.
   A tool is bound to one cluster at registration and must not take a cluster
-  parameter, so a caller cannot redirect it. The exceptions are `copy_message`,
-  which needs a destination, and `list_clusters`, which reports the roster;
-  both take the registry rather than a single client.
+  parameter, so a caller cannot redirect it. A tool escapes that rule only when
+  naming another cluster is the whole point of it — moving data to a
+  destination, or reporting the roster — and then it takes the registry rather
+  than a single client.
 - Never commit unless the user explicitly asks.
 - Keep `README.md` current. Any new tool, changed flag, changed environment
   variable or changed startup step must be reflected there in the same change.
