@@ -2,19 +2,17 @@ package batch_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"testing"
 
+	"github.com/google/jsonschema-go/jsonschema"
 	"github.com/stretchr/testify/suite"
 
 	"github.com/denizgursoy/kafka-mcp/internal/domain/batch"
 )
 
 type BatchSuite struct{ suite.Suite }
-
-type sampleOutput struct {
-	Name string `json:"name"`
-}
 
 func TestBatchSuite(t *testing.T) { suite.Run(t, new(BatchSuite)) }
 
@@ -49,22 +47,43 @@ func (s *BatchSuite) TestRejectsAnOversizedBatch() {
 	s.Require().Error(err, "the maximum must be enforced before workers start, so one call cannot create unbounded cluster load")
 }
 
-func (s *BatchSuite) TestOutputSchemaAcceptsSingleAndBatchShapes() {
-	schema, err := batch.OutputSchema[sampleOutput]().Resolve(nil)
-	s.Require().NoError(err, "the combined MCP output schema must resolve before a tool can register it")
+// conflicting names a field the envelope also has: every write tool's output
+// carries "applied", and so does Output.
+type conflicting struct {
+	Name    string `json:"name"`
+	Applied bool   `json:"applied"`
+}
 
-	s.Run("single output", func() {
-		s.Require().NoError(schema.Validate(map[string]any{"name": "one"}),
-			"the original single-operation shape must remain valid for backward compatibility")
+func (s *BatchSuite) TestOutputMarshalsAgainstItsInferredSchema() {
+	// The tools return Output directly and let the MCP SDK infer the schema, so
+	// what is inferred has to accept what is actually sent.
+	schema, err := jsonschema.For[batch.Output[conflicting]](nil)
+	s.Require().NoError(err, "the envelope's schema must be inferable, or no tool can register it")
+
+	resolved, err := schema.Resolve(nil)
+	s.Require().NoError(err, "the inferred schema must resolve")
+
+	encoded, err := json.Marshal(batch.Output[conflicting]{
+		Results: []batch.Result[conflicting]{
+			{Index: 0, Result: &conflicting{Name: "one", Applied: true}},
+			{Index: 1, Error: "second failed"},
+		},
+		Succeeded: 1,
+		Failed:    1,
+		Applied:   1,
+	})
+	s.Require().NoError(err, "marshalling the envelope must succeed")
+
+	var decoded any
+	s.Require().NoError(json.Unmarshal(encoded, &decoded), "the encoded envelope must be valid JSON")
+
+	s.Run("the envelope validates", func() {
+		s.Require().NoError(resolved.Validate(decoded),
+			"a tool's own output schema must accept what that tool sends, or every call fails at the protocol boundary")
 	})
 
-	s.Run("batch output", func() {
-		s.Require().NoError(schema.Validate(map[string]any{
-			"results":   []any{map[string]any{"index": 0, "result": map[string]any{"name": "one"}}},
-			"succeeded": 1,
-			"failed":    0,
-			"applied":   0,
-			"atomic":    false,
-		}), "the batch envelope must validate without also requiring single-operation fields")
+	s.Run("a result field named like the envelope's survives", func() {
+		s.Require().Contains(string(encoded), `"applied":true`,
+			"the item's own applied flag must reach the caller; nesting it under result is what keeps it from colliding with the envelope's count")
 	})
 }

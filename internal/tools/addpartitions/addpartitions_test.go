@@ -1,6 +1,7 @@
 package addpartitions_test
 
 import (
+	"errors"
 	"testing"
 
 	"github.com/stretchr/testify/suite"
@@ -27,15 +28,42 @@ func (s *AddPartitionsSuite) TearDownSuite() {
 	s.env.Stop()
 }
 
-func (s *AddPartitionsSuite) TestDryRunDoesNotChangeTheTopic() {
-	topic := s.env.CreateTopicWithPartitions(s.T(), "add-dry-run", 2)
+// add changes one topic and returns that item's result.
+//
+// Every call is a batch, so a single topic is an items array of length one, and
+// a failure for it arrives as the item's error rather than as an error for the
+// call. Structural problems, such as an empty items array, still fail the call.
+func (s *AddPartitionsSuite) add(
+	readOnly bool,
+	confirm bool,
+	item addpartitions.Item,
+) (addpartitions.Output, error) {
+	s.T().Helper()
 
 	out, err := addpartitions.Run(
 		s.T().Context(),
-		s.env.ClusterClient(s.T(), false),
+		s.env.ClusterClient(s.T(), readOnly),
 		s.env.Reader(),
-		addpartitions.Input{Topic: topic, Partitions: 6},
+		addpartitions.Input{Items: []addpartitions.Item{item}, Confirm: confirm},
 	)
+	if err != nil {
+		return addpartitions.Output{}, err
+	}
+
+	s.Require().Len(out.Results, 1,
+		"one item in must produce exactly one result out, or results cannot be matched to inputs by position")
+
+	if out.Results[0].Error != "" {
+		return addpartitions.Output{}, errors.New(out.Results[0].Error)
+	}
+
+	return *out.Results[0].Result, nil
+}
+
+func (s *AddPartitionsSuite) TestDryRunDoesNotChangeTheTopic() {
+	topic := s.env.CreateTopicWithPartitions(s.T(), "add-dry-run", 2)
+
+	out, err := s.add(false, false, addpartitions.Item{Topic: topic, Partitions: 6})
 
 	s.Require().NoError(err, "a dry run against a valid request must succeed")
 
@@ -62,12 +90,7 @@ func (s *AddPartitionsSuite) TestDryRunDoesNotChangeTheTopic() {
 func (s *AddPartitionsSuite) TestConfirmAddsPartitions() {
 	topic := s.env.CreateTopicWithPartitions(s.T(), "add-confirm", 1)
 
-	out, err := addpartitions.Run(
-		s.T().Context(),
-		s.env.ClusterClient(s.T(), false),
-		s.env.Reader(),
-		addpartitions.Input{Topic: topic, Partitions: 3, Confirm: true},
-	)
+	out, err := s.add(false, true, addpartitions.Item{Topic: topic, Partitions: 3})
 
 	s.Require().NoError(err, "a confirmed request must succeed")
 
@@ -87,12 +110,7 @@ func (s *AddPartitionsSuite) TestConfirmAddsPartitions() {
 func (s *AddPartitionsSuite) TestRefusesToReducePartitions() {
 	topic := s.env.CreateTopicWithPartitions(s.T(), "add-shrink", 3)
 
-	_, err := addpartitions.Run(
-		s.T().Context(),
-		s.env.ClusterClient(s.T(), false),
-		s.env.Reader(),
-		addpartitions.Input{Topic: topic, Partitions: 1, Confirm: true},
-	)
+	_, err := s.add(false, true, addpartitions.Item{Topic: topic, Partitions: 1})
 
 	s.Require().Error(err,
 		"Kafka cannot remove partitions, so asking for fewer must fail with a clear reason rather than an obscure broker rejection")
@@ -105,12 +123,7 @@ func (s *AddPartitionsSuite) TestRefusesToReducePartitions() {
 func (s *AddPartitionsSuite) TestRefusesToReduceEvenInADryRun() {
 	topic := s.env.CreateTopicWithPartitions(s.T(), "add-shrink-dry", 3)
 
-	_, err := addpartitions.Run(
-		s.T().Context(),
-		s.env.ClusterClient(s.T(), false),
-		s.env.Reader(),
-		addpartitions.Input{Topic: topic, Partitions: 2},
-	)
+	_, err := s.add(false, false, addpartitions.Item{Topic: topic, Partitions: 2})
 
 	s.Require().Error(err,
 		"a preview must not suggest an impossible change is worth confirming")
@@ -119,12 +132,7 @@ func (s *AddPartitionsSuite) TestRefusesToReduceEvenInADryRun() {
 func (s *AddPartitionsSuite) TestEqualCountIsANoOp() {
 	topic := s.env.CreateTopicWithPartitions(s.T(), "add-same", 2)
 
-	out, err := addpartitions.Run(
-		s.T().Context(),
-		s.env.ClusterClient(s.T(), false),
-		s.env.Reader(),
-		addpartitions.Input{Topic: topic, Partitions: 2, Confirm: true},
-	)
+	out, err := s.add(false, true, addpartitions.Item{Topic: topic, Partitions: 2})
 
 	s.Require().NoError(err,
 		"asking for the count a topic already has is not an error, which is what makes the target-count form safe to repeat")
@@ -137,12 +145,7 @@ func (s *AddPartitionsSuite) TestEqualCountIsANoOp() {
 func (s *AddPartitionsSuite) TestReadOnlyBlocksTheChange() {
 	topic := s.env.CreateTopicWithPartitions(s.T(), "add-read-only", 1)
 
-	_, err := addpartitions.Run(
-		s.T().Context(),
-		s.env.ClusterClient(s.T(), true),
-		s.env.Reader(),
-		addpartitions.Input{Topic: topic, Partitions: 4, Confirm: true},
-	)
+	_, err := s.add(true, true, addpartitions.Item{Topic: topic, Partitions: 4})
 
 	s.Require().Error(err,
 		"a read-only server must refuse to change the cluster, which is the whole purpose of the setting")
@@ -155,12 +158,7 @@ func (s *AddPartitionsSuite) TestReadOnlyBlocksTheChange() {
 func (s *AddPartitionsSuite) TestReadOnlyStillAllowsADryRun() {
 	topic := s.env.CreateTopicWithPartitions(s.T(), "add-read-only-dry", 1)
 
-	out, err := addpartitions.Run(
-		s.T().Context(),
-		s.env.ClusterClient(s.T(), true),
-		s.env.Reader(),
-		addpartitions.Input{Topic: topic, Partitions: 4},
-	)
+	out, err := s.add(true, false, addpartitions.Item{Topic: topic, Partitions: 4})
 
 	s.Require().NoError(err,
 		"a preview changes nothing, so a read-only server can still answer what a change would do")
@@ -178,12 +176,7 @@ func (s *AddPartitionsSuite) TestKeyedTopicRequiresAcknowledgement() {
 		testenv.Message{Key: "order-2", Value: `{"id":2}`},
 	)
 
-	_, err := addpartitions.Run(
-		s.T().Context(),
-		s.env.ClusterClient(s.T(), false),
-		s.env.Reader(),
-		addpartitions.Input{Topic: topic, Partitions: 3, Confirm: true},
-	)
+	_, err := s.add(false, true, addpartitions.Item{Topic: topic, Partitions: 3})
 
 	s.Require().Error(err,
 		"adding partitions to a keyed topic breaks ordering for existing keys, so it must not happen without the caller saying they understand")
@@ -198,17 +191,11 @@ func (s *AddPartitionsSuite) TestKeyedTopicProceedsWithAcknowledgement() {
 
 	s.env.Produce(s.T(), topic, testenv.Message{Key: "order-1", Value: `{"id":1}`})
 
-	out, err := addpartitions.Run(
-		s.T().Context(),
-		s.env.ClusterClient(s.T(), false),
-		s.env.Reader(),
-		addpartitions.Input{
-			Topic:                  topic,
-			Partitions:             3,
-			Confirm:                true,
-			AcknowledgeKeyOrdering: true,
-		},
-	)
+	out, err := s.add(false, true, addpartitions.Item{
+		Topic:                  topic,
+		Partitions:             3,
+		AcknowledgeKeyOrdering: true,
+	})
 
 	s.Require().NoError(err,
 		"an explicit acknowledgement must allow the change: the tool warns, it does not forbid")
@@ -225,12 +212,7 @@ func (s *AddPartitionsSuite) TestUnkeyedTopicNeedsNoAcknowledgement() {
 		testenv.Message{Value: "nor here"},
 	)
 
-	out, err := addpartitions.Run(
-		s.T().Context(),
-		s.env.ClusterClient(s.T(), false),
-		s.env.Reader(),
-		addpartitions.Input{Topic: topic, Partitions: 2, Confirm: true},
-	)
+	out, err := s.add(false, true, addpartitions.Item{Topic: topic, Partitions: 2})
 
 	s.Require().NoError(err,
 		"without keys there is no ordering guarantee to break, so no acknowledgement is warranted")
@@ -244,12 +226,7 @@ func (s *AddPartitionsSuite) TestWarnsAboutKeyedMessagesInADryRun() {
 
 	s.env.Produce(s.T(), topic, testenv.Message{Key: "order-1", Value: `{"id":1}`})
 
-	out, err := addpartitions.Run(
-		s.T().Context(),
-		s.env.ClusterClient(s.T(), false),
-		s.env.Reader(),
-		addpartitions.Input{Topic: topic, Partitions: 3},
-	)
+	out, err := s.add(false, false, addpartitions.Item{Topic: topic, Partitions: 3})
 
 	s.Require().NoError(err, "a preview of a keyed topic must succeed rather than error")
 	s.Require().True(out.KeyedMessages,
@@ -259,12 +236,7 @@ func (s *AddPartitionsSuite) TestWarnsAboutKeyedMessagesInADryRun() {
 }
 
 func (s *AddPartitionsSuite) TestErrorsOnUnknownTopic() {
-	_, err := addpartitions.Run(
-		s.T().Context(),
-		s.env.ClusterClient(s.T(), false),
-		s.env.Reader(),
-		addpartitions.Input{Topic: s.env.UniqueName("missing"), Partitions: 3},
-	)
+	_, err := s.add(false, false, addpartitions.Item{Topic: s.env.UniqueName("missing"), Partitions: 3})
 
 	s.Require().Error(err,
 		"a topic that does not exist must fail rather than appear to be scalable")
@@ -273,12 +245,7 @@ func (s *AddPartitionsSuite) TestErrorsOnUnknownTopic() {
 func (s *AddPartitionsSuite) TestErrorsOnZeroPartitions() {
 	topic := s.env.CreateTopicWithPartitions(s.T(), "add-zero", 1)
 
-	_, err := addpartitions.Run(
-		s.T().Context(),
-		s.env.ClusterClient(s.T(), false),
-		s.env.Reader(),
-		addpartitions.Input{Topic: topic, Partitions: 0},
-	)
+	_, err := s.add(false, false, addpartitions.Item{Topic: topic, Partitions: 0})
 
 	s.Require().Error(err,
 		"a missing or zero target must be refused, or an omitted parameter would read as a request to remove every partition")
@@ -288,13 +255,15 @@ func (s *AddPartitionsSuite) TestBatchAddsPartitionsToSeveralTopics() {
 	first := s.env.CreateTopicWithPartitions(s.T(), "add-batch-first", 1)
 	second := s.env.CreateTopicWithPartitions(s.T(), "add-batch-second", 2)
 
-	out, err := addpartitions.RunBatch(
+	out, err := addpartitions.Run(
 		s.T().Context(), s.env.ClusterClient(s.T(), false), s.env.Reader(),
-		[]addpartitions.Item{
-			{Topic: first, Partitions: 3},
-			{Topic: second, Partitions: 4},
+		addpartitions.Input{
+			Items: []addpartitions.Item{
+				{Topic: first, Partitions: 3},
+				{Topic: second, Partitions: 4},
+			},
+			Confirm: true,
 		},
-		true,
 	)
 
 	s.Require().NoError(err, "a valid partition batch must succeed")

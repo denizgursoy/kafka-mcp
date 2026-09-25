@@ -18,22 +18,18 @@ import (
 
 // Item is one topic partition target in a batch request.
 type Item struct {
-	Topic                  string `json:"topic" jsonschema:"Topic to change."`
-	Partitions             int    `json:"partitions" jsonschema:"Final total partition count."`
-	AcknowledgeKeyOrdering bool   `json:"acknowledge_key_ordering,omitempty" jsonschema:"Required when sampled messages carry keys."`
-	SampleSize             int    `json:"sample_size,omitempty" jsonschema:"Optional recent messages to inspect for keys. Defaults to 20."`
+	Topic string `json:"topic" jsonschema:"Topic to change. Matched exactly and case-sensitively."`
+	// Partitions is the final count rather than a number to add, so calling
+	// twice with the same value does not add twice.
+	Partitions             int  `json:"partitions" jsonschema:"The total number of partitions the topic should end up with. This is the final count, not the number to add, so repeating the same call is safe. Must be greater than the current count: Kafka cannot remove partitions."`
+	AcknowledgeKeyOrdering bool `json:"acknowledge_key_ordering,omitempty" jsonschema:"Optional. Required when the topic holds keyed messages. Adding partitions changes which partition a key maps to, so existing keys lose their ordering guarantee. Set this to true to confirm that is acceptable."`
+	SampleSize             int  `json:"sample_size,omitempty" jsonschema:"Optional number of recent messages to inspect when checking whether the topic is keyed. Defaults to 20."`
 }
 
 // Input is the argument set accepted by the add_partitions tool.
 type Input struct {
-	Topic string `json:"topic,omitempty" jsonschema:"Topic to change for a single operation. Omit when items is used."`
-	// Partitions is the final count rather than a number to add, so calling
-	// twice with the same value does not add twice.
-	Partitions             int    `json:"partitions" jsonschema:"The total number of partitions the topic should end up with. This is the final count, not the number to add, so repeating the same call is safe. Must be greater than the current count: Kafka cannot remove partitions."`
-	Confirm                bool   `json:"confirm,omitempty" jsonschema:"Optional. When false or omitted, nothing is changed and the response describes what would happen. Must be true to actually add partitions."`
-	AcknowledgeKeyOrdering bool   `json:"acknowledge_key_ordering,omitempty" jsonschema:"Optional. Required when the topic holds keyed messages. Adding partitions changes which partition a key maps to, so existing keys lose their ordering guarantee. Set this to true to confirm that is acceptable."`
-	SampleSize             int    `json:"sample_size,omitempty" jsonschema:"Optional number of recent messages to inspect when checking whether the topic is keyed. Defaults to 20."`
-	Items                  []Item `json:"items,omitempty" jsonschema:"Optional batch of 1 to 100 topic targets. Do not combine with single-operation fields. confirm applies to the whole batch; successful changes cannot be rolled back."`
+	Items   []Item `json:"items" jsonschema:"The topics to change, 1 to 100 of them. Changing one topic is an array of length one. Duplicate topic names are refused before anything changes."`
+	Confirm bool   `json:"confirm,omitempty" jsonschema:"Optional. When false or omitted, nothing is changed and the response describes what would happen for every item. Must be true to actually add partitions. One confirm covers the whole batch."`
 }
 
 // Output is the result returned by the add_partitions tool.
@@ -53,20 +49,20 @@ type Output struct {
 
 type BatchOutput = batch.Output[Output]
 
-type Response struct {
-	*Output
-	*BatchOutput
-}
-
 const defaultSampleSize = 20
 
 const description = `
-Increase one topic's partition count, or up to 100 topics through items, and report the current count, affected
-consumer groups, sampled key usage and warnings. Kafka cannot remove
-partitions, and changing the count can break ordering for keyed messages.
+Increase the partition count of 1 to 100 topics in one call through items, and
+report each topic's current count, affected consumer groups, sampled key usage
+and warnings. Changing one topic is an items array of length one.
 
-No change is made unless confirm is true. Keyed samples also require
-acknowledge_key_ordering. Requires Kafka ALTER permission.
+Kafka cannot remove partitions, and changing the count can break ordering for
+keyed messages. No change is made unless confirm is true; one confirm covers the
+whole batch, and changes are not atomic because Kafka cannot roll a successful
+item back. Results follow items order, each carrying index with result or error.
+
+Keyed samples also require acknowledge_key_ordering on the item. Requires Kafka
+ALTER permission.
 `
 
 // Register adds the add_partitions tool to the MCP server.
@@ -74,41 +70,37 @@ func Register(server *mcp.Server, kafka *kafkaclient.Client, reader *records.Rea
 	mcp.AddTool(
 		server,
 		&mcp.Tool{
-			Name:         "add_partitions",
-			Description:  description,
-			OutputSchema: batch.OutputSchema[Output](),
+			Name:        "add_partitions",
+			Description: description,
 		},
 		func(
 			ctx context.Context,
 			req *mcp.CallToolRequest,
 			input Input,
-		) (*mcp.CallToolResult, Response, error) {
-
-			if input.Items != nil {
-				if input.Topic != "" || input.Partitions != 0 || input.AcknowledgeKeyOrdering || input.SampleSize != 0 {
-					return nil, Response{}, fmt.Errorf("add partitions: items cannot be combined with single-operation fields")
-				}
-				out, err := RunBatch(ctx, kafka, reader, input.Items, input.Confirm)
-				if err != nil {
-					return nil, Response{}, fmt.Errorf("add partitions batch: %w", err)
-				}
-				return nil, Response{BatchOutput: &out}, nil
-			}
+		) (*mcp.CallToolResult, BatchOutput, error) {
 
 			out, err := Run(ctx, kafka, reader, input)
 			if err != nil {
-				return nil, Response{}, fmt.Errorf("add partitions: %w", err)
+				return nil, BatchOutput{}, fmt.Errorf("add partitions: %w", err)
 			}
 
-			return nil, Response{Output: &out}, nil
+			return nil, out, nil
 		},
 	)
 }
 
-// RunBatch previews every topic before applying valid changes. Changes are
+// Run previews every topic before applying valid changes. Changes are
 // non-atomic because Kafka cannot remove partitions to roll a successful item
 // back.
-func RunBatch(ctx context.Context, kafka *kafkaclient.Client, reader *records.Reader, items []Item, confirm bool) (BatchOutput, error) {
+func Run(
+	ctx context.Context,
+	kafka *kafkaclient.Client,
+	reader *records.Reader,
+	input Input,
+) (BatchOutput, error) {
+
+	items, confirm := input.Items, input.Confirm
+
 	if err := batch.Validate(len(items), batch.MaxItems); err != nil {
 		return BatchOutput{}, err
 	}
@@ -121,7 +113,7 @@ func RunBatch(ctx context.Context, kafka *kafkaclient.Client, reader *records.Re
 	}
 
 	out, err := batch.Run(ctx, items, batch.MaxItems, func(ctx context.Context, item Item) (Output, error) {
-		return Run(ctx, kafka, reader, addInput(item, false))
+		return add(ctx, kafka, reader, item, false)
 	})
 	if err != nil || !confirm {
 		return out, err
@@ -140,7 +132,7 @@ func RunBatch(ctx context.Context, kafka *kafkaclient.Client, reader *records.Re
 			out.Failed++
 			continue
 		}
-		value, applyErr := Run(ctx, kafka, reader, addInput(item, true))
+		value, applyErr := add(ctx, kafka, reader, item, true)
 		if applyErr != nil {
 			out.Results[index].Result = nil
 			out.Results[index].Error = applyErr.Error()
@@ -156,17 +148,13 @@ func RunBatch(ctx context.Context, kafka *kafkaclient.Client, reader *records.Re
 	return out, nil
 }
 
-func addInput(item Item, confirm bool) Input {
-	return Input{Topic: item.Topic, Partitions: item.Partitions, Confirm: confirm,
-		AcknowledgeKeyOrdering: item.AcknowledgeKeyOrdering, SampleSize: item.SampleSize}
-}
-
-// Run previews or applies a partition count change.
-func Run(
+// add previews or applies one partition count change.
+func add(
 	ctx context.Context,
 	kafka *kafkaclient.Client,
 	reader *records.Reader,
-	input Input,
+	input Item,
+	confirm bool,
 ) (Output, error) {
 
 	if input.Topic == "" {
@@ -242,7 +230,7 @@ func Run(
 
 	out.WouldApply = true
 
-	if !input.Confirm {
+	if !confirm {
 		out.Note = "nothing was changed. Call again with confirm true to apply."
 
 		return out, nil
@@ -333,7 +321,7 @@ func sampleKeys(
 	ctx context.Context,
 	admin *kadm.Client,
 	reader *records.Reader,
-	input Input,
+	input Item,
 ) (bool, int, error) {
 
 	size := input.SampleSize

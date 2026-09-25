@@ -1,6 +1,7 @@
 package describetopic_test
 
 import (
+	"errors"
 	"testing"
 	"time"
 
@@ -31,6 +32,34 @@ func (s *DescribeTopicSuite) TearDownSuite() {
 	s.env.Stop()
 }
 
+// describe describes one topic and returns that item's result.
+//
+// Every call is a batch, so a single topic is an items array of length one, and
+// a failure for that topic arrives as the item's error rather than as an error
+// for the call.
+func (s *DescribeTopicSuite) describe(topic string) (describetopic.Output, error) {
+	s.T().Helper()
+
+	out, err := describetopic.Run(
+		s.T().Context(),
+		s.env.Admin(),
+		s.env.Reader(),
+		describetopic.Input{Items: []describetopic.Item{{Topic: topic}}},
+	)
+	if err != nil {
+		return describetopic.Output{}, err
+	}
+
+	s.Require().Len(out.Results, 1,
+		"one item in must produce exactly one result out, or results cannot be matched to inputs by position")
+
+	if out.Results[0].Error != "" {
+		return describetopic.Output{}, errors.New(out.Results[0].Error)
+	}
+
+	return *out.Results[0].Result, nil
+}
+
 func (s *DescribeTopicSuite) TestReportsOffsetsAndCounts() {
 	topic := s.env.CreateTopic(s.T(), "describe-counts")
 
@@ -40,12 +69,7 @@ func (s *DescribeTopicSuite) TestReportsOffsetsAndCounts() {
 		testenv.Message{Value: "third"},
 	)
 
-	out, err := describetopic.Run(
-		s.T().Context(),
-		s.env.Admin(),
-		s.env.Reader(),
-		describetopic.Input{Topic: topic},
-	)
+	out, err := s.describe(topic)
 
 	s.Require().NoError(err, "describing an existing topic must succeed")
 	s.Require().Equal(topic, out.Topic,
@@ -74,12 +98,7 @@ func (s *DescribeTopicSuite) TestReportsEveryPartitionSorted() {
 		testenv.Message{Value: "p2-b", Partition: 2},
 	)
 
-	out, err := describetopic.Run(
-		s.T().Context(),
-		s.env.Admin(),
-		s.env.Reader(),
-		describetopic.Input{Topic: topic},
-	)
+	out, err := s.describe(topic)
 
 	s.Require().NoError(err, "describing a multi-partition topic must succeed")
 	s.Require().Len(out.Partitions, 3,
@@ -114,12 +133,7 @@ func (s *DescribeTopicSuite) TestReportsTimestampRange() {
 		testenv.Message{Value: "new", Timestamp: newest},
 	)
 
-	out, err := describetopic.Run(
-		s.T().Context(),
-		s.env.Admin(),
-		s.env.Reader(),
-		describetopic.Input{Topic: topic},
-	)
+	out, err := s.describe(topic)
 
 	s.Require().NoError(err, "describing a topic with timestamps must succeed")
 	s.Require().NotNil(out.OldestTimestamp,
@@ -135,12 +149,7 @@ func (s *DescribeTopicSuite) TestReportsTimestampRange() {
 func (s *DescribeTopicSuite) TestEmptyTopicReportsZeroCount() {
 	topic := s.env.CreateTopic(s.T(), "describe-empty")
 
-	out, err := describetopic.Run(
-		s.T().Context(),
-		s.env.Admin(),
-		s.env.Reader(),
-		describetopic.Input{Topic: topic},
-	)
+	out, err := s.describe(topic)
 
 	s.Require().NoError(err, "an empty topic is a normal case, not an error")
 	s.Require().Zero(out.MessageCount,
@@ -157,12 +166,7 @@ func (s *DescribeTopicSuite) TestEmptyTopicReportsZeroCount() {
 }
 
 func (s *DescribeTopicSuite) TestErrorsOnUnknownTopic() {
-	_, err := describetopic.Run(
-		s.T().Context(),
-		s.env.Admin(),
-		s.env.Reader(),
-		describetopic.Input{Topic: s.env.UniqueName("does-not-exist")},
-	)
+	_, err := s.describe(s.env.UniqueName("does-not-exist"))
 
 	s.Require().Error(err,
 		"describing a topic that does not exist must fail loudly, not report an empty topic")
@@ -174,15 +178,17 @@ func (s *DescribeTopicSuite) TestErrorsWhenBrokerUnreachable() {
 
 	s.T().Cleanup(client.Close)
 
-	_, err = describetopic.Run(
+	out, err := describetopic.Run(
 		s.T().Context(),
 		kadm.NewClient(client),
 		records.NewReader("127.0.0.1:1"),
-		describetopic.Input{Topic: "anything"},
+		describetopic.Input{Items: []describetopic.Item{{Topic: "anything"}}},
 	)
 
-	s.Require().Error(err,
-		"an unreachable broker must surface as an error, not as an empty description")
+	s.Require().NoError(err,
+		"a structurally valid batch must not fail as a call: the broker being down is the item's problem")
+	s.Require().NotEmpty(out.Results[0].Error,
+		"an unreachable broker must surface as that item's error, not as an empty description")
 }
 
 func (s *DescribeTopicSuite) configs(out describetopic.Output) map[string]describetopic.Config {
@@ -200,12 +206,7 @@ func (s *DescribeTopicSuite) configs(out describetopic.Output) map[string]descri
 func (s *DescribeTopicSuite) TestReportsInheritedRetention() {
 	topic := s.env.CreateTopic(s.T(), "describe-config-default")
 
-	out, err := describetopic.Run(
-		s.T().Context(),
-		s.env.Admin(),
-		s.env.Reader(),
-		describetopic.Input{Topic: topic},
-	)
+	out, err := s.describe(topic)
 
 	s.Require().NoError(err, "describing a topic must also report its configuration")
 
@@ -258,12 +259,7 @@ func (s *DescribeTopicSuite) TestReportsExplicitlySetRetention() {
 		"cleanup.policy": "compact",
 	})
 
-	out, err := describetopic.Run(
-		s.T().Context(),
-		s.env.Admin(),
-		s.env.Reader(),
-		describetopic.Input{Topic: topic},
-	)
+	out, err := s.describe(topic)
 
 	s.Require().NoError(err, "describing a topic with its own configuration must succeed")
 
@@ -293,9 +289,11 @@ func (s *DescribeTopicSuite) TestBatchDescribesSeveralTopicsWithPartialErrors() 
 	first := s.env.CreateTopicWithPartitions(s.T(), "describe-batch-first", 1)
 	second := s.env.CreateTopicWithPartitions(s.T(), "describe-batch-second", 2)
 
-	out, err := describetopic.RunBatch(
+	out, err := describetopic.Run(
 		s.T().Context(), s.env.Admin(), s.env.Reader(),
-		[]describetopic.Item{{Topic: first}, {Topic: s.env.UniqueName("missing")}, {Topic: second}},
+		describetopic.Input{Items: []describetopic.Item{
+			{Topic: first}, {Topic: s.env.UniqueName("missing")}, {Topic: second},
+		}},
 	)
 
 	s.Require().NoError(err, "one missing topic must not hide descriptions of topics that exist")

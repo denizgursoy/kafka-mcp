@@ -18,21 +18,17 @@ import (
 	"github.com/denizgursoy/kafka-mcp/internal/domain/records"
 )
 
-// Item is one topic sample in a batch request.
+// Item is one topic to sample.
 type Item struct {
 	Topic         string  `json:"topic" jsonschema:"Topic to sample. Matched exactly and case-sensitively."`
-	SampleSize    int     `json:"sample_size,omitempty" jsonschema:"Optional number of messages to read. Defaults to 20."`
+	SampleSize    int     `json:"sample_size,omitempty" jsonschema:"Optional number of messages to read in total, spread across partitions. Defaults to 20."`
 	Partitions    []int32 `json:"partitions,omitempty" jsonschema:"Optional partitions to sample. Defaults to every partition."`
-	MaxValueBytes int     `json:"max_value_bytes,omitempty" jsonschema:"Optional maximum value bytes per message. Defaults to 512."`
+	MaxValueBytes int     `json:"max_value_bytes,omitempty" jsonschema:"Optional maximum value bytes to return per message. Defaults to 512."`
 }
 
 // Input is the argument set accepted by the sample_messages tool.
 type Input struct {
-	Topic         string  `json:"topic,omitempty" jsonschema:"Topic to sample for a single operation. Omit when items is used."`
-	SampleSize    int     `json:"sample_size,omitempty" jsonschema:"Optional number of messages to read in total, spread across partitions. Defaults to 20."`
-	Partitions    []int32 `json:"partitions,omitempty" jsonschema:"Optional partitions to sample. Defaults to every partition."`
-	MaxValueBytes int     `json:"max_value_bytes,omitempty" jsonschema:"Optional maximum value bytes to return per message. Defaults to 512."`
-	Items         []Item  `json:"items,omitempty" jsonschema:"Optional batch of 1 to 20 topic samples. Do not combine with single-operation fields. Results preserve input order."`
+	Items []Item `json:"items" jsonschema:"The topics to sample, 1 to 20 of them. Sampling one topic is an array of length one. Results follow this order and a topic that cannot be sampled is reported against its own item."`
 }
 
 // Formats counts how many sampled values were of each kind.
@@ -79,11 +75,6 @@ type Output struct {
 
 type BatchOutput = batch.Output[Output]
 
-type Response struct {
-	*Output
-	*BatchOutput
-}
-
 const (
 	defaultSampleSize    = 20
 	defaultMaxValueBytes = 512
@@ -92,10 +83,13 @@ const (
 )
 
 const description = `
-Sample one topic's newest messages, or up to 20 topics through items, and summarize value formats, JSON field paths,
-key usage and sampled offset ranges. Use this to design a search_messages
-predicate. The sample describes recent data only, and keys must not be used to
-guess partitions.
+Sample the newest messages of 1 to 20 topics in one call through items, and
+summarize value formats, JSON field paths, key usage and sampled offset ranges.
+Use this to design a search_messages predicate.
+
+Results follow items order, each carrying index with result or error. Sampling
+one topic is an items array of length one. The sample describes recent data
+only, and keys must not be used to guess partitions.
 `
 
 // Register adds the sample_messages tool to the MCP server.
@@ -103,53 +97,44 @@ func Register(server *mcp.Server, admin *kadm.Client, reader *records.Reader) {
 	mcp.AddTool(
 		server,
 		&mcp.Tool{
-			Name:         "sample_messages",
-			Description:  description,
-			OutputSchema: batch.OutputSchema[Output](),
+			Name:        "sample_messages",
+			Description: description,
 		},
 		func(
 			ctx context.Context,
 			req *mcp.CallToolRequest,
 			input Input,
-		) (*mcp.CallToolResult, Response, error) {
-
-			if input.Items != nil {
-				if input.Topic != "" || input.SampleSize != 0 || len(input.Partitions) != 0 || input.MaxValueBytes != 0 {
-					return nil, Response{}, fmt.Errorf("sample messages: items cannot be combined with single-operation fields")
-				}
-				out, err := RunBatch(ctx, admin, reader, input.Items)
-				if err != nil {
-					return nil, Response{}, fmt.Errorf("sample messages batch: %w", err)
-				}
-				return nil, Response{BatchOutput: &out}, nil
-			}
+		) (*mcp.CallToolResult, BatchOutput, error) {
 
 			out, err := Run(ctx, admin, reader, input)
 			if err != nil {
-				return nil, Response{}, fmt.Errorf("sample messages: %w", err)
+				return nil, BatchOutput{}, fmt.Errorf("sample messages: %w", err)
 			}
 
-			return nil, Response{Output: &out}, nil
+			return nil, out, nil
 		},
 	)
 }
 
-// RunBatch samples independent topics with bounded concurrency.
-func RunBatch(ctx context.Context, admin *kadm.Client, reader *records.Reader, items []Item) (BatchOutput, error) {
-	return batch.Run(ctx, items, batch.MaxHeavyItems, func(ctx context.Context, item Item) (Output, error) {
-		return Run(ctx, admin, reader, Input{
-			Topic: item.Topic, SampleSize: item.SampleSize, Partitions: item.Partitions,
-			MaxValueBytes: item.MaxValueBytes,
-		})
-	})
-}
-
-// Run samples the newest messages of a topic and describes their shape.
+// Run samples every requested topic with bounded concurrency.
 func Run(
 	ctx context.Context,
 	admin *kadm.Client,
 	reader *records.Reader,
 	input Input,
+) (BatchOutput, error) {
+
+	return batch.Run(ctx, input.Items, batch.MaxHeavyItems, func(ctx context.Context, item Item) (Output, error) {
+		return sample(ctx, admin, reader, item)
+	})
+}
+
+// sample reads the newest messages of one topic and describes their shape.
+func sample(
+	ctx context.Context,
+	admin *kadm.Client,
+	reader *records.Reader,
+	input Item,
 ) (Output, error) {
 
 	if input.Topic == "" {
@@ -221,7 +206,7 @@ func Run(
 func newestRanges(
 	ctx context.Context,
 	admin *kadm.Client,
-	input Input,
+	input Item,
 	size int,
 ) ([]records.Range, error) {
 

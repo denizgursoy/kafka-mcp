@@ -17,14 +17,14 @@ import (
 	"github.com/denizgursoy/kafka-mcp/internal/domain/records"
 )
 
-// Item is one source address and destination in a batch copy request.
+// Item is one source address and destination for a copy.
 type Item struct {
-	SourceTopic        string `json:"source_topic" jsonschema:"Topic holding the source message."`
-	SourcePartition    int32  `json:"source_partition" jsonschema:"Partition holding the source message."`
-	SourceOffset       int64  `json:"source_offset" jsonschema:"Exact source offset."`
-	DestinationTopic   string `json:"destination_topic" jsonschema:"Existing topic to receive the copy."`
-	DestinationCluster string `json:"destination_cluster,omitempty" jsonschema:"Optional destination cluster; defaults to this endpoint's cluster."`
-	MaxValueBytes      int    `json:"max_value_bytes,omitempty" jsonschema:"Optional preview value limit. The complete value is always copied."`
+	SourceTopic        string `json:"source_topic" jsonschema:"Topic holding the message to copy. Matched exactly and case-sensitively."`
+	SourcePartition    int32  `json:"source_partition" jsonschema:"Partition holding the message to copy."`
+	SourceOffset       int64  `json:"source_offset" jsonschema:"Exact offset of the message to copy."`
+	DestinationTopic   string `json:"destination_topic" jsonschema:"Topic to write the copy to. It must already exist. It must differ from the source topic when both are on the same cluster."`
+	DestinationCluster string `json:"destination_cluster,omitempty" jsonschema:"Optional cluster to write the copy to. Defaults to the cluster this endpoint serves. Use list_clusters to see which names are valid. The destination cluster must not be read-only; the source may be."`
+	MaxValueBytes      int    `json:"max_value_bytes,omitempty" jsonschema:"Optional maximum number of value bytes to show in the response. Defaults to 4096. This affects the preview only: the copy always carries the whole value."`
 }
 
 // Provenance headers added to every copy, so a message that turns up in
@@ -44,18 +44,12 @@ const (
 
 // Input is the argument set accepted by the copy_message tool.
 //
-// The message is named by its address rather than its content, so this tool
-// can only duplicate something the cluster already holds. It has no way to
-// write a message that no producer sent.
+// A message is named by its address rather than its content, so this tool can
+// only duplicate something the cluster already holds. It has no way to write a
+// message that no producer sent; produce_message does that.
 type Input struct {
-	SourceTopic        string `json:"source_topic,omitempty" jsonschema:"Topic holding one source message. Omit when items is used."`
-	SourcePartition    int32  `json:"source_partition" jsonschema:"Partition holding the message to copy."`
-	SourceOffset       int64  `json:"source_offset" jsonschema:"Exact offset of the message to copy."`
-	DestinationTopic   string `json:"destination_topic" jsonschema:"Topic to write the copy to. It must already exist. It must differ from the source topic when both are on the same cluster."`
-	DestinationCluster string `json:"destination_cluster,omitempty" jsonschema:"Optional cluster to write the copy to. Defaults to the cluster this endpoint serves. Use list_clusters to see which names are valid. The destination cluster must not be read-only; the source may be."`
-	Confirm            bool   `json:"confirm,omitempty" jsonschema:"Optional. When false or omitted, nothing is written and the response shows the message that would be copied. Must be true to actually write it."`
-	MaxValueBytes      int    `json:"max_value_bytes,omitempty" jsonschema:"Optional maximum number of value bytes to show in the response. Defaults to 4096. This affects the preview only: the copy always carries the whole value."`
-	Items              []Item `json:"items,omitempty" jsonschema:"Optional batch of 1 to 20 copies. Do not combine with single-operation fields. confirm applies to the whole batch; successful writes cannot be rolled back."`
+	Items   []Item `json:"items" jsonschema:"The copies to make, 1 to 20 of them. Copying one message is an array of length one. Two items naming the same source and destination are refused before anything is written."`
+	Confirm bool   `json:"confirm,omitempty" jsonschema:"Optional. When false or omitted, nothing is written and the response shows the messages that would be copied. Must be true to actually write them. One confirm covers the whole batch."`
 }
 
 // Output is the result returned by the copy_message tool.
@@ -77,19 +71,19 @@ type Output struct {
 
 type BatchOutput = batch.Output[Output]
 
-type Response struct {
-	*Output
-	*BatchOutput
-}
-
 const description = `
-Copy one existing message, or up to 20 messages through items, identified by topic, partition and offset, to an
-existing topic on this or another configured cluster. Preserves key, value and
-headers and adds traceable provenance headers.
+Copy 1 to 20 existing messages in one call through items, each identified by
+topic, partition and offset, to an existing topic on this or another configured
+cluster. Preserves key, value and headers and adds traceable provenance headers.
+Copying one message is an items array of length one.
 
-No message is written unless confirm is true. The destination must be writable
-and requires Kafka write permission; a read-only cluster may still be the
-source.
+No message is written unless confirm is true; one confirm covers the whole
+batch, and writing is not atomic because Kafka cannot retract a record produced
+before a later item failed. Results follow items order, each carrying index with
+result or error.
+
+The destination must be writable and requires Kafka write permission; a
+read-only cluster may still be the source.
 `
 
 // Register adds the copy_message tool to the MCP server.
@@ -101,15 +95,14 @@ func Register(
 	mcp.AddTool(
 		server,
 		&mcp.Tool{
-			Name:         toolName,
-			Description:  description,
-			OutputSchema: batch.OutputSchema[Output](),
+			Name:        toolName,
+			Description: description,
 		},
 		func(
 			ctx context.Context,
 			req *mcp.CallToolRequest,
 			input Input,
-		) (*mcp.CallToolResult, Response, error) {
+		) (*mcp.CallToolResult, BatchOutput, error) {
 
 			client := ""
 
@@ -117,32 +110,27 @@ func Register(
 				client = info.Name
 			}
 
-			if input.Items != nil {
-				if input.SourceTopic != "" || input.SourcePartition != 0 || input.SourceOffset != 0 || input.DestinationTopic != "" || input.DestinationCluster != "" || input.MaxValueBytes != 0 {
-					return nil, Response{}, fmt.Errorf("copy message: items cannot be combined with single-operation fields")
-				}
-				out, err := runBatch(ctx, clusters, own, input.Items, input.Confirm, client)
-				if err != nil {
-					return nil, Response{}, fmt.Errorf("copy messages: %w", err)
-				}
-				return nil, Response{BatchOutput: &out}, nil
-			}
-
-			out, err := run(ctx, clusters, own, input, client)
+			out, err := runBatch(ctx, clusters, own, input.Items, input.Confirm, client)
 			if err != nil {
-				return nil, Response{}, fmt.Errorf("copy message: %w", err)
+				return nil, BatchOutput{}, fmt.Errorf("copy messages: %w", err)
 			}
 
-			return nil, Response{Output: &out}, nil
+			return nil, out, nil
 		},
 	)
 }
 
-// RunBatch previews every copy before writing valid items. Writes are
-// non-atomic because Kafka cannot retract a record that was produced before a
-// later item failed.
-func RunBatch(ctx context.Context, clusters *kafkaclient.Registry, own string, items []Item, confirm bool) (BatchOutput, error) {
-	return runBatch(ctx, clusters, own, items, confirm, "")
+// Run previews every copy before writing valid items. Writes are non-atomic
+// because Kafka cannot retract a record that was produced before a later item
+// failed.
+func Run(
+	ctx context.Context,
+	clusters *kafkaclient.Registry,
+	own string,
+	input Input,
+) (BatchOutput, error) {
+
+	return runBatch(ctx, clusters, own, input.Items, input.Confirm, "")
 }
 
 func runBatch(ctx context.Context, clusters *kafkaclient.Registry, own string, items []Item, confirm bool, client string) (BatchOutput, error) {
@@ -159,7 +147,7 @@ func runBatch(ctx context.Context, clusters *kafkaclient.Registry, own string, i
 	}
 
 	out, err := batch.Run(ctx, items, batch.MaxHeavyItems, func(ctx context.Context, item Item) (Output, error) {
-		return run(ctx, clusters, own, copyInput(item, false), client)
+		return run(ctx, clusters, own, item, false, client)
 	})
 	if err != nil || !confirm {
 		return out, err
@@ -171,7 +159,7 @@ func runBatch(ctx context.Context, clusters *kafkaclient.Registry, own string, i
 			out.Failed++
 			continue
 		}
-		value, applyErr := run(ctx, clusters, own, copyInput(item, true), client)
+		value, applyErr := run(ctx, clusters, own, item, true, client)
 		if applyErr != nil {
 			out.Results[index].Result = nil
 			out.Results[index].Error = applyErr.Error()
@@ -187,28 +175,12 @@ func runBatch(ctx context.Context, clusters *kafkaclient.Registry, own string, i
 	return out, nil
 }
 
-func copyInput(item Item, confirm bool) Input {
-	return Input{SourceTopic: item.SourceTopic, SourcePartition: item.SourcePartition,
-		SourceOffset: item.SourceOffset, DestinationTopic: item.DestinationTopic,
-		DestinationCluster: item.DestinationCluster, Confirm: confirm, MaxValueBytes: item.MaxValueBytes}
-}
-
-// Run previews or performs a copy.
-func Run(
-	ctx context.Context,
-	clusters *kafkaclient.Registry,
-	own string,
-	input Input,
-) (Output, error) {
-
-	return run(ctx, clusters, own, input, "")
-}
-
 func run(
 	ctx context.Context,
 	clusters *kafkaclient.Registry,
 	own string,
-	input Input,
+	input Item,
+	confirm bool,
 	client string,
 ) (Output, error) {
 
@@ -298,7 +270,7 @@ func run(
 			key))
 	}
 
-	if !input.Confirm {
+	if !confirm {
 		out.Note = "nothing was written. Call again with confirm true to copy the message."
 
 		return out, nil
@@ -323,7 +295,7 @@ func run(
 // plus a record of where this copy came from.
 func withProvenance(
 	record *kgo.Record,
-	input Input,
+	input Item,
 	sourceCluster string,
 	destination *kafkaclient.Client,
 	client string,
@@ -418,7 +390,7 @@ func readSource(
 	ctx context.Context,
 	kafka *kafkaclient.Client,
 	reader *records.Reader,
-	input Input,
+	input Item,
 ) (*kgo.Record, error) {
 
 	// Seeking past the end of a partition does not fail: the read waits and
@@ -479,7 +451,10 @@ func topicExists(ctx context.Context, kafka *kafkaclient.Client, topic string) e
 	}
 
 	detail, ok := details[topic]
-	if !ok {
+	if !ok || errors.Is(detail.Err, kerr.UnknownTopicOrPartition) {
+		// The broker reports an absent topic either by omitting it or by
+		// returning it with UNKNOWN_TOPIC_OR_PARTITION, and both mean the same
+		// thing to the caller.
 		return fmt.Errorf(
 			"destination topic %q does not exist: create it first, so a mistyped name cannot scatter messages into a topic nobody meant to make",
 			topic)

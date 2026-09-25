@@ -1,6 +1,7 @@
 package commitoffset_test
 
 import (
+	"errors"
 	"testing"
 
 	"github.com/stretchr/testify/suite"
@@ -63,14 +64,40 @@ func (s *CommitOffsetSuite) stuckGroup(prefix string, produce int, consume int) 
 	return topic, group
 }
 
+// commitOne moves one offset and returns that item's result.
+//
+// Every call is a batch, so a single move is an items array of length one, and a
+// failure for it arrives as the item's error rather than as an error for the
+// call. Structural problems, such as an empty items array, still fail the call.
+func (s *CommitOffsetSuite) commitOne(
+	kafka *kafkaclient.Client,
+	confirm bool,
+	item commitoffset.Item,
+) (commitoffset.Output, error) {
+	s.T().Helper()
+
+	out, err := commitoffset.Run(s.T().Context(), kafka, commitoffset.Input{
+		Items:   []commitoffset.Item{item},
+		Confirm: confirm,
+	})
+	if err != nil {
+		return commitoffset.Output{}, err
+	}
+
+	s.Require().Len(out.Results, 1,
+		"one item in must produce exactly one result out, or results cannot be matched to inputs by position")
+
+	if out.Results[0].Error != "" {
+		return commitoffset.Output{}, errors.New(out.Results[0].Error)
+	}
+
+	return *out.Results[0].Result, nil
+}
+
 func (s *CommitOffsetSuite) TestDryRunDoesNotMoveTheOffset() {
 	topic, group := s.stuckGroup("commit-dry-run", 10, 4)
 
-	out, err := commitoffset.Run(
-		s.T().Context(),
-		s.env.ClusterClient(s.T(), false),
-		commitoffset.Input{Topic: topic, Group: group, Partition: 0, Offset: 8},
-	)
+	out, err := s.commitOne(s.env.ClusterClient(s.T(), false), false, commitoffset.Item{Topic: topic, Group: group, Partition: 0, Offset: 8})
 
 	s.Require().NoError(err, "a dry run against a valid request must succeed")
 
@@ -94,17 +121,12 @@ func (s *CommitOffsetSuite) TestDryRunDoesNotMoveTheOffset() {
 func (s *CommitOffsetSuite) TestConfirmMovesTheOffsetForward() {
 	topic, group := s.stuckGroup("commit-forward", 10, 3)
 
-	out, err := commitoffset.Run(
-		s.T().Context(),
-		s.env.ClusterClient(s.T(), false),
-		commitoffset.Input{
-			Topic:     topic,
-			Group:     group,
-			Partition: 0,
-			Offset:    7,
-			Confirm:   true,
-		},
-	)
+	out, err := s.commitOne(s.env.ClusterClient(s.T(), false), true, commitoffset.Item{
+		Topic:     topic,
+		Group:     group,
+		Partition: 0,
+		Offset:    7,
+	})
 
 	s.Require().NoError(err, "a confirmed commit must succeed")
 	s.Require().True(out.Applied, "a change that happened must be reported as applied")
@@ -117,17 +139,12 @@ func (s *CommitOffsetSuite) TestConfirmMovesTheOffsetForward() {
 func (s *CommitOffsetSuite) TestConfirmMovesTheOffsetBackward() {
 	topic, group := s.stuckGroup("commit-backward", 10, 8)
 
-	out, err := commitoffset.Run(
-		s.T().Context(),
-		s.env.ClusterClient(s.T(), false),
-		commitoffset.Input{
-			Topic:     topic,
-			Group:     group,
-			Partition: 0,
-			Offset:    2,
-			Confirm:   true,
-		},
-	)
+	out, err := s.commitOne(s.env.ClusterClient(s.T(), false), true, commitoffset.Item{
+		Topic:     topic,
+		Group:     group,
+		Partition: 0,
+		Offset:    2,
+	})
 
 	s.Require().NoError(err,
 		"moving an offset backwards is how messages are replayed, and must be allowed")
@@ -140,17 +157,12 @@ func (s *CommitOffsetSuite) TestConfirmMovesTheOffsetBackward() {
 func (s *CommitOffsetSuite) TestRefusesAnOffsetBeyondTheEnd() {
 	topic, group := s.stuckGroup("commit-past-end", 5, 2)
 
-	_, err := commitoffset.Run(
-		s.T().Context(),
-		s.env.ClusterClient(s.T(), false),
-		commitoffset.Input{
-			Topic:     topic,
-			Group:     group,
-			Partition: 0,
-			Offset:    99,
-			Confirm:   true,
-		},
-	)
+	_, err := s.commitOne(s.env.ClusterClient(s.T(), false), true, commitoffset.Item{
+		Topic:     topic,
+		Group:     group,
+		Partition: 0,
+		Offset:    99,
+	})
 
 	s.Require().Error(err,
 		"an offset past the end of the partition must be refused: the group would sit ahead of the data and appear caught up while consuming nothing")
@@ -161,17 +173,12 @@ func (s *CommitOffsetSuite) TestRefusesAnOffsetBeyondTheEnd() {
 func (s *CommitOffsetSuite) TestRefusesANegativeOffset() {
 	topic, group := s.stuckGroup("commit-negative", 5, 2)
 
-	_, err := commitoffset.Run(
-		s.T().Context(),
-		s.env.ClusterClient(s.T(), false),
-		commitoffset.Input{
-			Topic:     topic,
-			Group:     group,
-			Partition: 0,
-			Offset:    -5,
-			Confirm:   true,
-		},
-	)
+	_, err := s.commitOne(s.env.ClusterClient(s.T(), false), true, commitoffset.Item{
+		Topic:     topic,
+		Group:     group,
+		Partition: 0,
+		Offset:    -5,
+	})
 
 	s.Require().Error(err,
 		"a negative offset is never valid, and Kafka would interpret some negative values as special positions rather than rejecting them")
@@ -182,17 +189,12 @@ func (s *CommitOffsetSuite) TestRefusesANegativeOffset() {
 func (s *CommitOffsetSuite) TestReadOnlyRefusesTheCommit() {
 	topic, group := s.stuckGroup("commit-read-only", 10, 3)
 
-	_, err := commitoffset.Run(
-		s.T().Context(),
-		s.env.ClusterClient(s.T(), true),
-		commitoffset.Input{
-			Topic:     topic,
-			Group:     group,
-			Partition: 0,
-			Offset:    7,
-			Confirm:   true,
-		},
-	)
+	_, err := s.commitOne(s.env.ClusterClient(s.T(), true), true, commitoffset.Item{
+		Topic:     topic,
+		Group:     group,
+		Partition: 0,
+		Offset:    7,
+	})
 
 	s.Require().Error(err,
 		"a read-only server must refuse to move an offset: this protects clusters that have no ACLs of their own, so it cannot be left to the broker")
@@ -205,11 +207,7 @@ func (s *CommitOffsetSuite) TestReadOnlyRefusesTheCommit() {
 func (s *CommitOffsetSuite) TestReadOnlyStillAllowsADryRun() {
 	topic, group := s.stuckGroup("commit-read-only-dry", 10, 3)
 
-	out, err := commitoffset.Run(
-		s.T().Context(),
-		s.env.ClusterClient(s.T(), true),
-		commitoffset.Input{Topic: topic, Group: group, Partition: 0, Offset: 7},
-	)
+	out, err := s.commitOne(s.env.ClusterClient(s.T(), true), false, commitoffset.Item{Topic: topic, Group: group, Partition: 0, Offset: 7})
 
 	s.Require().NoError(err,
 		"a preview only reads the current offset, so a read-only server can still answer what a move would do")
@@ -223,33 +221,24 @@ func (s *CommitOffsetSuite) TestErrorsOnUnknownGroup() {
 
 	s.env.Produce(s.T(), topic, testenv.Message{Value: "one"})
 
-	_, err := commitoffset.Run(
-		s.T().Context(),
-		s.env.ClusterClient(s.T(), false),
-		commitoffset.Input{
-			Topic:     topic,
-			Group:     s.env.UniqueName("never-existed"),
-			Partition: 0,
-			Offset:    1,
-			Confirm:   true,
-		},
-	)
+	_, err := s.commitOne(s.env.ClusterClient(s.T(), false), true, commitoffset.Item{
+		Topic:     topic,
+		Group:     s.env.UniqueName("never-existed"),
+		Partition: 0,
+		Offset:    1,
+	})
 
 	s.Require().Error(err,
 		"committing for a group that does not exist must fail: it would otherwise create a group out of a typo and appear to have worked")
 }
 
 func (s *CommitOffsetSuite) TestErrorsOnUnknownTopic() {
-	_, err := commitoffset.Run(
-		s.T().Context(),
-		s.env.ClusterClient(s.T(), false),
-		commitoffset.Input{
-			Topic:     s.env.UniqueName("missing"),
-			Group:     s.env.UniqueName("group"),
-			Partition: 0,
-			Offset:    1,
-		},
-	)
+	_, err := s.commitOne(s.env.ClusterClient(s.T(), false), false, commitoffset.Item{
+		Topic:     s.env.UniqueName("missing"),
+		Group:     s.env.UniqueName("group"),
+		Partition: 0,
+		Offset:    1,
+	})
 
 	s.Require().Error(err,
 		"a topic that does not exist must fail rather than appear to accept an offset for it")
@@ -261,11 +250,9 @@ func (s *CommitOffsetSuite) TestErrorsWhenBrokerUnreachable() {
 
 	s.T().Cleanup(client.Close)
 
-	_, err = commitoffset.Run(
-		s.T().Context(),
-		client,
-		commitoffset.Input{Topic: "anything", Group: "anything", Partition: 0, Offset: 1},
-	)
+	_, err = s.commitOne(client, false, commitoffset.Item{
+		Topic: "anything", Group: "anything", Partition: 0, Offset: 1,
+	})
 
 	s.Require().Error(err,
 		"an unreachable broker must surface as an error, not as a commit that appears to have succeeded")
@@ -275,15 +262,17 @@ func (s *CommitOffsetSuite) TestBatchCommitsSeveralOffsetsAndReportsItemErrors()
 	firstTopic, firstGroup := s.stuckGroup("commit-batch-first", 8, 2)
 	secondTopic, secondGroup := s.stuckGroup("commit-batch-second", 8, 3)
 
-	out, err := commitoffset.RunBatch(
+	out, err := commitoffset.Run(
 		s.T().Context(),
 		s.env.ClusterClient(s.T(), false),
-		[]commitoffset.Item{
-			{Topic: firstTopic, Group: firstGroup, Partition: 0, Offset: 6},
-			{Topic: secondTopic, Group: secondGroup, Partition: 0, Offset: 5},
-			{Topic: secondTopic, Group: secondGroup, Partition: 99, Offset: 5},
+		commitoffset.Input{
+			Items: []commitoffset.Item{
+				{Topic: firstTopic, Group: firstGroup, Partition: 0, Offset: 6},
+				{Topic: secondTopic, Group: secondGroup, Partition: 0, Offset: 5},
+				{Topic: secondTopic, Group: secondGroup, Partition: 99, Offset: 5},
+			},
+			Confirm: true,
 		},
-		true,
 	)
 
 	s.Require().NoError(err, "a structurally valid batch must return per-item results even when one item is invalid")

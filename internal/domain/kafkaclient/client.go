@@ -8,6 +8,7 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"sync"
 
 	"github.com/twmb/franz-go/pkg/kgo"
 	"github.com/twmb/franz-go/pkg/sasl"
@@ -27,8 +28,46 @@ type Client struct {
 	client   *kgo.Client
 	admin    *kadm.Client
 	reader   *records.Reader
+	manual   *manualProducer
 	cfg      *config.Cluster
 	endpoint *config.Endpoint
+}
+
+// manualProducer is a second producer that honours Record.Partition.
+//
+// The shared client uses franz-go's default partitioner, which ignores that
+// field and balances records itself. Switching the shared client to
+// ManualPartitioner is not an option: an unset Partition is 0 rather than
+// "unset", so every record produced without an explicit partition would land
+// on partition 0.
+//
+// It is built on first use and shared by every endpoint view of the cluster,
+// so a server whose callers never name a partition opens no extra connection.
+type manualProducer struct {
+	options []kgo.Opt
+
+	once   sync.Once
+	client *kgo.Client
+	err    error
+}
+
+func (m *manualProducer) get() (*kgo.Client, error) {
+	m.once.Do(func() {
+		m.client, m.err = kgo.NewClient(
+			append(m.options, kgo.RecordPartitioner(kgo.ManualPartitioner()))...)
+	})
+
+	if m.err != nil {
+		return nil, fmt.Errorf("connect a manual-partition producer: %w", m.err)
+	}
+
+	return m.client, nil
+}
+
+func (m *manualProducer) close() {
+	if m.client != nil {
+		m.client.Close()
+	}
 }
 
 // ForEndpoint returns an endpoint-scoped view over the same Kafka connection.
@@ -42,6 +81,7 @@ func (c *Client) ForEndpoint(endpoint *config.Endpoint) *Client {
 		client:   c.client,
 		admin:    c.admin,
 		reader:   c.reader,
+		manual:   c.manual,
 		cfg:      c.cfg,
 		endpoint: endpoint,
 	}
@@ -88,6 +128,7 @@ func New(cfg *config.Cluster) (*Client, error) {
 		client: client,
 		admin:  kadm.NewClient(client),
 		reader: records.NewReaderWithOptions(options...),
+		manual: &manualProducer{options: options},
 		cfg:    cfg,
 	}, nil
 }
@@ -185,6 +226,22 @@ func (c *Client) Kafka() *kgo.Client {
 	return c.client
 }
 
+// ManualProducer returns a producer that writes a record to the partition set
+// on it, for a caller who chose the partition deliberately.
+//
+// This is a separate connection from Kafka() on purpose. The shared client
+// partitions by key, which is what almost every write wants; honouring
+// Record.Partition there would send every record with no explicit partition to
+// partition 0, because an unset field is indistinguishable from a deliberate
+// zero.
+func (c *Client) ManualProducer() (*kgo.Client, error) {
+	if c.manual == nil {
+		return nil, fmt.Errorf("cluster %q has no manual-partition producer", c.cfg.Name)
+	}
+
+	return c.manual.get()
+}
+
 // Reader returns the reader used by tools that read message content.
 func (c *Client) Reader() *records.Reader {
 	return c.reader
@@ -201,5 +258,9 @@ func (c *Client) Ping(ctx context.Context) error {
 }
 
 func (c *Client) Close() {
+	if c.manual != nil {
+		c.manual.close()
+	}
+
 	c.client.Close()
 }

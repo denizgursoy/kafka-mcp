@@ -419,19 +419,28 @@ at the compose broker and is what local runs use.
 ## Conventions
 
 - A tool whose operation names one target — a topic, a partition, an offset, a
-  group — takes an optional `items` array that repeats that operation, built on
+  group — takes that target **only** as an `items` array, built on
   `internal/domain/batch`. Debugging asks the same question of several targets
   at once, and a caller who must spend one round trip per topic pays for the
   tool's shape rather than for the work. A tool escapes this only when one call
   already covers many targets, because wrapping a scan in a batch just hides
   where the cost went.
 
-  The rules are the same for every such tool, so follow them rather than copying
-  a particular one:
+  There is no second, single-target form. One operation is an `items` array of
+  length one. Offering both means every field is declared twice, once on the
+  input and once on the item, and the two drift: a field added to one is
+  missing from the other, and a description written for one is not the
+  description the other's caller reads. A single shape cannot drift from
+  itself.
 
-  - `items` is an alternative to the single-operation fields, never a
-    supplement. Combining them is an error, and the single form keeps its
-    original input and output shape so existing callers are untouched.
+  The rules are the same for every such tool, so follow them rather than
+  copying a particular one:
+
+  - `items` is required and holds at least one entry. Everything that names or
+    shapes the operation lives on the item, so the item type is the only place
+    those fields and their descriptions exist.
+  - What governs the call as a whole, rather than one target, stays at the top
+    level. `confirm` is the usual one: approval covers the whole batch.
   - Bound the batch with the limit in `batch` that matches the work: the
     smaller one for anything that opens a record reader or returns messages,
     the larger for metadata and administration.

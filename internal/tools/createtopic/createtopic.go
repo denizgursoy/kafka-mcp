@@ -17,12 +17,16 @@ import (
 	"github.com/denizgursoy/kafka-mcp/internal/domain/kafkaclient"
 )
 
-// Item is one topic specification in a batch request.
+// Item is one topic to create.
 type Item struct {
-	Topic             string            `json:"topic" jsonschema:"Name of the topic to create."`
-	Partitions        int               `json:"partitions,omitempty" jsonschema:"Optional partition count; omit for the broker default."`
-	ReplicationFactor int               `json:"replication_factor,omitempty" jsonschema:"Optional replication factor; omit for the broker default."`
-	Configs           map[string]string `json:"configs,omitempty" jsonschema:"Optional topic-level configuration."`
+	Topic string `json:"topic" jsonschema:"Name of the topic to create. An existing topic is refused rather than modified."`
+
+	// Partitions and ReplicationFactor are optional because a broker has
+	// defaults for both, and a wrong guess is worse than the default: the
+	// partition count can never be reduced afterwards.
+	Partitions        int               `json:"partitions,omitempty" jsonschema:"Optional number of partitions. On Kafka 2.4 or newer, omit to use the broker default; older brokers require a value. This can only ever be increased later, never reduced, so prefer the smallest count that meets the expected consumer parallelism."`
+	ReplicationFactor int               `json:"replication_factor,omitempty" jsonschema:"Optional number of replicas per partition. On Kafka 2.4 or newer, omit to use the broker default; older brokers require a value. It cannot exceed the number of brokers in the cluster."`
+	Configs           map[string]string `json:"configs,omitempty" jsonschema:"Optional topic-level configuration, such as retention.ms, cleanup.policy or max.message.bytes. Keys and values are passed to Kafka as given. Anything omitted is inherited from the cluster defaults."`
 }
 
 // brokerDefault is what Kafka reads as "choose for me" for the partition count
@@ -40,18 +44,8 @@ const (
 
 // Input is the argument set accepted by the create_topic tool.
 type Input struct {
-	Topic string `json:"topic,omitempty" jsonschema:"Name of one topic to create. Omit when items is used."`
-
-	// Partitions and ReplicationFactor are optional because a broker has
-	// defaults for both, and a wrong guess is worse than the default: the
-	// partition count can never be reduced afterwards.
-	Partitions        int `json:"partitions,omitempty" jsonschema:"Optional number of partitions. On Kafka 2.4 or newer, omit to use the broker default; older brokers require a value. This can only ever be increased later, never reduced, so prefer the smallest count that meets the expected consumer parallelism."`
-	ReplicationFactor int `json:"replication_factor,omitempty" jsonschema:"Optional number of replicas per partition. On Kafka 2.4 or newer, omit to use the broker default; older brokers require a value. It cannot exceed the number of brokers in the cluster."`
-
-	Configs map[string]string `json:"configs,omitempty" jsonschema:"Optional topic-level configuration, such as retention.ms, cleanup.policy or max.message.bytes. Keys and values are passed to Kafka as given. Anything omitted is inherited from the cluster defaults."`
-
-	Confirm bool   `json:"confirm,omitempty" jsonschema:"Optional. When false or omitted, nothing is created: the request is validated by the broker and the response describes what would happen. Must be true to actually create the topic."`
-	Items   []Item `json:"items,omitempty" jsonschema:"Optional batch of 1 to 100 topic specifications. Do not combine with single-operation fields. confirm applies to the whole batch; successful creations cannot be rolled back if another item fails."`
+	Items   []Item `json:"items" jsonschema:"The topics to create, 1 to 100 of them. Creating one topic is an array of length one. Duplicate topic names are refused before anything is created."`
+	Confirm bool   `json:"confirm,omitempty" jsonschema:"Optional. When false or omitted, nothing is created: every item is validated by the broker and the response describes what would happen. Must be true to actually create. One confirm covers the whole batch."`
 }
 
 // Output is the result returned by the create_topic tool.
@@ -68,19 +62,18 @@ type Output struct {
 
 type BatchOutput = batch.Output[Output]
 
-type Response struct {
-	*Output
-	*BatchOutput
-}
-
 const description = `
-Create one Kafka topic, or up to 100 topics through items, with optional partition count, replication factor and
-topic-level configs. Omitted values use broker defaults. Existing topics are
-refused rather than modified.
+Create 1 to 100 Kafka topics in one call through items, each with optional
+partition count, replication factor and topic-level configs. Omitted values use
+broker defaults. Existing topics are refused rather than modified. Creating one
+topic is an items array of length one.
 
 No topic is created unless confirm is true; otherwise the broker only validates
-the request. Partition counts cannot be reduced later. Requires Kafka CREATE
-permission.
+the requests. One confirm covers the whole batch, and creation is not atomic:
+topics created before a later item failed stay, because Kafka cannot roll them
+back. Results follow items order, each carrying index with result or error.
+
+Partition counts cannot be reduced later. Requires Kafka CREATE permission.
 `
 
 // Register adds the create_topic tool to the MCP server.
@@ -88,40 +81,30 @@ func Register(server *mcp.Server, kafka *kafkaclient.Client) {
 	mcp.AddTool(
 		server,
 		&mcp.Tool{
-			Name:         "create_topic",
-			Description:  description,
-			OutputSchema: batch.OutputSchema[Output](),
+			Name:        "create_topic",
+			Description: description,
 		},
 		func(
 			ctx context.Context,
 			req *mcp.CallToolRequest,
 			input Input,
-		) (*mcp.CallToolResult, Response, error) {
-
-			if input.Items != nil {
-				if input.Topic != "" || input.Partitions != 0 || input.ReplicationFactor != 0 || len(input.Configs) != 0 {
-					return nil, Response{}, fmt.Errorf("create topic: items cannot be combined with single-operation fields")
-				}
-				out, err := RunBatch(ctx, kafka, input.Items, input.Confirm)
-				if err != nil {
-					return nil, Response{}, fmt.Errorf("create topics: %w", err)
-				}
-				return nil, Response{BatchOutput: &out}, nil
-			}
+		) (*mcp.CallToolResult, BatchOutput, error) {
 
 			out, err := Run(ctx, kafka, input)
 			if err != nil {
-				return nil, Response{}, fmt.Errorf("create topic: %w", err)
+				return nil, BatchOutput{}, fmt.Errorf("create topics: %w", err)
 			}
 
-			return nil, Response{Output: &out}, nil
+			return nil, out, nil
 		},
 	)
 }
 
-// RunBatch validates every topic before creating any valid item. The creation
-// phase is non-atomic because Kafka cannot roll successful topics back.
-func RunBatch(ctx context.Context, kafka *kafkaclient.Client, items []Item, confirm bool) (BatchOutput, error) {
+// Run validates every topic before creating any valid item. The creation phase
+// is non-atomic because Kafka cannot roll successful topics back.
+func Run(ctx context.Context, kafka *kafkaclient.Client, input Input) (BatchOutput, error) {
+	items, confirm := input.Items, input.Confirm
+
 	if err := batch.Validate(len(items), batch.MaxItems); err != nil {
 		return BatchOutput{}, err
 	}
@@ -134,7 +117,7 @@ func RunBatch(ctx context.Context, kafka *kafkaclient.Client, items []Item, conf
 	}
 
 	out, err := batch.Run(ctx, items, batch.MaxItems, func(ctx context.Context, item Item) (Output, error) {
-		return Run(ctx, kafka, createInput(item, false))
+		return create(ctx, kafka, item, false)
 	})
 	if err != nil || !confirm {
 		return out, err
@@ -146,7 +129,7 @@ func RunBatch(ctx context.Context, kafka *kafkaclient.Client, items []Item, conf
 			out.Failed++
 			continue
 		}
-		value, applyErr := Run(ctx, kafka, createInput(item, true))
+		value, applyErr := create(ctx, kafka, item, true)
 		if applyErr != nil {
 			out.Results[index].Result = nil
 			out.Results[index].Error = applyErr.Error()
@@ -162,13 +145,14 @@ func RunBatch(ctx context.Context, kafka *kafkaclient.Client, items []Item, conf
 	return out, nil
 }
 
-func createInput(item Item, confirm bool) Input {
-	return Input{Topic: item.Topic, Partitions: item.Partitions, ReplicationFactor: item.ReplicationFactor,
-		Configs: item.Configs, Confirm: confirm}
-}
+// create validates or performs one topic creation.
+func create(
+	ctx context.Context,
+	kafka *kafkaclient.Client,
+	input Item,
+	confirm bool,
+) (Output, error) {
 
-// Run validates or performs a topic creation.
-func Run(ctx context.Context, kafka *kafkaclient.Client, input Input) (Output, error) {
 	if input.Topic == "" {
 		return Output{}, fmt.Errorf("topic is required")
 	}
@@ -211,7 +195,7 @@ func Run(ctx context.Context, kafka *kafkaclient.Client, input Input) (Output, e
 		Warnings: warnings(input),
 	}
 
-	if !input.Confirm {
+	if !confirm {
 		// ValidateOnly asks the broker the same question without creating
 		// anything, so the preview reports the cluster's answer rather than a
 		// guess made here about what the cluster would allow.
@@ -428,7 +412,7 @@ func reported(fromBroker int32, requested int) int {
 }
 
 // warnings states what the caller cannot take back later.
-func warnings(input Input) []string {
+func warnings(input Item) []string {
 	warnings := make([]string, 0, 3)
 
 	if input.Partitions > 0 {

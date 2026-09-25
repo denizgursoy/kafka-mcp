@@ -39,9 +39,10 @@ that is a different answer from "the consumers are keeping up".
 
 ### 3. Measure
 
-Call `consumer_lag` with the topic, and the group if the user named one.
-When several topic/group pairs must be compared, use `items`; their sampling
-windows run concurrently instead of adding one wait window per tool call.
+Call `consumer_lag` with one `items` entry per topic, and the group on the item
+if the user named one. Comparing several topic/group pairs is the same call with
+more entries, and their sampling windows run concurrently instead of adding one
+wait window per call. Read each item's own result.
 
 The call **blocks for `sample_seconds`** (default 5), because Kafka stores no
 history of consumption: the only way to learn the consume rate is to read the

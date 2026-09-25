@@ -13,21 +13,17 @@ import (
 	"github.com/denizgursoy/kafka-mcp/internal/domain/batch"
 )
 
-// Item is one topic/group measurement in a batch request.
+// Item is one topic/group measurement.
 type Item struct {
-	Topic           string `json:"topic" jsonschema:"Topic to measure lag on."`
-	Group           string `json:"group,omitempty" jsonschema:"Optional consumer group. Defaults to every group for the topic."`
-	SampleSeconds   int    `json:"sample_seconds,omitempty" jsonschema:"Optional consume-rate sample window in seconds. Defaults to 5."`
-	SkipConsumeRate bool   `json:"skip_consume_rate,omitempty" jsonschema:"Optional. Return immediately without consume-rate sampling."`
+	Topic           string `json:"topic" jsonschema:"Topic to measure lag on. Matched exactly and case-sensitively."`
+	Group           string `json:"group,omitempty" jsonschema:"Optional consumer group. Defaults to every group that consumes or holds committed offsets for the topic."`
+	SampleSeconds   int    `json:"sample_seconds,omitempty" jsonschema:"Optional number of seconds to sample the consume rate over. Defaults to 5. The call blocks for this long, because Kafka stores no history of past commits and the rate can only be measured by comparing two readings."`
+	SkipConsumeRate bool   `json:"skip_consume_rate,omitempty" jsonschema:"Optional. When true, return immediately without sampling the consume rate. No completion estimate can be produced, because there is no rate to divide the lag by."`
 }
 
 // Input is the argument set accepted by the consumer_lag tool.
 type Input struct {
-	Topic           string `json:"topic,omitempty" jsonschema:"Topic to measure for a single operation. Omit when items is used."`
-	Group           string `json:"group,omitempty" jsonschema:"Optional consumer group. Defaults to every group that consumes or holds committed offsets for the topic."`
-	SampleSeconds   int    `json:"sample_seconds,omitempty" jsonschema:"Optional number of seconds to sample the consume rate over. Defaults to 5. The call blocks for this long, because Kafka stores no history of past commits and the rate can only be measured by comparing two readings."`
-	SkipConsumeRate bool   `json:"skip_consume_rate,omitempty" jsonschema:"Optional. When true, return immediately without sampling the consume rate. No completion estimate can be produced, because there is no rate to divide the lag by."`
-	Items           []Item `json:"items,omitempty" jsonschema:"Optional batch of 1 to 100 topic/group measurements. Do not combine with single-operation fields. Sampling windows run concurrently with bounded parallelism."`
+	Items []Item `json:"items" jsonschema:"The measurements to take, 1 to 100 of them. Measuring one topic is an array of length one. Sampling windows run concurrently, so several measurements do not add their wait times together."`
 }
 
 // PartitionLag is the lag of one partition within a group.
@@ -73,11 +69,6 @@ type Output struct {
 
 type BatchOutput = batch.Output[Output]
 
-type Response struct {
-	*Output
-	*BatchOutput
-}
-
 // Statuses reported for a group.
 const (
 	statusCaughtUp    = "caught_up"
@@ -91,12 +82,17 @@ const (
 const defaultSampleSeconds = 5
 
 const description = `
-Measure consumer lag for one topic or up to 100 items, production and consumption rates, and whether a topic's
-backlog is caught up, draining, growing, stalled or has no active consumers.
-Returns an ETA only when lag is shrinking.
+Measure consumer lag for 1 to 100 topics in one call through items: production
+and consumption rates, and whether each topic's backlog is caught up, draining,
+growing, stalled or has no active consumers. Returns an ETA only when lag is
+shrinking.
+
+Results follow items order, each carrying index with result or error. Measuring
+one topic is an items array of length one.
 
 Consumption rate is sampled for sample_seconds, so the call waits that long.
-Set skip_consume_rate for an immediate result without an ETA.
+Windows run concurrently, so several measurements do not add their waits
+together. Set skip_consume_rate for an immediate result without an ETA.
 `
 
 // Register adds the consumer_lag tool to the MCP server.
@@ -104,53 +100,38 @@ func Register(server *mcp.Server, admin *kadm.Client) {
 	mcp.AddTool(
 		server,
 		&mcp.Tool{
-			Name:         "consumer_lag",
-			Description:  description,
-			OutputSchema: batch.OutputSchema[Output](),
+			Name:        "consumer_lag",
+			Description: description,
 		},
 		func(
 			ctx context.Context,
 			req *mcp.CallToolRequest,
 			input Input,
-		) (*mcp.CallToolResult, Response, error) {
-
-			if input.Items != nil {
-				if input.Topic != "" || input.Group != "" || input.SampleSeconds != 0 || input.SkipConsumeRate {
-					return nil, Response{}, fmt.Errorf("consumer lag: items cannot be combined with single-operation fields")
-				}
-				out, err := RunBatch(ctx, admin, input.Items)
-				if err != nil {
-					return nil, Response{}, fmt.Errorf("consumer lag batch: %w", err)
-				}
-				return nil, Response{BatchOutput: &out}, nil
-			}
+		) (*mcp.CallToolResult, BatchOutput, error) {
 
 			out, err := Run(ctx, admin, input)
 			if err != nil {
-				return nil, Response{}, fmt.Errorf("consumer lag: %w", err)
+				return nil, BatchOutput{}, fmt.Errorf("consumer lag: %w", err)
 			}
 
-			return nil, Response{Output: &out}, nil
+			return nil, out, nil
 		},
 	)
 }
 
-// RunBatch measures independent topic/group pairs with bounded concurrency, so
-// several sampling windows do not add their wait times together.
-func RunBatch(ctx context.Context, admin *kadm.Client, items []Item) (BatchOutput, error) {
-	return batch.Run(ctx, items, batch.MaxItems, func(ctx context.Context, item Item) (Output, error) {
-		return Run(ctx, admin, Input{
-			Topic: item.Topic, Group: item.Group, SampleSeconds: item.SampleSeconds,
-			SkipConsumeRate: item.SkipConsumeRate,
-		})
+// Run measures every requested topic with bounded concurrency, so several
+// sampling windows do not add their wait times together.
+func Run(ctx context.Context, admin *kadm.Client, input Input) (BatchOutput, error) {
+	return batch.Run(ctx, input.Items, batch.MaxItems, func(ctx context.Context, item Item) (Output, error) {
+		return measure(ctx, admin, item)
 	})
 }
 
-// Run measures lag, throughput and the time remaining for a topic's consumers.
-func Run(
+// measure reports lag, throughput and time remaining for one topic.
+func measure(
 	ctx context.Context,
 	admin *kadm.Client,
-	input Input,
+	input Item,
 ) (Output, error) {
 
 	if input.Topic == "" {
@@ -245,7 +226,7 @@ func Run(
 func resolveGroups(
 	ctx context.Context,
 	admin *kadm.Client,
-	input Input,
+	input Item,
 ) ([]string, error) {
 
 	if input.Group != "" {

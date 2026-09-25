@@ -97,15 +97,16 @@ but never shrink" — because that is the decision they are actually confirming.
 
 ### 5. Create
 
-Call `create_topic` again with `confirm: true`. The response reports the
-partition count and replication factor **read back from the cluster**, so
-verify they are what was intended, particularly when either was omitted and the
-broker chose.
+Call `create_topic` again with top-level `confirm: true`. Each item's result
+reports the partition count and replication factor **read back from the
+cluster**, so verify they are what was intended, particularly when either was
+omitted and the broker chose.
 
-When several related topics are needed (for example main, retry and dead-letter
-topics), put their separate specifications in `items`. Preview the whole batch,
-then use top-level `confirm: true`. Creation is not atomic: report any per-item
-error and never imply successful topics were rolled back.
+Several related topics (for example main, retry and dead-letter) are separate
+`items` entries in one call, each with its own partition count and configs.
+Preview the whole batch, then use top-level `confirm: true`. Creation is not
+atomic: report any per-item error and never imply successful topics were rolled
+back.
 
 If the broker refuses with an authorization error, the fix is a Kafka ACL:
 creating a topic needs `CREATE` on the topic or the cluster for the principal

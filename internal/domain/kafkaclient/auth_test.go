@@ -90,7 +90,9 @@ func (s *AuthenticationSuite) TestAuthenticatedConnections() {
 		session, err := caller.Connect(ctx, &mcp.StreamableClientTransport{Endpoint: httpServer.URL}, nil)
 		s.Require().NoError(err, "MCP initialization must succeed over real HTTP")
 		defer session.Close()
-		result, err := session.CallTool(ctx, &mcp.CallToolParams{Name: "get_message", Arguments: map[string]any{"topic": topic, "partition": 0, "offset": 0}})
+		result, err := session.CallTool(ctx, &mcp.CallToolParams{Name: "get_message", Arguments: map[string]any{
+			"items": []map[string]any{{"topic": topic, "partition": 0, "offset": 0}},
+		}})
 		s.Require().NoError(err, "the MCP session must call the registered reading tool")
 		s.Require().False(result.IsError, "MCP message reading must authenticate its own broker connection")
 		data, err := json.Marshal(result)

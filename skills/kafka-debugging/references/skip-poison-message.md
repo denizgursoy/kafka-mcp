@@ -110,7 +110,7 @@ tool refusing.
 
 ### 6. Preview the skip
 
-Call `commit_offset` **without** `confirm`. The response gives the current
+Call `commit_offset` **without** `confirm`. Each item's result gives the current
 offset, the target, and how many messages will be skipped.
 
 To skip the message at offset 42, the target is **43**: the offset is the one
@@ -142,9 +142,15 @@ there is another poison message, and this whole sequence repeats.
 - A repeatedly poisoned topic is usually a producer or schema problem. After
   the second or third skip, say so: skipping is a way to restore service, not
   a fix.
-- `commit_offset` moves one partition per item. A consumer stuck on several
-  partitions should use one `items` batch, previewed with top-level `confirm`
-  omitted and applied only after every skip count has been approved. Valid
-  commits are not rolled back if another item fails.
+- `commit_offset` moves one partition per item, so a consumer stuck on several
+  partitions is one call with several entries. Preview with `confirm` omitted and
+  apply only after every skip count has been approved. Valid commits are not
+  rolled back if another item fails.
 - Moving the offset backward is the same tool and replays messages instead of
   skipping them, which produces duplicates rather than losing data.
+- Skipping leaves the work undone. When the payload itself was broken and a
+  corrected version has to take its place, the skipped message can be repaired
+  and written back with `produce_message`; see
+  [produce-message.md](produce-message.md). Do this only once the consumer is
+  moving again, and note that the repair arrives at the end of the partition
+  rather than at the original's position.

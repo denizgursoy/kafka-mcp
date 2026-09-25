@@ -1,6 +1,7 @@
 package getmessage_test
 
 import (
+	"errors"
 	"testing"
 
 	"github.com/stretchr/testify/suite"
@@ -28,6 +29,40 @@ func (s *GetMessageSuite) TearDownSuite() {
 	s.env.Stop()
 }
 
+// get reads one address and returns that item's result.
+//
+// Every call is a batch, so a single address is an items array of length one,
+// and a failure for that address arrives as the item's error rather than as an
+// error for the call.
+func (s *GetMessageSuite) get(item getmessage.Item) (getmessage.Output, error) {
+	s.T().Helper()
+
+	return s.getWith(s.env.Reader(), item)
+}
+
+func (s *GetMessageSuite) getWith(
+	reader *records.Reader,
+	item getmessage.Item,
+) (getmessage.Output, error) {
+	s.T().Helper()
+
+	out, err := getmessage.Run(s.T().Context(), reader, getmessage.Input{
+		Items: []getmessage.Item{item},
+	})
+	if err != nil {
+		return getmessage.Output{}, err
+	}
+
+	s.Require().Len(out.Results, 1,
+		"one item in must produce exactly one result out, or results cannot be matched to inputs by position")
+
+	if out.Results[0].Error != "" {
+		return getmessage.Output{}, errors.New(out.Results[0].Error)
+	}
+
+	return *out.Results[0].Result, nil
+}
+
 func (s *GetMessageSuite) TestReturnsMessageAtOffset() {
 	topic := s.env.CreateTopic(s.T(), "get-one")
 
@@ -41,11 +76,7 @@ func (s *GetMessageSuite) TestReturnsMessageAtOffset() {
 		testenv.Message{Key: "k2", Value: "third"},
 	)
 
-	out, err := getmessage.Run(
-		s.T().Context(),
-		s.env.Reader(),
-		getmessage.Input{Topic: topic, Partition: 0, Offset: 1},
-	)
+	out, err := s.get(getmessage.Item{Topic: topic, Partition: 0, Offset: 1})
 
 	s.Require().NoError(err, "reading an offset that exists must succeed")
 	s.Require().EqualValues(1, out.Message.Offset,
@@ -73,11 +104,7 @@ func (s *GetMessageSuite) TestReturnsNeighbouringMessages() {
 		testenv.Message{Value: "four"},
 	)
 
-	out, err := getmessage.Run(
-		s.T().Context(),
-		s.env.Reader(),
-		getmessage.Input{Topic: topic, Partition: 0, Offset: 2, Context: 1},
-	)
+	out, err := s.get(getmessage.Item{Topic: topic, Partition: 0, Offset: 2, Context: 1})
 
 	s.Require().NoError(err, "reading with context must succeed")
 	s.Require().Equal("two", out.Message.Value,
@@ -100,11 +127,7 @@ func (s *GetMessageSuite) TestContextIsClampedAtPartitionBounds() {
 		testenv.Message{Value: "one"},
 	)
 
-	out, err := getmessage.Run(
-		s.T().Context(),
-		s.env.Reader(),
-		getmessage.Input{Topic: topic, Partition: 0, Offset: 0, Context: 5},
-	)
+	out, err := s.get(getmessage.Item{Topic: topic, Partition: 0, Offset: 0, Context: 5})
 
 	s.Require().NoError(err,
 		"asking for more context than the partition holds must not fail")
@@ -124,11 +147,7 @@ func (s *GetMessageSuite) TestTruncatesOversizedValue() {
 
 	s.env.Produce(s.T(), topic, testenv.Message{Value: string(long)})
 
-	out, err := getmessage.Run(
-		s.T().Context(),
-		s.env.Reader(),
-		getmessage.Input{Topic: topic, Partition: 0, Offset: 0, MaxValueBytes: 50},
-	)
+	out, err := s.get(getmessage.Item{Topic: topic, Partition: 0, Offset: 0, MaxValueBytes: 50})
 
 	s.Require().NoError(err, "reading an oversized value must succeed, not fail")
 	s.Require().True(out.Message.Truncated,
@@ -144,11 +163,7 @@ func (s *GetMessageSuite) TestBase64EncodesBinaryValue() {
 
 	s.env.Produce(s.T(), topic, testenv.Message{Value: string([]byte{0xff, 0xfe, 0x00, 0x01})})
 
-	out, err := getmessage.Run(
-		s.T().Context(),
-		s.env.Reader(),
-		getmessage.Input{Topic: topic, Partition: 0, Offset: 0},
-	)
+	out, err := s.get(getmessage.Item{Topic: topic, Partition: 0, Offset: 0})
 
 	s.Require().NoError(err, "reading a binary payload must succeed")
 	s.Require().Equal("base64", out.Message.Encoding,
@@ -162,11 +177,7 @@ func (s *GetMessageSuite) TestErrorsOnOffsetPastEnd() {
 
 	s.env.Produce(s.T(), topic, testenv.Message{Value: "only"})
 
-	_, err := getmessage.Run(
-		s.T().Context(),
-		s.env.Reader(),
-		getmessage.Input{Topic: topic, Partition: 0, Offset: 99},
-	)
+	_, err := s.get(getmessage.Item{Topic: topic, Partition: 0, Offset: 99})
 
 	s.Require().Error(err,
 		"an offset beyond the end of the partition must fail rather than hang or return nothing")
@@ -177,25 +188,20 @@ func (s *GetMessageSuite) TestErrorsOnUnknownPartition() {
 
 	s.env.Produce(s.T(), topic, testenv.Message{Value: "only"})
 
-	_, err := getmessage.Run(
-		s.T().Context(),
-		s.env.Reader(),
-		getmessage.Input{Topic: topic, Partition: 7, Offset: 0},
-	)
+	_, err := s.get(getmessage.Item{Topic: topic, Partition: 7, Offset: 0})
 
 	s.Require().Error(err,
 		"a partition the topic does not have must fail, not silently return nothing")
 }
 
 func (s *GetMessageSuite) TestErrorsWhenBrokerUnreachable() {
-	_, err := getmessage.Run(
-		s.T().Context(),
+	_, err := s.getWith(
 		records.NewReader("127.0.0.1:1"),
-		getmessage.Input{Topic: "anything", Partition: 0, Offset: 0},
+		getmessage.Item{Topic: "anything", Partition: 0, Offset: 0},
 	)
 
 	s.Require().Error(err,
-		"an unreachable broker must surface as an error, not as a missing message")
+		"an unreachable broker must surface as that item's error, not as a missing message")
 }
 
 func (s *GetMessageSuite) TestBatchReadsSeveralAddressesAndKeepsPartialErrors() {
@@ -205,10 +211,12 @@ func (s *GetMessageSuite) TestBatchReadsSeveralAddressesAndKeepsPartialErrors() 
 		testenv.Message{Value: "one"},
 	)
 
-	out, err := getmessage.RunBatch(s.T().Context(), s.env.Reader(), []getmessage.Item{
-		{Topic: topic, Partition: 0, Offset: 1},
-		{Topic: topic, Partition: 0, Offset: 99},
-		{Topic: topic, Partition: 0, Offset: 0},
+	out, err := getmessage.Run(s.T().Context(), s.env.Reader(), getmessage.Input{
+		Items: []getmessage.Item{
+			{Topic: topic, Partition: 0, Offset: 1},
+			{Topic: topic, Partition: 0, Offset: 99},
+			{Topic: topic, Partition: 0, Offset: 0},
+		},
 	})
 
 	s.Require().NoError(err, "an invalid address must be reported on its item rather than hide successful reads")

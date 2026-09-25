@@ -318,9 +318,11 @@ A writable endpoint can withhold individual tools too, with its `tools` map.
 That is the same mechanism seen from the client: the tool is
 not registered, so it is absent from `tools/list` and from `server_config`.
 
-`copy_message` stays, because `read_only` protects the cluster being written
-to and the destination is chosen per call. Copying a message out of a
-read-only production cluster is exactly what it is for.
+`copy_message` and `produce_message` stay, because `read_only` protects the
+cluster being written to and the destination is chosen per call. Copying a
+message out of a read-only production cluster, or seeding a writable preprod
+cluster from a protected session, is exactly what they are for. Both refuse
+outright when the destination is the read-only cluster itself.
 
 Hiding a tool decides what is advertised, not what is permitted: both tools
 still refuse at the point of mutation, so a registration mistake cannot turn
@@ -361,27 +363,38 @@ ACLs, `read_only: true` is the available protection.
 ### Batch operations
 
 `describe_topic`, `sample_messages`, `get_message`, `consumer_lag`,
-`add_partitions`, `create_topic`, `commit_offset` and `copy_message` accept an
-optional `items` array as an alternative to their single-operation fields. The
-message-heavy tools accept at most 20 items; lag and administrative tools
+`add_partitions`, `create_topic`, `commit_offset`, `copy_message` and
+`produce_message` take their target **only** as a required `items` array. There
+is no single-target form: one operation is an `items` array of length one.
+
+```json
+{"items": [{"topic": "orders"}]}
+{"items": [{"topic": "orders"}, {"topic": "payments"}]}
+```
+
+Everything naming or shaping an operation lives on the item, so each field and
+its description exist in exactly one place. What governs the whole call stays at
+the top level, which in practice means `confirm`.
+
+The message-heavy tools accept at most 20 items; lag and administrative tools
 accept at most 100.
 
-Batch results stay in input order. Each entry has `index` and either `result`
-or `error`, followed by `succeeded`, `failed` and `atomic: false`. An item error
-does not hide successful items. Batch writes first preview every item, then
-apply the valid items only when the top-level `confirm` is true. They are not
-transactions: Kafka cannot roll back a topic, partition, offset or produced
-message after a later item fails. Duplicate write targets are refused before
-anything changes.
-
-Do not combine `items` with the tool's single-operation fields. Existing single
-calls keep their original input and output shape.
+Every response is the same envelope. Results stay in input order, each entry
+carrying `index` and either `result` or `error`, followed by `succeeded`,
+`failed`, `applied` and `atomic: false`. An item's failure is data in the
+response rather than an error for the call, so it never hides the items that
+worked. Batch writes preview every item first, then apply the valid ones only
+when the top-level `confirm` is true. They are not transactions: Kafka cannot
+roll back a topic, partition, offset or produced message after a later item
+fails. Duplicate write targets are refused before anything changes, except in
+`produce_message`, where two identical items mean two messages rather than a
+mistake.
 
 ### `list_clusters`
 
 Lists the clusters this server serves, with whether each is reachable and
 whether it accepts writes. Takes no parameters. Available from every endpoint,
-so a session can discover what `copy_message` may target.
+so a session can discover what `copy_message` and `produce_message` may target.
 
 ```json
 {"clusters": [
@@ -417,16 +430,23 @@ Reports a topic's partitions, offset ranges, message count, time span and full
 configuration. Use it before searching to see how much data a search would read
 and how far back the topic can hold data at all.
 
-| Parameter | Type   | Required | Meaning              |
-| --------- | ------ | -------- | -------------------- |
-| `topic`   | string | yes      | Topic to describe    |
-| `items`   | object[] | no     | Up to 20 topic objects; alternative to `topic` |
+| Parameter | Type     | Required | Meaning                      |
+| --------- | -------- | -------- | ---------------------------- |
+| `items`   | object[] | yes      | 1 to 20 topics to describe   |
+
+Item fields:
+
+| Field   | Type   | Required | Meaning           |
+| ------- | ------ | -------- | ----------------- |
+| `topic` | string | yes      | Topic to describe |
 
 ```json
-{"topic": "orders", "partition_count": 1, "message_count": 3,
- "partitions": [{"partition": 0, "start_offset": 0, "end_offset": 3, "message_count": 3}],
- "configs": [{"key": "cleanup.policy", "value": "delete", "source": "DYNAMIC_TOPIC_CONFIG", "is_default": false},
-             {"key": "retention.ms", "value": "604800000", "source": "DEFAULT_CONFIG", "is_default": true}]}
+{"results": [{"index": 0, "result": {
+   "topic": "orders", "partition_count": 1, "message_count": 3,
+   "partitions": [{"partition": 0, "start_offset": 0, "end_offset": 3, "message_count": 3}],
+   "configs": [{"key": "cleanup.policy", "value": "delete", "source": "DYNAMIC_TOPIC_CONFIG", "is_default": false},
+               {"key": "retention.ms", "value": "604800000", "source": "DEFAULT_CONFIG", "is_default": true}]}}],
+ "succeeded": 1, "failed": 0, "applied": 0, "atomic": false}
 ```
 
 `configs` lists every topic config as the string Kafka reports, where `-1`
@@ -442,20 +462,27 @@ value formats, JSON field paths with their types, key statistics, and which
 value fields carry the message key. Use it before searching to decide how to
 search.
 
-| Parameter         | Type   | Required | Meaning                                  |
-| ----------------- | ------ | -------- | ---------------------------------------- |
-| `topic`           | string | yes      | Topic to sample                          |
-| `sample_size`     | int    | no       | Messages to read in total. Default 20    |
-| `partitions`      | int[]  | no       | Restrict to these partitions             |
-| `max_value_bytes` | int    | no       | Value bytes per message. Default 512     |
-| `items`           | object[] | no     | Up to 20 topic sample requests           |
+| Parameter | Type     | Required | Meaning                   |
+| --------- | -------- | -------- | ------------------------- |
+| `items`   | object[] | yes      | 1 to 20 topics to sample  |
+
+Item fields:
+
+| Field             | Type   | Required | Meaning                               |
+| ----------------- | ------ | -------- | ------------------------------------- |
+| `topic`           | string | yes      | Topic to sample                       |
+| `sample_size`     | int    | no       | Messages to read in total. Default 20 |
+| `partitions`      | int[]  | no       | Restrict to these partitions          |
+| `max_value_bytes` | int    | no       | Value bytes per message. Default 512  |
 
 ```json
-{"value_formats": {"json": 20, "text": 0, "binary": 0},
- "json_fields": [{"path": "payload.amount", "types": ["number"], "present": 20, "example": "500"}],
- "key_stats": {"present": 20, "absent": 0, "unique": 20, "all_unique": true},
- "key_in_value": ["payload.orderId"],
- "sampled_ranges": [{"partition": 0, "start": 980, "end": 1000}]}
+{"results": [{"index": 0, "result": {
+   "value_formats": {"json": 20, "text": 0, "binary": 0},
+   "json_fields": [{"path": "payload.amount", "types": ["number"], "present": 20, "example": "500"}],
+   "key_stats": {"present": 20, "absent": 0, "unique": 20, "all_unique": true},
+   "key_in_value": ["payload.orderId"],
+   "sampled_ranges": [{"partition": 0, "start": 980, "end": 1000}]}}],
+ "succeeded": 1, "failed": 0, "applied": 0, "atomic": false}
 ```
 
 `key_in_value` naming a field means the key is that identifier, so searching
@@ -547,19 +574,25 @@ For large result sets, use `count_only` to learn how many matches exist, then
 
 ### `get_message`
 
-Reads one message at an exact offset, plus optional neighbours.
+Reads messages at exact offsets, plus optional neighbours.
 
-| Parameter         | Type   | Required | Meaning                                       |
-| ----------------- | ------ | -------- | --------------------------------------------- |
-| `topic`           | string | yes      | Topic to read from                            |
-| `partition`       | int    | yes      | Partition to read from                        |
-| `offset`          | int    | yes      | Exact offset to read                          |
-| `context`         | int    | no       | Also return this many messages either side    |
-| `max_value_bytes` | int    | no       | Value bytes to return. Default 4096           |
-| `items`           | object[] | no     | Up to 20 exact message addresses             |
+| Parameter | Type     | Required | Meaning                             |
+| --------- | -------- | -------- | ----------------------------------- |
+| `items`   | object[] | yes      | 1 to 20 addresses to read           |
+
+Item fields:
+
+| Field             | Type   | Required | Meaning                                    |
+| ----------------- | ------ | -------- | ------------------------------------------ |
+| `topic`           | string | yes      | Topic to read from                         |
+| `partition`       | int    | yes      | Partition to read from                     |
+| `offset`          | int    | yes      | Exact offset to read                       |
+| `context`         | int    | no       | Also return this many messages either side |
+| `max_value_bytes` | int    | no       | Value bytes to return. Default 4096        |
 
 ```json
-{"name": "get_message", "arguments": {"topic": "orders", "partition": 0, "offset": 17, "context": 1}}
+{"name": "get_message", "arguments": {"items": [
+  {"topic": "orders", "partition": 0, "offset": 17, "context": 1}]}}
 ```
 
 Values that are not valid UTF-8 are base64 encoded, with `encoding` set to
@@ -588,21 +621,31 @@ consumers that made them. Kafka has no topic-to-group index, so filtering by
 Measures how far behind a topic's consumers are, how fast messages are produced
 and consumed, and when the backlog will clear.
 
-| Parameter            | Type   | Required | Meaning                                                     |
-| -------------------- | ------ | -------- | ----------------------------------------------------------- |
-| `topic`              | string | yes      | Topic to measure                                             |
-| `group`              | string | no       | Defaults to every group consuming the topic                  |
-| `sample_seconds`     | int    | no       | Consume-rate sample window. Default 5. **The call blocks**   |
-| `skip_consume_rate`  | bool   | no       | Return immediately, without a rate or estimate               |
-| `items`              | object[] | no     | Up to 100 topic/group measurements                            |
+| Parameter | Type     | Required | Meaning                        |
+| --------- | -------- | -------- | ------------------------------ |
+| `items`   | object[] | yes      | 1 to 100 measurements to take  |
+
+Item fields:
+
+| Field               | Type   | Required | Meaning                                                   |
+| ------------------- | ------ | -------- | --------------------------------------------------------- |
+| `topic`             | string | yes      | Topic to measure                                          |
+| `group`             | string | no       | Defaults to every group consuming the topic               |
+| `sample_seconds`    | int    | no       | Consume-rate sample window. Default 5. **The call blocks** |
+| `skip_consume_rate` | bool   | no       | Return immediately, without a rate or estimate            |
+
+Sampling windows run concurrently, so several measurements do not add their
+waits together.
 
 ```json
-{"topic": "orders", "total_lag": 4200,
- "produce_rate": {"last_minute": {"messages": 3000, "per_second": 50, "per_minute": 3000, "per_hour": 180000}},
- "groups": [{"group": "payments", "state": "Stable", "members": 2, "lag": 4200,
-             "consume_rate": {"per_second": 120, "sampled_seconds": 5},
-             "drain_per_second": 70, "eta_seconds": 60, "eta_human": "1m 0s",
-             "status": "draining"}]}
+{"results": [{"index": 0, "result": {
+   "topic": "orders", "total_lag": 4200,
+   "produce_rate": {"last_minute": {"messages": 3000, "per_second": 50, "per_minute": 3000, "per_hour": 180000}},
+   "groups": [{"group": "payments", "state": "Stable", "members": 2, "lag": 4200,
+               "consume_rate": {"per_second": 120, "sampled_seconds": 5},
+               "drain_per_second": 70, "eta_seconds": 60, "eta_human": "1m 0s",
+               "status": "draining"}]}}],
+ "succeeded": 1, "failed": 0, "applied": 0, "atomic": false}
 ```
 
 The two rates are measured differently, and the output says so:
@@ -638,14 +681,19 @@ different on a local broker than on production.
 Adds partitions to a topic. **Irreversible** — Kafka cannot reduce a partition
 count. Not exposed on a read-only endpoint.
 
-| Parameter | Type | Required | Meaning |
-| --------- | ---- | -------- | ------- |
-| `topic` | string | yes | Topic to change |
-| `partitions` | int | yes | Final total, not the number to add. Repeating a call is safe |
-| `confirm` | bool | no | Default false: preview only, nothing changes |
-| `acknowledge_key_ordering` | bool | no | Required when messages are keyed |
-| `sample_size` | int | no | Messages inspected for keys. Default 20 |
-| `items` | object[] | no | Up to 100 topic targets; `confirm` stays top-level |
+| Parameter | Type     | Required | Meaning                                      |
+| --------- | -------- | -------- | -------------------------------------------- |
+| `items`   | object[] | yes      | 1 to 100 topics to change                    |
+| `confirm` | bool     | no       | Default false: preview only, nothing changes |
+
+Item fields:
+
+| Field                      | Type   | Required | Meaning                                                      |
+| -------------------------- | ------ | -------- | ------------------------------------------------------------ |
+| `topic`                    | string | yes      | Topic to change                                              |
+| `partitions`               | int    | yes      | Final total, not the number to add. Repeating a call is safe |
+| `acknowledge_key_ordering` | bool   | no       | Required when messages are keyed                             |
+| `sample_size`              | int    | no       | Messages inspected for keys. Default 20                      |
 
 Without `confirm` it reports what would happen: current and target counts,
 whether messages are keyed, which consumer groups will rebalance, and warnings.
@@ -660,14 +708,19 @@ has is refused with an explanation rather than attempted.
 Creates a topic. Refuses a topic that already exists rather than adjusting it.
 Not exposed on a read-only endpoint.
 
-| Parameter | Type | Required | Meaning |
-| --------- | ---- | -------- | ------- |
-| `topic` | string | yes | Name of the topic to create |
-| `partitions` | int | no | Omit for the broker default on Kafka 2.4+. Can grow later, never shrink |
-| `replication_factor` | int | no | Omit for the broker default on Kafka 2.4+. Cannot exceed the broker count |
-| `configs` | map | no | Topic-level config, such as `retention.ms` or `cleanup.policy` |
-| `confirm` | bool | no | Default false: the broker validates the request and creates nothing |
-| `items` | object[] | no | Up to 100 topic specifications; `confirm` stays top-level |
+| Parameter | Type     | Required | Meaning                                                             |
+| --------- | -------- | -------- | ------------------------------------------------------------------- |
+| `items`   | object[] | yes      | 1 to 100 topics to create                                           |
+| `confirm` | bool     | no       | Default false: the broker validates the requests and creates nothing |
+
+Item fields:
+
+| Field                | Type   | Required | Meaning                                                                  |
+| -------------------- | ------ | -------- | ------------------------------------------------------------------------ |
+| `topic`              | string | yes      | Name of the topic to create                                              |
+| `partitions`         | int    | no       | Omit for the broker default on Kafka 2.4+. Can grow later, never shrink   |
+| `replication_factor` | int    | no       | Omit for the broker default on Kafka 2.4+. Cannot exceed the broker count |
+| `configs`            | map    | no       | Topic-level config, such as `retention.ms` or `cleanup.policy`           |
 
 Without `confirm` the request is sent to the broker with `ValidateOnly`, so the
 preview reports the cluster's own answer — an invalid name, an unknown config
@@ -689,17 +742,24 @@ never modifies a topic it did not create.
 
 ### `commit_offset`
 
-Moves a consumer group's committed offset for one partition. Forward to skip
-messages, backward to replay them. **Irreversible** in the sense that skipped
-messages are never processed. Not exposed on a read-only endpoint.
+Moves consumer groups' committed offsets. Forward to skip messages, backward to
+replay them. **Irreversible** in the sense that skipped messages are never
+processed. Not exposed on a read-only endpoint.
 
-| Parameter | Type | Required | Meaning |
-| --------- | ---- | -------- | ------- |
-| `topic`, `group`, `partition` | | yes | What to move |
-| `offset` | int | yes | The offset the group reads next. To skip offset 42, commit 43 |
-| `confirm` | bool | no | Default false: preview only, nothing changes |
-| `allow_active_members` | bool | no | Proceed despite running consumers |
-| `items` | object[] | no | Up to 100 offset moves; active-member acknowledgement is per item |
+| Parameter | Type     | Required | Meaning                                      |
+| --------- | -------- | -------- | -------------------------------------------- |
+| `items`   | object[] | yes      | 1 to 100 offsets to move                     |
+| `confirm` | bool     | no       | Default false: preview only, nothing changes |
+
+Item fields:
+
+| Field                  | Type   | Required | Meaning                                                       |
+| ---------------------- | ------ | -------- | ------------------------------------------------------------- |
+| `topic`                | string | yes      | Topic whose offset is moving                                  |
+| `group`                | string | yes      | Consumer group to move                                        |
+| `partition`            | int    | yes      | Partition to move                                             |
+| `offset`               | int    | yes      | The offset the group reads next. To skip offset 42, commit 43 |
+| `allow_active_members` | bool   | no       | Proceed despite running consumers                             |
 
 The group must have no active members. A running consumer keeps its position in
 memory and only reads the committed offset when it joins, so a commit made
@@ -708,17 +768,23 @@ Stop the consumers first.
 
 ### `copy_message`
 
-Copies one message to another topic, preserving key, value and headers. Takes
-the message's address, never its content, so it can only duplicate a message
-the cluster already holds.
+Copies messages to another topic, preserving key, value and headers. Takes each
+message's address, never its content, so it can only duplicate a message the
+cluster already holds.
 
-| Parameter | Type | Required | Meaning |
-| --------- | ---- | -------- | ------- |
-| `source_topic`, `source_partition`, `source_offset` | | yes | Message to copy |
-| `destination_topic` | string | yes | Where to write it. Must already exist |
-| `destination_cluster` | string | no | Another cluster to write to. Defaults to this endpoint's own |
-| `confirm` | bool | no | Default false: preview only, nothing is written |
-| `items` | object[] | no | Up to 20 copies; destination and preview limit are per item |
+| Parameter | Type     | Required | Meaning                                         |
+| --------- | -------- | -------- | ----------------------------------------------- |
+| `items`   | object[] | yes      | 1 to 20 copies to make                          |
+| `confirm` | bool     | no       | Default false: preview only, nothing is written |
+
+Item fields:
+
+| Field                                               | Type   | Required | Meaning                                                      |
+| --------------------------------------------------- | ------ | -------- | ------------------------------------------------------------ |
+| `source_topic`, `source_partition`, `source_offset` |        | yes      | Message to copy                                              |
+| `destination_topic`                                 | string | yes      | Where to write it. Must already exist                        |
+| `destination_cluster`                               | string | no       | Another cluster to write to. Defaults to this endpoint's own  |
+| `max_value_bytes`                                   | int    | no       | Preview value limit. The whole value is always copied         |
 
 Set `destination_cluster` to copy into another cluster this server serves,
 which is how a production message is taken into a preproduction topic to be
@@ -739,11 +805,52 @@ destination cluster is writable when it has at least one writable endpoint;
 when the destination is read-only, preview included, because writing is all it
 does.
 
+### `produce_message`
+
+Writes new messages to existing topics. Unlike `copy_message`, the caller
+supplies the content, so this can put a message into a topic that no producer
+ever sent.
+
+| Parameter | Type     | Required | Meaning                                         |
+| --------- | -------- | -------- | ----------------------------------------------- |
+| `items`   | object[] | yes      | 1 to 20 messages to write                       |
+| `confirm` | bool     | no       | Default false: preview only, nothing is written |
+
+Item fields:
+
+| Field                 | Type   | Required | Meaning                                                     |
+| --------------------- | ------ | -------- | ----------------------------------------------------------- |
+| `topic`               | string | yes      | Existing topic to write to                                  |
+| `value`               | string | yes      | The message body                                            |
+| `key`                 | string | no       | Decides the partition when `partition` is omitted           |
+| `headers`             | object | no       | Header name to value                                        |
+| `partition`           | int    | no       | Exact partition. Omit to let the key decide                 |
+| `encoding`            | string | no       | `utf8` (default) or `base64` for binary payloads            |
+| `destination_cluster` | string | no       | Another cluster to write to. Defaults to this endpoint's own |
+| `max_value_bytes`     | int    | no       | Preview value limit. The whole value is always written       |
+
+Every message carries `kafka-mcp-produced-at`, `kafka-mcp-produced-by-tool`,
+`kafka-mcp-produced-by-principal` and, when the client identifies itself,
+`kafka-mcp-produced-by-client`, so a fabricated message stays distinguishable
+from a genuine one. A header the caller supplies under one of those names is
+kept as given and the collision is reported.
+
+The topic must already exist: a missing one is refused rather than left to
+auto-creation. Omit `partition` unless the exact partition is the point — the
+key decides placement, and naming a partition puts a keyed message where its
+key does not hash to, which breaks ordering for that key. The response warns
+whenever an explicit partition is used.
+
+`read_only` protects the cluster being written to, so a read-only endpoint may
+still produce into a different, writable cluster, and is refused outright —
+preview included — when writing to its own. A produced message cannot be
+deleted; it stays until retention removes it.
+
 ## Skills
 
 `skills/kafka-debugging/SKILL.md` is the one skill an agent loads. It routes to
 the scenario guides under `skills/kafka-debugging/references/`, rather than
-holding all five workflows itself, so a session reads only the one it needs:
+holding all six workflows itself, so a session reads only the one it needs:
 
 - `find-message.md` — locating a message from something the user knows about it.
 - `check-lag.md` — measuring lag and throughput, and judging when a backlog will
@@ -754,6 +861,8 @@ holding all five workflows itself, so a session reads only the one it needs:
   process, preserving the message first.
 - `create-topic.md` — creating a topic with a partition count and retention
   chosen on purpose, including as a `copy_message` destination.
+- `produce-message.md` — writing a message: repairing and re-injecting one,
+  reproducing a failure in another cluster, or seeding a topic.
 
 The umbrella also resolves the overlap between them: "the consumer is behind"
 opens three of these guides, and `consumer_lag`'s `status` is what decides which

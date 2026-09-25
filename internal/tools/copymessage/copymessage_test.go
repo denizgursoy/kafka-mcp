@@ -1,6 +1,7 @@
 package copymessage_test
 
 import (
+	"errors"
 	"testing"
 
 	"github.com/stretchr/testify/suite"
@@ -120,6 +121,38 @@ func (s *CopyMessageSuite) read(topic string, offset int64) (string, string, map
 	return s.readOn(s.env, topic, offset)
 }
 
+// copyOne copies one message and returns that item's result.
+//
+// Every call is a batch, so a single copy is an items array of length one, and a
+// failure for it arrives as the item's error rather than as an error for the
+// call. Structural refusals, such as a read-only destination, still fail the
+// call.
+func (s *CopyMessageSuite) copyOne(
+	clusters *kafkaclient.Registry,
+	own string,
+	confirm bool,
+	item copymessage.Item,
+) (copymessage.Output, error) {
+	s.T().Helper()
+
+	out, err := copymessage.Run(s.T().Context(), clusters, own, copymessage.Input{
+		Items:   []copymessage.Item{item},
+		Confirm: confirm,
+	})
+	if err != nil {
+		return copymessage.Output{}, err
+	}
+
+	s.Require().Len(out.Results, 1,
+		"one item in must produce exactly one result out, or results cannot be matched to inputs by position")
+
+	if out.Results[0].Error != "" {
+		return copymessage.Output{}, errors.New(out.Results[0].Error)
+	}
+
+	return *out.Results[0].Result, nil
+}
+
 func (s *CopyMessageSuite) TestCopiesTheMessageIntact() {
 	source := s.env.CreateTopic(s.T(), "copy-source")
 	destination := s.env.CreateTopic(s.T(), "copy-destination")
@@ -130,18 +163,12 @@ func (s *CopyMessageSuite) TestCopiesTheMessageIntact() {
 		Headers: map[string]string{"correlation-id": "corr-7"},
 	})
 
-	out, err := copymessage.Run(
-		s.T().Context(),
-		s.client(false),
-		"here",
-		copymessage.Input{
-			SourceTopic:      source,
-			SourcePartition:  0,
-			SourceOffset:     0,
-			DestinationTopic: destination,
-			Confirm:          true,
-		},
-	)
+	out, err := s.copyOne(s.client(false), "here", true, copymessage.Item{
+		SourceTopic:      source,
+		SourcePartition:  0,
+		SourceOffset:     0,
+		DestinationTopic: destination,
+	})
 
 	s.Require().NoError(err, "copying an existing message must succeed")
 	s.Require().True(out.Applied, "a copy that happened must be reported as applied")
@@ -173,18 +200,12 @@ func (s *CopyMessageSuite) TestAddsProvenanceHeaders() {
 		testenv.Message{Key: "k", Value: "second"},
 	)
 
-	_, err := copymessage.Run(
-		s.T().Context(),
-		s.client(false),
-		"here",
-		copymessage.Input{
-			SourceTopic:      source,
-			SourcePartition:  0,
-			SourceOffset:     1,
-			DestinationTopic: destination,
-			Confirm:          true,
-		},
-	)
+	_, err := s.copyOne(s.client(false), "here", true, copymessage.Item{
+		SourceTopic:      source,
+		SourcePartition:  0,
+		SourceOffset:     1,
+		DestinationTopic: destination,
+	})
 
 	s.Require().NoError(err, "copying must succeed")
 
@@ -218,18 +239,12 @@ func (s *CopyMessageSuite) TestOriginalHeadersWinOnCollision() {
 		Headers: map[string]string{"kafka-mcp-copied-from-topic": "an-earlier-topic"},
 	})
 
-	out, err := copymessage.Run(
-		s.T().Context(),
-		s.client(false),
-		"here",
-		copymessage.Input{
-			SourceTopic:      source,
-			SourcePartition:  0,
-			SourceOffset:     0,
-			DestinationTopic: destination,
-			Confirm:          true,
-		},
-	)
+	out, err := s.copyOne(s.client(false), "here", true, copymessage.Item{
+		SourceTopic:      source,
+		SourcePartition:  0,
+		SourceOffset:     0,
+		DestinationTopic: destination,
+	})
 
 	s.Require().NoError(err, "copying a message that already carries provenance must succeed")
 
@@ -247,17 +262,12 @@ func (s *CopyMessageSuite) TestDryRunWritesNothing() {
 
 	s.env.Produce(s.T(), source, testenv.Message{Key: "k", Value: "payload"})
 
-	out, err := copymessage.Run(
-		s.T().Context(),
-		s.client(false),
-		"here",
-		copymessage.Input{
-			SourceTopic:      source,
-			SourcePartition:  0,
-			SourceOffset:     0,
-			DestinationTopic: destination,
-		},
-	)
+	out, err := s.copyOne(s.client(false), "here", false, copymessage.Item{
+		SourceTopic:      source,
+		SourcePartition:  0,
+		SourceOffset:     0,
+		DestinationTopic: destination,
+	})
 
 	s.Require().NoError(err, "a dry run against a valid request must succeed")
 	s.Require().False(out.Applied,
@@ -274,17 +284,12 @@ func (s *CopyMessageSuite) TestReadOnlyRefusesEvenADryRun() {
 
 	s.env.Produce(s.T(), source, testenv.Message{Value: "payload"})
 
-	_, err := copymessage.Run(
-		s.T().Context(),
-		s.client(true),
-		"here",
-		copymessage.Input{
-			SourceTopic:      source,
-			SourcePartition:  0,
-			SourceOffset:     0,
-			DestinationTopic: destination,
-		},
-	)
+	_, err := s.copyOne(s.client(true), "here", false, copymessage.Item{
+		SourceTopic:      source,
+		SourcePartition:  0,
+		SourceOffset:     0,
+		DestinationTopic: destination,
+	})
 
 	s.Require().Error(err,
 		"a read-only server must refuse this tool outright: its only purpose is to write, so a preview would offer a capability the server does not have")
@@ -299,21 +304,17 @@ func (s *CopyMessageSuite) TestErrorsWhenTheDestinationDoesNotExist() {
 
 	s.env.Produce(s.T(), source, testenv.Message{Value: "payload"})
 
-	_, err := copymessage.Run(
-		s.T().Context(),
-		s.client(false),
-		"here",
-		copymessage.Input{
-			SourceTopic:      source,
-			SourcePartition:  0,
-			SourceOffset:     0,
-			DestinationTopic: s.env.UniqueName("never-created"),
-			Confirm:          true,
-		},
-	)
+	_, err := s.copyOne(s.client(false), "here", true, copymessage.Item{
+		SourceTopic:      source,
+		SourcePartition:  0,
+		SourceOffset:     0,
+		DestinationTopic: s.env.UniqueName("never-created"),
+	})
 
 	s.Require().Error(err,
 		"the destination must already exist: creating it silently would hide a typo and scatter messages into topics nobody meant to make")
+	s.Require().Contains(err.Error(), "does not exist",
+		"the caller must be told the topic is missing in words they can act on, not handed the broker's UNKNOWN_TOPIC_OR_PARTITION code")
 }
 
 func (s *CopyMessageSuite) TestErrorsWhenTheSourceOffsetDoesNotExist() {
@@ -322,18 +323,12 @@ func (s *CopyMessageSuite) TestErrorsWhenTheSourceOffsetDoesNotExist() {
 
 	s.env.Produce(s.T(), source, testenv.Message{Value: "only one"})
 
-	_, err := copymessage.Run(
-		s.T().Context(),
-		s.client(false),
-		"here",
-		copymessage.Input{
-			SourceTopic:      source,
-			SourcePartition:  0,
-			SourceOffset:     99,
-			DestinationTopic: destination,
-			Confirm:          true,
-		},
-	)
+	_, err := s.copyOne(s.client(false), "here", true, copymessage.Item{
+		SourceTopic:      source,
+		SourcePartition:  0,
+		SourceOffset:     99,
+		DestinationTopic: destination,
+	})
 
 	s.Require().Error(err,
 		"an offset that holds no message must fail rather than write an empty copy that looks like a real message")
@@ -346,18 +341,12 @@ func (s *CopyMessageSuite) TestErrorsWhenSourceAndDestinationAreTheSame() {
 
 	s.env.Produce(s.T(), source, testenv.Message{Value: "payload"})
 
-	_, err := copymessage.Run(
-		s.T().Context(),
-		s.client(false),
-		"here",
-		copymessage.Input{
-			SourceTopic:      source,
-			SourcePartition:  0,
-			SourceOffset:     0,
-			DestinationTopic: source,
-			Confirm:          true,
-		},
-	)
+	_, err := s.copyOne(s.client(false), "here", true, copymessage.Item{
+		SourceTopic:      source,
+		SourcePartition:  0,
+		SourceOffset:     0,
+		DestinationTopic: source,
+	})
 
 	s.Require().Error(err,
 		"copying a topic onto itself appends a duplicate to the topic being debugged, which is never what the caller meant")
@@ -373,19 +362,13 @@ func (s *CopyMessageSuite) TestCopiesToAnotherCluster() {
 		Headers: map[string]string{"correlation-id": "corr-42"},
 	})
 
-	out, err := copymessage.Run(
-		s.T().Context(),
-		s.clusters(false, false),
-		"here",
-		copymessage.Input{
-			SourceTopic:        source,
-			SourcePartition:    0,
-			SourceOffset:       0,
-			DestinationTopic:   destination,
-			DestinationCluster: "there",
-			Confirm:            true,
-		},
-	)
+	out, err := s.copyOne(s.clusters(false, false), "here", true, copymessage.Item{
+		SourceTopic:        source,
+		SourcePartition:    0,
+		SourceOffset:       0,
+		DestinationTopic:   destination,
+		DestinationCluster: "there",
+	})
 
 	s.Require().NoError(err, "copying to another cluster must succeed")
 	s.Require().True(out.Applied, "a copy that happened must be reported as applied")
@@ -418,19 +401,13 @@ func (s *CopyMessageSuite) TestRefusesAReadOnlyDestinationCluster() {
 
 	s.env.Produce(s.T(), source, testenv.Message{Value: "payload"})
 
-	_, err := copymessage.Run(
-		s.T().Context(),
-		s.clusters(false, true),
-		"here",
-		copymessage.Input{
-			SourceTopic:        source,
-			SourcePartition:    0,
-			SourceOffset:       0,
-			DestinationTopic:   destination,
-			DestinationCluster: "there",
-			Confirm:            true,
-		},
-	)
+	_, err := s.copyOne(s.clusters(false, true), "here", true, copymessage.Item{
+		SourceTopic:        source,
+		SourcePartition:    0,
+		SourceOffset:       0,
+		DestinationTopic:   destination,
+		DestinationCluster: "there",
+	})
 
 	s.Require().Error(err,
 		"read_only protects the cluster being written to, so a read-only destination must refuse the copy")
@@ -446,19 +423,13 @@ func (s *CopyMessageSuite) TestAllowsAReadOnlySourceCluster() {
 
 	s.env.Produce(s.T(), source, testenv.Message{Value: "payload"})
 
-	out, err := copymessage.Run(
-		s.T().Context(),
-		s.clusters(true, false),
-		"here",
-		copymessage.Input{
-			SourceTopic:        source,
-			SourcePartition:    0,
-			SourceOffset:       0,
-			DestinationTopic:   destination,
-			DestinationCluster: "there",
-			Confirm:            true,
-		},
-	)
+	out, err := s.copyOne(s.clusters(true, false), "here", true, copymessage.Item{
+		SourceTopic:        source,
+		SourcePartition:    0,
+		SourceOffset:       0,
+		DestinationTopic:   destination,
+		DestinationCluster: "there",
+	})
 
 	s.Require().NoError(err,
 		"copying out of a read-only cluster changes nothing there, so it must be allowed: this is how a message is rescued from production")
@@ -472,19 +443,13 @@ func (s *CopyMessageSuite) TestErrorsOnAnUnknownDestinationCluster() {
 
 	s.env.Produce(s.T(), source, testenv.Message{Value: "payload"})
 
-	_, err := copymessage.Run(
-		s.T().Context(),
-		s.clusters(false, false),
-		"here",
-		copymessage.Input{
-			SourceTopic:        source,
-			SourcePartition:    0,
-			SourceOffset:       0,
-			DestinationTopic:   "anything",
-			DestinationCluster: "never-configured",
-			Confirm:            true,
-		},
-	)
+	_, err := s.copyOne(s.clusters(false, false), "here", true, copymessage.Item{
+		SourceTopic:        source,
+		SourcePartition:    0,
+		SourceOffset:       0,
+		DestinationTopic:   "anything",
+		DestinationCluster: "never-configured",
+	})
 
 	s.Require().Error(err,
 		"a destination cluster that does not exist must fail by name, so the caller can correct it from list_clusters rather than guess")
@@ -500,13 +465,15 @@ func (s *CopyMessageSuite) TestBatchCopiesSeveralMessagesInInputOrder() {
 		testenv.Message{Value: "second"},
 	)
 
-	out, err := copymessage.RunBatch(
+	out, err := copymessage.Run(
 		s.T().Context(), s.client(false), "here",
-		[]copymessage.Item{
-			{SourceTopic: source, SourcePartition: 0, SourceOffset: 0, DestinationTopic: destination},
-			{SourceTopic: source, SourcePartition: 0, SourceOffset: 1, DestinationTopic: destination},
+		copymessage.Input{
+			Items: []copymessage.Item{
+				{SourceTopic: source, SourcePartition: 0, SourceOffset: 0, DestinationTopic: destination},
+				{SourceTopic: source, SourcePartition: 0, SourceOffset: 1, DestinationTopic: destination},
+			},
+			Confirm: true,
 		},
-		true,
 	)
 
 	s.Require().NoError(err, "copying a valid batch must succeed")

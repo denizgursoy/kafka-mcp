@@ -1,6 +1,7 @@
 package createtopic_test
 
 import (
+	"errors"
 	"testing"
 
 	"github.com/stretchr/testify/suite"
@@ -27,14 +28,41 @@ func (s *CreateTopicSuite) TearDownSuite() {
 	s.env.Stop()
 }
 
-func (s *CreateTopicSuite) TestPreviewCreatesNothing() {
-	topic := s.env.UniqueName("create-preview")
+// create creates one topic and returns that item's result.
+//
+// Every call is a batch, so a single topic is an items array of length one, and
+// a failure for it arrives as the item's error rather than as an error for the
+// call. Structural problems, such as an empty items array, still fail the call.
+func (s *CreateTopicSuite) create(
+	readOnly bool,
+	confirm bool,
+	item createtopic.Item,
+) (createtopic.Output, error) {
+	s.T().Helper()
 
 	out, err := createtopic.Run(
 		s.T().Context(),
-		s.env.ClusterClient(s.T(), false),
-		createtopic.Input{Topic: topic, Partitions: 3, ReplicationFactor: 1},
+		s.env.ClusterClient(s.T(), readOnly),
+		createtopic.Input{Items: []createtopic.Item{item}, Confirm: confirm},
 	)
+	if err != nil {
+		return createtopic.Output{}, err
+	}
+
+	s.Require().Len(out.Results, 1,
+		"one item in must produce exactly one result out, or results cannot be matched to inputs by position")
+
+	if out.Results[0].Error != "" {
+		return createtopic.Output{}, errors.New(out.Results[0].Error)
+	}
+
+	return *out.Results[0].Result, nil
+}
+
+func (s *CreateTopicSuite) TestPreviewCreatesNothing() {
+	topic := s.env.UniqueName("create-preview")
+
+	out, err := s.create(false, false, createtopic.Item{Topic: topic, Partitions: 3, ReplicationFactor: 1})
 
 	s.Require().NoError(err,
 		"a valid request must preview successfully, because that is how the caller learns it would work")
@@ -56,11 +84,7 @@ func (s *CreateTopicSuite) TestConfirmCreatesTheTopic() {
 	topic := s.env.UniqueName("create-confirm")
 	defer s.env.DeleteTopics(s.T(), topic)
 
-	out, err := createtopic.Run(
-		s.T().Context(),
-		s.env.ClusterClient(s.T(), false),
-		createtopic.Input{Topic: topic, Partitions: 3, ReplicationFactor: 1, Confirm: true},
-	)
+	out, err := s.create(false, true, createtopic.Item{Topic: topic, Partitions: 3, ReplicationFactor: 1})
 
 	s.Require().NoError(err, "a confirmed request against a valid broker must succeed")
 
@@ -83,17 +107,12 @@ func (s *CreateTopicSuite) TestCreatesWithTopicConfigs() {
 	topic := s.env.UniqueName("create-configs")
 	defer s.env.DeleteTopics(s.T(), topic)
 
-	_, err := createtopic.Run(
-		s.T().Context(),
-		s.env.ClusterClient(s.T(), false),
-		createtopic.Input{
-			Topic:             topic,
-			Partitions:        1,
-			ReplicationFactor: 1,
-			Configs:           map[string]string{"retention.ms": "60000"},
-			Confirm:           true,
-		},
-	)
+	_, err := s.create(false, true, createtopic.Item{
+		Topic:             topic,
+		Partitions:        1,
+		ReplicationFactor: 1,
+		Configs:           map[string]string{"retention.ms": "60000"},
+	})
 
 	s.Require().NoError(err, "creating a topic with a valid config must succeed")
 	s.Require().Equal("60000", s.env.TopicConfig(s.T(), topic, "retention.ms"),
@@ -104,11 +123,7 @@ func (s *CreateTopicSuite) TestOmittedCountsUseBrokerDefaults() {
 	topic := s.env.UniqueName("create-defaults")
 	defer s.env.DeleteTopics(s.T(), topic)
 
-	out, err := createtopic.Run(
-		s.T().Context(),
-		s.env.ClusterClient(s.T(), false),
-		createtopic.Input{Topic: topic, Confirm: true},
-	)
+	out, err := s.create(false, true, createtopic.Item{Topic: topic})
 
 	s.Require().NoError(err,
 		"omitting the counts must mean the broker's defaults, not a rejected request: a caller who does not care should not have to guess")
@@ -124,11 +139,7 @@ func (s *CreateTopicSuite) TestOmittedCountsUseBrokerDefaults() {
 func (s *CreateTopicSuite) TestRefusesATopicThatAlreadyExists() {
 	topic := s.env.CreateTopicWithPartitions(s.T(), "create-existing", 2)
 
-	_, err := createtopic.Run(
-		s.T().Context(),
-		s.env.ClusterClient(s.T(), false),
-		createtopic.Input{Topic: topic, Partitions: 5, ReplicationFactor: 1, Confirm: true},
-	)
+	_, err := s.create(false, true, createtopic.Item{Topic: topic, Partitions: 5, ReplicationFactor: 1})
 
 	s.Require().Error(err,
 		"an existing topic must fail loudly: silently succeeding would let a caller believe a topic has settings it does not have")
@@ -142,11 +153,7 @@ func (s *CreateTopicSuite) TestRefusesATopicThatAlreadyExists() {
 func (s *CreateTopicSuite) TestReadOnlyRefusesEvenThePreview() {
 	topic := s.env.UniqueName("create-read-only")
 
-	_, err := createtopic.Run(
-		s.T().Context(),
-		s.env.ClusterClient(s.T(), true),
-		createtopic.Input{Topic: topic, Partitions: 1, ReplicationFactor: 1},
-	)
+	_, err := s.create(true, false, createtopic.Item{Topic: topic, Partitions: 1, ReplicationFactor: 1})
 
 	s.Require().Error(err,
 		"creating a topic is the tool's only purpose, so a read-only cluster must refuse outright: previewing a capability the server does not have is misleading")
@@ -157,11 +164,7 @@ func (s *CreateTopicSuite) TestReadOnlyRefusesEvenThePreview() {
 }
 
 func (s *CreateTopicSuite) TestErrorsOnMissingTopicName() {
-	_, err := createtopic.Run(
-		s.T().Context(),
-		s.env.ClusterClient(s.T(), false),
-		createtopic.Input{Partitions: 1, Confirm: true},
-	)
+	_, err := s.create(false, true, createtopic.Item{Partitions: 1})
 
 	s.Require().Error(err,
 		"an empty name must be refused here rather than sent to the broker, which would answer with an error no caller can act on")
@@ -170,11 +173,7 @@ func (s *CreateTopicSuite) TestErrorsOnMissingTopicName() {
 func (s *CreateTopicSuite) TestDoesNotRewriteTheTopicName() {
 	topic := " " + s.env.UniqueName("create-spaced") + " "
 
-	out, err := createtopic.Run(
-		s.T().Context(),
-		s.env.ClusterClient(s.T(), false),
-		createtopic.Input{Topic: topic, Partitions: 1, ReplicationFactor: 1},
-	)
+	out, err := s.create(false, false, createtopic.Item{Topic: topic, Partitions: 1, ReplicationFactor: 1})
 
 	s.Require().NoError(err,
 		"this broker accepts the name, so the preview should report its own validation result rather than imposing a different naming policy")
@@ -184,28 +183,20 @@ func (s *CreateTopicSuite) TestDoesNotRewriteTheTopicName() {
 
 func (s *CreateTopicSuite) TestErrorsOnCountsKafkaCannotRepresent() {
 	s.Run("partition count exceeds Kafka's int32 field", func() {
-		_, err := createtopic.Run(
-			s.T().Context(),
-			s.env.ClusterClient(s.T(), false),
-			createtopic.Input{
-				Topic:      s.env.UniqueName("create-too-many-partitions"),
-				Partitions: int(^uint32(0)>>1) + 1,
-			},
-		)
+		_, err := s.create(false, false, createtopic.Item{
+			Topic:      s.env.UniqueName("create-too-many-partitions"),
+			Partitions: int(^uint32(0)>>1) + 1,
+		})
 
 		s.Require().Error(err,
 			"a partition count that overflows Kafka's int32 request field must be rejected instead of wrapping to a negative number")
 	})
 
 	s.Run("replication factor exceeds Kafka's int16 field", func() {
-		_, err := createtopic.Run(
-			s.T().Context(),
-			s.env.ClusterClient(s.T(), false),
-			createtopic.Input{
-				Topic:             s.env.UniqueName("create-too-many-replicas"),
-				ReplicationFactor: int(^uint16(0)>>1) + 1,
-			},
-		)
+		_, err := s.create(false, false, createtopic.Item{
+			Topic:             s.env.UniqueName("create-too-many-replicas"),
+			ReplicationFactor: int(^uint16(0)>>1) + 1,
+		})
 
 		s.Require().Error(err,
 			"a replication factor that overflows Kafka's int16 request field must be rejected instead of wrapping to a negative number")
@@ -215,11 +206,7 @@ func (s *CreateTopicSuite) TestErrorsOnCountsKafkaCannotRepresent() {
 func (s *CreateTopicSuite) TestPreviewSurfacesABrokerRejection() {
 	topic := s.env.UniqueName("create-invalid-rf")
 
-	_, err := createtopic.Run(
-		s.T().Context(),
-		s.env.ClusterClient(s.T(), false),
-		createtopic.Input{Topic: topic, Partitions: 1, ReplicationFactor: 5},
-	)
+	_, err := s.create(false, false, createtopic.Item{Topic: topic, Partitions: 1, ReplicationFactor: 5})
 
 	s.Require().Error(err,
 		"the test broker has one node, so a replication factor of 5 is impossible and the preview must say so instead of reporting it would work")
@@ -233,13 +220,15 @@ func (s *CreateTopicSuite) TestBatchCreatesSeveralTopics() {
 	second := s.env.UniqueName("create-batch-second")
 	defer s.env.DeleteTopics(s.T(), first, second)
 
-	out, err := createtopic.RunBatch(
+	out, err := createtopic.Run(
 		s.T().Context(), s.env.ClusterClient(s.T(), false),
-		[]createtopic.Item{
-			{Topic: first, Partitions: 1, ReplicationFactor: 1},
-			{Topic: second, Partitions: 2, ReplicationFactor: 1},
+		createtopic.Input{
+			Items: []createtopic.Item{
+				{Topic: first, Partitions: 1, ReplicationFactor: 1},
+				{Topic: second, Partitions: 2, ReplicationFactor: 1},
+			},
+			Confirm: true,
 		},
-		true,
 	)
 
 	s.Require().NoError(err, "creating a structurally valid batch must succeed")

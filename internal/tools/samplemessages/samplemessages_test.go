@@ -1,6 +1,7 @@
 package samplemessages_test
 
 import (
+	"errors"
 	"testing"
 
 	"github.com/stretchr/testify/suite"
@@ -28,6 +29,41 @@ func (s *SampleMessagesSuite) TearDownSuite() {
 	s.env.Stop()
 }
 
+// sample samples one topic and returns that item's result.
+//
+// Every call is a batch, so a single topic is an items array of length one, and
+// a failure for that topic arrives as the item's error rather than as an error
+// for the call.
+func (s *SampleMessagesSuite) sample(item samplemessages.Item) (samplemessages.Output, error) {
+	s.T().Helper()
+
+	return s.sampleWith(s.env.Reader(), item)
+}
+
+func (s *SampleMessagesSuite) sampleWith(
+	reader *records.Reader,
+	item samplemessages.Item,
+) (samplemessages.Output, error) {
+	s.T().Helper()
+
+	out, err := samplemessages.Run(
+		s.T().Context(), s.env.Admin(), reader,
+		samplemessages.Input{Items: []samplemessages.Item{item}},
+	)
+	if err != nil {
+		return samplemessages.Output{}, err
+	}
+
+	s.Require().Len(out.Results, 1,
+		"one item in must produce exactly one result out, or results cannot be matched to inputs by position")
+
+	if out.Results[0].Error != "" {
+		return samplemessages.Output{}, errors.New(out.Results[0].Error)
+	}
+
+	return *out.Results[0].Result, nil
+}
+
 func (s *SampleMessagesSuite) TestReportsJSONFieldsAndTypes() {
 	topic := s.env.CreateTopic(s.T(), "sample-fields")
 
@@ -42,12 +78,7 @@ func (s *SampleMessagesSuite) TestReportsJSONFieldsAndTypes() {
 		},
 	)
 
-	out, err := samplemessages.Run(
-		s.T().Context(),
-		s.env.Admin(),
-		s.env.Reader(),
-		samplemessages.Input{Topic: topic},
-	)
+	out, err := s.sample(samplemessages.Item{Topic: topic})
 
 	s.Require().NoError(err, "sampling a topic of JSON messages must succeed")
 	s.Require().Equal(2, out.ValueFormats.JSON,
@@ -92,12 +123,7 @@ func (s *SampleMessagesSuite) TestDetectsKeyInsideValue() {
 		},
 	)
 
-	out, err := samplemessages.Run(
-		s.T().Context(),
-		s.env.Admin(),
-		s.env.Reader(),
-		samplemessages.Input{Topic: topic},
-	)
+	out, err := s.sample(samplemessages.Item{Topic: topic})
 
 	s.Require().NoError(err, "sampling must succeed")
 	s.Require().Equal([]string{"payload.orderId"}, out.KeyInValue,
@@ -118,12 +144,7 @@ func (s *SampleMessagesSuite) TestReportsAbsentKeys() {
 		testenv.Message{Value: `{"a":2}`},
 	)
 
-	out, err := samplemessages.Run(
-		s.T().Context(),
-		s.env.Admin(),
-		s.env.Reader(),
-		samplemessages.Input{Topic: topic},
-	)
+	out, err := s.sample(samplemessages.Item{Topic: topic})
 
 	s.Require().NoError(err, "sampling a keyless topic must succeed")
 	s.Require().Equal(2, out.KeyStats.Absent,
@@ -140,12 +161,7 @@ func (s *SampleMessagesSuite) TestReportsNonJSONFormats() {
 		testenv.Message{Value: "plain log line two"},
 	)
 
-	out, err := samplemessages.Run(
-		s.T().Context(),
-		s.env.Admin(),
-		s.env.Reader(),
-		samplemessages.Input{Topic: topic},
-	)
+	out, err := s.sample(samplemessages.Item{Topic: topic})
 
 	s.Require().NoError(err, "sampling a plain-text topic must succeed")
 	s.Require().Equal(2, out.ValueFormats.Text,
@@ -169,12 +185,7 @@ func (s *SampleMessagesSuite) TestSamplesTheNewestMessages() {
 
 	s.env.Produce(s.T(), topic, messages...)
 
-	out, err := samplemessages.Run(
-		s.T().Context(),
-		s.env.Admin(),
-		s.env.Reader(),
-		samplemessages.Input{Topic: topic, SampleSize: 5},
-	)
+	out, err := s.sample(samplemessages.Item{Topic: topic, SampleSize: 5})
 
 	s.Require().NoError(err, "sampling with a size limit must succeed")
 	s.Require().Len(out.Messages, 5,
@@ -201,12 +212,7 @@ func (s *SampleMessagesSuite) TestSamplesEveryPartition() {
 		testenv.Message{Value: `{"p":2}`, Partition: 2},
 	)
 
-	out, err := samplemessages.Run(
-		s.T().Context(),
-		s.env.Admin(),
-		s.env.Reader(),
-		samplemessages.Input{Topic: topic},
-	)
+	out, err := s.sample(samplemessages.Item{Topic: topic})
 
 	s.Require().NoError(err, "sampling a multi-partition topic must succeed")
 	s.Require().Len(out.Messages, 3,
@@ -224,12 +230,7 @@ func (s *SampleMessagesSuite) TestSamplesEveryPartition() {
 func (s *SampleMessagesSuite) TestEmptyTopicSamplesNothing() {
 	topic := s.env.CreateTopic(s.T(), "sample-empty")
 
-	out, err := samplemessages.Run(
-		s.T().Context(),
-		s.env.Admin(),
-		s.env.Reader(),
-		samplemessages.Input{Topic: topic},
-	)
+	out, err := s.sample(samplemessages.Item{Topic: topic})
 
 	s.Require().NoError(err, "an empty topic is a normal case, not an error")
 	s.Require().NotNil(out.Messages,
@@ -241,27 +242,20 @@ func (s *SampleMessagesSuite) TestEmptyTopicSamplesNothing() {
 }
 
 func (s *SampleMessagesSuite) TestErrorsOnUnknownTopic() {
-	_, err := samplemessages.Run(
-		s.T().Context(),
-		s.env.Admin(),
-		s.env.Reader(),
-		samplemessages.Input{Topic: s.env.UniqueName("missing")},
-	)
+	_, err := s.sample(samplemessages.Item{Topic: s.env.UniqueName("missing")})
 
 	s.Require().Error(err,
 		"sampling a topic that does not exist must fail rather than look like an empty topic")
 }
 
 func (s *SampleMessagesSuite) TestErrorsWhenBrokerUnreachable() {
-	_, err := samplemessages.Run(
-		s.T().Context(),
-		s.env.Admin(),
+	_, err := s.sampleWith(
 		records.NewReader("127.0.0.1:1"),
-		samplemessages.Input{Topic: "anything"},
+		samplemessages.Item{Topic: "anything"},
 	)
 
 	s.Require().Error(err,
-		"an unreachable broker must surface as an error, not as an empty sample")
+		"an unreachable broker must surface as that item's error, not as an empty sample")
 }
 
 func itoa(n int) string {
@@ -285,9 +279,9 @@ func (s *SampleMessagesSuite) TestBatchSamplesSeveralTopics() {
 	s.env.Produce(s.T(), first, testenv.Message{Value: `{"kind":"first"}`})
 	s.env.Produce(s.T(), second, testenv.Message{Value: "plain text"})
 
-	out, err := samplemessages.RunBatch(
+	out, err := samplemessages.Run(
 		s.T().Context(), s.env.Admin(), s.env.Reader(),
-		[]samplemessages.Item{{Topic: first}, {Topic: second}},
+		samplemessages.Input{Items: []samplemessages.Item{{Topic: first}, {Topic: second}}},
 	)
 
 	s.Require().NoError(err, "sampling a valid topic batch must succeed")

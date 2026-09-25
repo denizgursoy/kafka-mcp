@@ -6,25 +6,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
-
-	"github.com/google/jsonschema-go/jsonschema"
 )
-
-// OutputSchema describes the two response shapes used by a batch-capable MCP
-// tool: its original single result or the batch envelope. Inferring the wrapper
-// struct directly would require both embedded shapes at once.
-func OutputSchema[T any]() *jsonschema.Schema {
-	single, err := jsonschema.For[T](nil)
-	if err != nil {
-		panic(fmt.Sprintf("infer single output schema: %v", err))
-	}
-	many, err := jsonschema.For[Output[T]](nil)
-	if err != nil {
-		panic(fmt.Sprintf("infer batch output schema: %v", err))
-	}
-
-	return &jsonschema.Schema{OneOf: []*jsonschema.Schema{single, many}}
-}
 
 const (
 	// MaxItems bounds metadata and administrative batches.
@@ -44,6 +26,11 @@ type Result[T any] struct {
 // Output reports every item in input order. Batch operations are deliberately
 // non-atomic: Kafka offers no transaction spanning these administrative and
 // record operations.
+//
+// This is the only response shape a batch tool has. A tool used to offer a
+// second, single-target shape alongside it, which meant every field was
+// declared twice and the two drifted; one operation is now an items array of
+// length one.
 type Output[T any] struct {
 	Results   []Result[T] `json:"results"`
 	Succeeded int         `json:"succeeded"`

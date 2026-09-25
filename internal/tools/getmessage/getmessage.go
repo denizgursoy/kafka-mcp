@@ -12,26 +12,21 @@ import (
 	"github.com/denizgursoy/kafka-mcp/internal/domain/records"
 )
 
-// Item is one exact message address in a batch request.
+// Item is one exact message address to read.
 type Item struct {
 	Topic         string `json:"topic" jsonschema:"Topic to read from. Matched exactly and case-sensitively."`
 	Partition     int32  `json:"partition" jsonschema:"Partition to read from."`
 	Offset        int64  `json:"offset" jsonschema:"Exact offset of the message to read."`
-	Context       int    `json:"context,omitempty" jsonschema:"Optional number of messages to also return either side of this offset. Defaults to 0."`
-	MaxValueBytes int    `json:"max_value_bytes,omitempty" jsonschema:"Optional maximum number of value bytes to return per message. Defaults to 4096."`
+	Context       int    `json:"context,omitempty" jsonschema:"Optional number of messages to also return either side of this offset. Defaults to 0. Clamped to what the partition holds."`
+	MaxValueBytes int    `json:"max_value_bytes,omitempty" jsonschema:"Optional maximum number of value bytes to return per message. Defaults to 4096. Values longer than this are cut and flagged with truncated=true."`
 }
 
 // Input is the argument set accepted by the get_message tool.
 type Input struct {
-	Topic         string `json:"topic,omitempty" jsonschema:"Topic to read from for a single operation. Omit when items is used."`
-	Partition     int32  `json:"partition" jsonschema:"Partition to read from."`
-	Offset        int64  `json:"offset" jsonschema:"Exact offset of the message to read."`
-	Context       int    `json:"context,omitempty" jsonschema:"Optional number of messages to also return either side of this offset. Defaults to 0. Clamped to what the partition holds."`
-	MaxValueBytes int    `json:"max_value_bytes,omitempty" jsonschema:"Optional maximum number of value bytes to return per message. Defaults to 4096. Values longer than this are cut and flagged with truncated=true."`
-	Items         []Item `json:"items,omitempty" jsonschema:"Optional batch of 1 to 20 message addresses. Do not combine with the single-operation fields. Results preserve input order and item failures do not hide successful reads."`
+	Items []Item `json:"items" jsonschema:"The message addresses to read, 1 to 20 of them. Reading one message is an array of length one. Results follow this order and an address that cannot be read is reported against its own item."`
 }
 
-// Output is the result returned by the get_message tool.
+// Output is the result returned for one message address.
 type Output struct {
 	Topic   string            `json:"topic"`
 	Message records.Message   `json:"message"`
@@ -41,18 +36,15 @@ type Output struct {
 
 type BatchOutput = batch.Output[Output]
 
-// Response preserves the original single-operation result shape while adding
-// the batch envelope when items is supplied.
-type Response struct {
-	*Output
-	*BatchOutput
-}
-
 const description = `
-Read one Kafka message, or up to 20 addresses through items, and optionally
-nearby messages for context. Returns key, value, headers, timestamp and original
-value size; binary values are base64 encoded. Fails for an invalid partition or
-an offset beyond the partition end.
+Read 1 to 20 Kafka messages at exact addresses in one call through items, and
+optionally nearby messages for context. Returns key, value, headers, timestamp
+and original value size; binary values are base64 encoded.
+
+Results follow items order, each carrying index with result or error, so an
+invalid partition or an offset beyond the partition end is reported against its
+own item rather than failing the call. Reading one message is an items array of
+length one.
 `
 
 // Register adds the get_message tool to the MCP server.
@@ -60,54 +52,37 @@ func Register(server *mcp.Server, reader *records.Reader) {
 	mcp.AddTool(
 		server,
 		&mcp.Tool{
-			Name:         "get_message",
-			Description:  description,
-			OutputSchema: batch.OutputSchema[Output](),
+			Name:        "get_message",
+			Description: description,
 		},
 		func(
 			ctx context.Context,
 			req *mcp.CallToolRequest,
 			input Input,
-		) (*mcp.CallToolResult, Response, error) {
-
-			if input.Items != nil {
-				if input.Topic != "" || input.Partition != 0 || input.Offset != 0 || input.Context != 0 || input.MaxValueBytes != 0 {
-					return nil, Response{}, fmt.Errorf("get message: items cannot be combined with single-operation fields")
-				}
-
-				out, err := RunBatch(ctx, reader, input.Items)
-				if err != nil {
-					return nil, Response{}, fmt.Errorf("get messages: %w", err)
-				}
-
-				return nil, Response{BatchOutput: &out}, nil
-			}
+		) (*mcp.CallToolResult, BatchOutput, error) {
 
 			out, err := Run(ctx, reader, input)
 			if err != nil {
-				return nil, Response{}, fmt.Errorf("get message: %w", err)
+				return nil, BatchOutput{}, fmt.Errorf("get messages: %w", err)
 			}
 
-			return nil, Response{Output: &out}, nil
+			return nil, out, nil
 		},
 	)
 }
 
-// RunBatch reads independent message addresses with bounded concurrency.
-func RunBatch(ctx context.Context, reader *records.Reader, items []Item) (BatchOutput, error) {
-	return batch.Run(ctx, items, batch.MaxHeavyItems, func(ctx context.Context, item Item) (Output, error) {
-		return Run(ctx, reader, Input{
-			Topic: item.Topic, Partition: item.Partition, Offset: item.Offset,
-			Context: item.Context, MaxValueBytes: item.MaxValueBytes,
-		})
+// Run reads every requested address with bounded concurrency.
+func Run(ctx context.Context, reader *records.Reader, input Input) (BatchOutput, error) {
+	return batch.Run(ctx, input.Items, batch.MaxHeavyItems, func(ctx context.Context, item Item) (Output, error) {
+		return get(ctx, reader, item)
 	})
 }
 
-// Run reads the message at an exact offset, plus optional surrounding context.
-func Run(
+// get reads the message at an exact offset, plus optional surrounding context.
+func get(
 	ctx context.Context,
 	reader *records.Reader,
-	input Input,
+	input Item,
 ) (Output, error) {
 
 	if input.Topic == "" {

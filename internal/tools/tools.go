@@ -28,6 +28,7 @@ import (
 	"github.com/denizgursoy/kafka-mcp/internal/tools/listclusters"
 	"github.com/denizgursoy/kafka-mcp/internal/tools/listconsumergroups"
 	"github.com/denizgursoy/kafka-mcp/internal/tools/listtopics"
+	"github.com/denizgursoy/kafka-mcp/internal/tools/producemessage"
 	"github.com/denizgursoy/kafka-mcp/internal/tools/samplemessages"
 	"github.com/denizgursoy/kafka-mcp/internal/tools/searchmessages"
 	"github.com/denizgursoy/kafka-mcp/internal/tools/serverconfig"
@@ -61,6 +62,7 @@ func Names() []string {
 		"list_clusters",
 		"list_consumer_groups",
 		"list_topics",
+		"produce_message",
 		"sample_messages",
 		"search_messages",
 		ServerConfig,
@@ -128,15 +130,16 @@ func Register(
 		endpoint.add("create_topic", func() { createtopic.Register(server, kafka) })
 	}
 
-	// These two need the whole roster rather than one cluster: copy_message so
-	// it can write to another cluster, list_clusters so a caller can discover
-	// which names are valid.
+	// These need the whole roster rather than one cluster: copy_message and
+	// produce_message so they can write to another cluster, list_clusters so a
+	// caller can discover which names are valid.
 	//
-	// A read-only endpoint keeps copy_message. read_only protects the cluster
-	// being written to, and the destination is chosen per call, so hiding it
-	// here would block rescuing a message out of a protected cluster, which is
-	// the case the tool exists for.
+	// A read-only endpoint keeps them. read_only protects the cluster being
+	// written to, and the destination is chosen per call, so hiding them here
+	// would block rescuing a message out of a protected cluster, or seeding a
+	// writable one from a protected session, which is what they exist for.
 	endpoint.add("copy_message", func() { copymessage.Register(server, clusters, name) })
+	endpoint.add("produce_message", func() { producemessage.Register(server, clusters, name) })
 	endpoint.add("list_clusters", func() { listclusters.Register(server, clusters) })
 
 	// server_config is registered last and unconditionally, because it is what

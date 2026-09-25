@@ -1,6 +1,7 @@
 package consumerlag_test
 
 import (
+	"errors"
 	"testing"
 
 	"github.com/stretchr/testify/suite"
@@ -29,6 +30,41 @@ func (s *ConsumerLagSuite) TearDownSuite() {
 	s.env.Stop()
 }
 
+// lag measures one item and returns that item's result.
+//
+// Every call is a batch, so a single measurement is an items array of length
+// one, and a failure for it arrives as the item's error rather than as an error
+// for the call.
+func (s *ConsumerLagSuite) lag(item consumerlag.Item) (consumerlag.Output, error) {
+	s.T().Helper()
+
+	return s.lagOn(s.env.Admin(), item)
+}
+
+func (s *ConsumerLagSuite) lagOn(
+	admin *kadm.Client,
+	item consumerlag.Item,
+) (consumerlag.Output, error) {
+	s.T().Helper()
+
+	out, err := consumerlag.Run(
+		s.T().Context(), admin,
+		consumerlag.Input{Items: []consumerlag.Item{item}},
+	)
+	if err != nil {
+		return consumerlag.Output{}, err
+	}
+
+	s.Require().Len(out.Results, 1,
+		"one item in must produce exactly one result out, or results cannot be matched to inputs by position")
+
+	if out.Results[0].Error != "" {
+		return consumerlag.Output{}, errors.New(out.Results[0].Error)
+	}
+
+	return *out.Results[0].Result, nil
+}
+
 // messages returns n simple messages, so a test states only how many it needs.
 func (s *ConsumerLagSuite) messages(n int) []testenv.Message {
 	s.T().Helper()
@@ -50,11 +86,7 @@ func (s *ConsumerLagSuite) TestReportsLagOfAPartiallyConsumedTopic() {
 	group := s.env.UniqueName("lag-partial-group")
 	s.env.ConsumeAndCommit(s.T(), topic, group, 4)
 
-	out, err := consumerlag.Run(
-		s.T().Context(),
-		s.env.Admin(),
-		consumerlag.Input{Topic: topic, Group: group, SkipConsumeRate: true},
-	)
+	out, err := s.lag(consumerlag.Item{Topic: topic, Group: group, SkipConsumeRate: true})
 
 	s.Require().NoError(err, "measuring lag for an existing group must succeed")
 	s.Require().Len(out.Groups, 1,
@@ -90,11 +122,7 @@ func (s *ConsumerLagSuite) TestCaughtUpGroupReportsZeroLag() {
 	group := s.env.UniqueName("lag-caught-up-group")
 	s.env.ConsumeAndCommit(s.T(), topic, group, 3)
 
-	out, err := consumerlag.Run(
-		s.T().Context(),
-		s.env.Admin(),
-		consumerlag.Input{Topic: topic, Group: group, SkipConsumeRate: true},
-	)
+	out, err := s.lag(consumerlag.Item{Topic: topic, Group: group, SkipConsumeRate: true})
 
 	s.Require().NoError(err, "measuring a caught-up group must succeed")
 	s.Require().Zero(out.Groups[0].Lag,
@@ -113,11 +141,7 @@ func (s *ConsumerLagSuite) TestGroupWithNoActiveMembersIsReportedAsSuch() {
 	group := s.env.UniqueName("lag-empty-group")
 	s.env.ConsumeAndCommit(s.T(), topic, group, 2)
 
-	out, err := consumerlag.Run(
-		s.T().Context(),
-		s.env.Admin(),
-		consumerlag.Input{Topic: topic, Group: group, SampleSeconds: 1},
-	)
+	out, err := s.lag(consumerlag.Item{Topic: topic, Group: group, SampleSeconds: 1})
 
 	s.Require().NoError(err, "measuring a group whose consumers stopped must succeed")
 
@@ -149,11 +173,7 @@ func (s *ConsumerLagSuite) TestReportsProduceRateOverRealWindows() {
 	group := s.env.UniqueName("lag-produce-rate-group")
 	s.env.ConsumeAndCommit(s.T(), topic, group, 5)
 
-	out, err := consumerlag.Run(
-		s.T().Context(),
-		s.env.Admin(),
-		consumerlag.Input{Topic: topic, Group: group, SkipConsumeRate: true},
-	)
+	out, err := s.lag(consumerlag.Item{Topic: topic, Group: group, SkipConsumeRate: true})
 
 	s.Require().NoError(err, "measuring produce rate must succeed")
 
@@ -183,11 +203,7 @@ func (s *ConsumerLagSuite) TestConsumeRateOfAStoppedGroupIsZero() {
 	group := s.env.UniqueName("lag-consume-rate-group")
 	s.env.ConsumeAndCommit(s.T(), topic, group, 3)
 
-	out, err := consumerlag.Run(
-		s.T().Context(),
-		s.env.Admin(),
-		consumerlag.Input{Topic: topic, Group: group, SampleSeconds: 1},
-	)
+	out, err := s.lag(consumerlag.Item{Topic: topic, Group: group, SampleSeconds: 1})
 
 	s.Require().NoError(err, "sampling the consume rate must succeed")
 
@@ -211,11 +227,7 @@ func (s *ConsumerLagSuite) TestSkippingTheSampleReturnsNoConsumeRate() {
 	group := s.env.UniqueName("lag-skip-sample-group")
 	s.env.ConsumeAndCommit(s.T(), topic, group, 1)
 
-	out, err := consumerlag.Run(
-		s.T().Context(),
-		s.env.Admin(),
-		consumerlag.Input{Topic: topic, Group: group, SkipConsumeRate: true},
-	)
+	out, err := s.lag(consumerlag.Item{Topic: topic, Group: group, SkipConsumeRate: true})
 
 	s.Require().NoError(err, "skipping the sample must succeed")
 	s.Require().Nil(out.Groups[0].ConsumeRate,
@@ -236,11 +248,7 @@ func (s *ConsumerLagSuite) TestReportsLagAcrossPartitions() {
 	group := s.env.UniqueName("lag-partitions-group")
 	s.env.ConsumeAndCommit(s.T(), topic, group, 1)
 
-	out, err := consumerlag.Run(
-		s.T().Context(),
-		s.env.Admin(),
-		consumerlag.Input{Topic: topic, Group: group, SkipConsumeRate: true},
-	)
+	out, err := s.lag(consumerlag.Item{Topic: topic, Group: group, SkipConsumeRate: true})
 
 	s.Require().NoError(err, "measuring lag across partitions must succeed")
 
@@ -269,11 +277,7 @@ func (s *ConsumerLagSuite) TestMeasuresEveryGroupWhenNoneIsNamed() {
 	s.env.ConsumeAndCommit(s.T(), topic, first, 1)
 	s.env.ConsumeAndCommit(s.T(), topic, second, 4)
 
-	out, err := consumerlag.Run(
-		s.T().Context(),
-		s.env.Admin(),
-		consumerlag.Input{Topic: topic, SkipConsumeRate: true},
-	)
+	out, err := s.lag(consumerlag.Item{Topic: topic, SkipConsumeRate: true})
 
 	s.Require().NoError(err, "measuring every group on a topic must succeed")
 	s.Require().Len(out.Groups, 2,
@@ -291,11 +295,7 @@ func (s *ConsumerLagSuite) TestMeasuresEveryGroupWhenNoneIsNamed() {
 }
 
 func (s *ConsumerLagSuite) TestErrorsOnUnknownTopic() {
-	_, err := consumerlag.Run(
-		s.T().Context(),
-		s.env.Admin(),
-		consumerlag.Input{Topic: s.env.UniqueName("missing"), SkipConsumeRate: true},
-	)
+	_, err := s.lag(consumerlag.Item{Topic: s.env.UniqueName("missing"), SkipConsumeRate: true})
 
 	s.Require().Error(err,
 		"a topic that does not exist must fail rather than report a topic nobody is behind on")
@@ -306,15 +306,11 @@ func (s *ConsumerLagSuite) TestErrorsOnUnknownGroup() {
 
 	s.env.Produce(s.T(), topic, s.messages(2)...)
 
-	_, err := consumerlag.Run(
-		s.T().Context(),
-		s.env.Admin(),
-		consumerlag.Input{
-			Topic:           topic,
-			Group:           s.env.UniqueName("never-existed"),
-			SkipConsumeRate: true,
-		},
-	)
+	_, err := s.lag(consumerlag.Item{
+		Topic:           topic,
+		Group:           s.env.UniqueName("never-existed"),
+		SkipConsumeRate: true,
+	})
 
 	s.Require().Error(err,
 		"naming a group that does not exist must fail, not silently report zero lag as though it were caught up")
@@ -326,14 +322,13 @@ func (s *ConsumerLagSuite) TestErrorsWhenBrokerUnreachable() {
 
 	s.T().Cleanup(client.Close)
 
-	_, err = consumerlag.Run(
-		s.T().Context(),
+	_, err = s.lagOn(
 		kadm.NewClient(client),
-		consumerlag.Input{Topic: "anything", SkipConsumeRate: true},
+		consumerlag.Item{Topic: "anything", SkipConsumeRate: true},
 	)
 
 	s.Require().Error(err,
-		"an unreachable broker must surface as an error, not as a topic with no lag")
+		"an unreachable broker must surface as that item's error, not as a topic with no lag")
 }
 
 func (s *ConsumerLagSuite) TestBatchMeasuresSeveralTopics() {
@@ -346,9 +341,11 @@ func (s *ConsumerLagSuite) TestBatchMeasuresSeveralTopics() {
 	s.env.ConsumeAndCommit(s.T(), first, firstGroup, 1)
 	s.env.ConsumeAndCommit(s.T(), second, secondGroup, 2)
 
-	out, err := consumerlag.RunBatch(s.T().Context(), s.env.Admin(), []consumerlag.Item{
-		{Topic: first, Group: firstGroup, SkipConsumeRate: true},
-		{Topic: second, Group: secondGroup, SkipConsumeRate: true},
+	out, err := consumerlag.Run(s.T().Context(), s.env.Admin(), consumerlag.Input{
+		Items: []consumerlag.Item{
+			{Topic: first, Group: firstGroup, SkipConsumeRate: true},
+			{Topic: second, Group: secondGroup, SkipConsumeRate: true},
+		},
 	})
 
 	s.Require().NoError(err, "measuring a valid topic batch must succeed")

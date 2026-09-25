@@ -15,15 +15,14 @@ import (
 	"github.com/denizgursoy/kafka-mcp/internal/domain/records"
 )
 
-// Item is one topic in a batch description request.
+// Item is one topic to describe.
 type Item struct {
 	Topic string `json:"topic" jsonschema:"Name of the topic to describe. Matched exactly and case-sensitively."`
 }
 
 // Input is the argument set accepted by the describe_topic tool.
 type Input struct {
-	Topic string `json:"topic,omitempty" jsonschema:"Name of one topic to describe. Omit when items is used."`
-	Items []Item `json:"items,omitempty" jsonschema:"Optional batch of 1 to 20 topics. Do not combine with topic. Results preserve input order and missing topics are reported per item."`
+	Items []Item `json:"items" jsonschema:"The topics to describe, 1 to 20 of them. Describing one topic is an array of length one. Results follow this order and a missing topic is reported against its own item."`
 }
 
 // Partition describes one partition's offset range and size.
@@ -60,18 +59,18 @@ type Output struct {
 
 type BatchOutput = batch.Output[Output]
 
-type Response struct {
-	*Output
-	*BatchOutput
-}
-
 const description = `
-Describe one topic, or up to 20 topics through items: partitions, offset ranges, approximate message count,
-oldest/newest timestamps and complete effective configuration. Config entries
-identify whether values are inherited or topic-specific.
+Describe 1 to 20 topics in one call through items: partitions, offset ranges,
+approximate message count, oldest/newest timestamps and complete effective
+configuration. Config entries identify whether values are inherited or
+topic-specific.
+
+Results follow items order, each carrying index with result or error, so a
+topic that does not exist is reported against its own item rather than failing
+the call. Describing one topic is an items array of length one.
 
 Message counts are offset spans and may overcount after retention or
-compaction. Fails if the topic does not exist.
+compaction.
 `
 
 // Register adds the describe_topic tool to the MCP server.
@@ -79,50 +78,44 @@ func Register(server *mcp.Server, admin *kadm.Client, reader *records.Reader) {
 	mcp.AddTool(
 		server,
 		&mcp.Tool{
-			Name:         "describe_topic",
-			Description:  description,
-			OutputSchema: batch.OutputSchema[Output](),
+			Name:        "describe_topic",
+			Description: description,
 		},
 		func(
 			ctx context.Context,
 			req *mcp.CallToolRequest,
 			input Input,
-		) (*mcp.CallToolResult, Response, error) {
-
-			if input.Items != nil {
-				if input.Topic != "" {
-					return nil, Response{}, fmt.Errorf("describe topic: items cannot be combined with topic")
-				}
-				out, err := RunBatch(ctx, admin, reader, input.Items)
-				if err != nil {
-					return nil, Response{}, fmt.Errorf("describe topics: %w", err)
-				}
-				return nil, Response{BatchOutput: &out}, nil
-			}
+		) (*mcp.CallToolResult, BatchOutput, error) {
 
 			out, err := Run(ctx, admin, reader, input)
 			if err != nil {
-				return nil, Response{}, fmt.Errorf("describe topic: %w", err)
+				return nil, BatchOutput{}, fmt.Errorf("describe topics: %w", err)
 			}
 
-			return nil, Response{Output: &out}, nil
+			return nil, out, nil
 		},
 	)
 }
 
-// RunBatch describes independent topics with bounded concurrency.
-func RunBatch(ctx context.Context, admin *kadm.Client, reader *records.Reader, items []Item) (BatchOutput, error) {
-	return batch.Run(ctx, items, batch.MaxHeavyItems, func(ctx context.Context, item Item) (Output, error) {
-		return Run(ctx, admin, reader, Input{Topic: item.Topic})
-	})
-}
-
-// Run reports the partition layout, size and time span of a topic.
+// Run describes every requested topic with bounded concurrency.
 func Run(
 	ctx context.Context,
 	admin *kadm.Client,
 	reader *records.Reader,
 	input Input,
+) (BatchOutput, error) {
+
+	return batch.Run(ctx, input.Items, batch.MaxHeavyItems, func(ctx context.Context, item Item) (Output, error) {
+		return describe(ctx, admin, reader, item)
+	})
+}
+
+// describe reports the partition layout, size and time span of one topic.
+func describe(
+	ctx context.Context,
+	admin *kadm.Client,
+	reader *records.Reader,
+	input Item,
 ) (Output, error) {
 
 	if input.Topic == "" {
