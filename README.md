@@ -358,6 +358,50 @@ ali cannot bypass that by editing config or rebuilding the binary, because the
 decision is made by Kafka rather than by this server. On a cluster without
 ACLs, `read_only: true` is the available protection.
 
+### Audit logging
+
+Every tool call is logged. One `slog` record per call, on the server's own log
+stream, so nothing extra has to be configured:
+
+```json
+{"level":"INFO","msg":"tool call","tool":"produce_message","outcome":"ok",
+ "duration_ms":12,"endpoint":"prod-write","cluster":"prod","read_only":false,
+ "principal":"kafka-mcp-rw","session":"QY7MZM...","client":"claude-code",
+ "client_version":"1.0.0","confirm":true,"item_count":1,"targets":"orders"}
+```
+
+The tools that change a cluster — `add_partitions`, `commit_offset`,
+`create_topic`, `copy_message`, `produce_message` — are logged at `INFO`.
+Everything else is logged at `DEBUG`, because reads are constant and change
+nothing, so recording them at the same level would bury the writes among them.
+Raise the log level to see them.
+
+Two fields carry most of the weight. `confirm` separates a real write from a
+preview, and `targets` names the topic, group, partition and offset each item
+pointed at, so a record says which topic was touched rather than only that some
+topic was.
+
+**Message content is never logged.** `produce_message` and `copy_message` carry
+arbitrary payloads, and an audit log is usually readable by more people than the
+data it describes, so keys, values and headers are left out. The audit code has
+no field to unmarshal them into, so content cannot reach a log even by mistake.
+
+**None of the recorded identities is a person, and the server cannot make one
+up.** What each actually means:
+
+| Field | What it is |
+| ----- | ---------- |
+| `principal` | The Kafka credential this server connects as, which is what ACLs are enforced against. Everyone reaching the same endpoint shares it |
+| `endpoint` | Which endpoint policy allowed the call, and so which cluster was touched |
+| `session` | One MCP session, which groups a sequence of calls into one investigation |
+| `client`, `client_version` | The program that connected, as it identified itself at `initialize`. Self-reported and not verified |
+| `user` | Present only when an inbound bearer token established it. This server installs no token verifier, so it is absent today |
+| `request_id` | The HTTP request id, which joins a record to the access log |
+
+For attribution to a person, give each person their own endpoint and SASL
+credentials, as above: the `principal` in the record is then the answer to who
+acted. A shared credential cannot be made to answer it.
+
 ## Tools
 
 ### Batch operations

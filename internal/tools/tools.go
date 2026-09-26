@@ -12,10 +12,12 @@ package tools
 
 import (
 	"fmt"
+	"log/slog"
 	"sort"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"github.com/denizgursoy/kafka-mcp/internal/domain/audit"
 	"github.com/denizgursoy/kafka-mcp/internal/domain/config"
 	"github.com/denizgursoy/kafka-mcp/internal/domain/kafkaclient"
 	"github.com/denizgursoy/kafka-mcp/internal/tools/addpartitions"
@@ -97,6 +99,17 @@ func Register(
 	if err := Validate(endpointConfig); err != nil {
 		return err
 	}
+
+	// Auditing wraps the whole endpoint rather than each tool, so what gets
+	// recorded cannot drift from what gets registered: a tool added later is
+	// audited without anyone remembering to add a line to it.
+	//
+	// The endpoint and its principal are bound here, where the cluster is
+	// already decided, so no caller can make a record name a cluster it did not
+	// touch.
+	server.AddReceivingMiddleware(
+		audit.Middleware(slog.Default(), endpointConfig, audit.Principal(kafka.Config())),
+	)
 
 	endpoint := &endpoint{config: endpointConfig}
 
