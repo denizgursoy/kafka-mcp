@@ -134,3 +134,7 @@ happen:
   consumer just as stuck; see [skip-poison-message.md](skip-poison-message.md).
 - A cluster with auto-creation enabled may have made the topic already, with
   whatever defaults the broker had. That is what step 1 finds.
+- To create topics another environment already has, compare the two first:
+  `compare_clusters` reports each missing topic with the partition count and
+  configs to reproduce, so the new topic matches its counterpart rather than the
+  broker's defaults. See [compare-clusters.md](compare-clusters.md).

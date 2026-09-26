@@ -9,10 +9,10 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/twmb/franz-go/pkg/kadm"
-	"github.com/twmb/franz-go/pkg/kmsg"
 
 	"github.com/denizgursoy/kafka-mcp/internal/domain/batch"
 	"github.com/denizgursoy/kafka-mcp/internal/domain/records"
+	"github.com/denizgursoy/kafka-mcp/internal/domain/topicconfig"
 )
 
 // Item is one topic to describe.
@@ -34,17 +34,11 @@ type Partition struct {
 }
 
 // Config is one topic-level configuration entry.
-type Config struct {
-	Key   string `json:"key"`
-	Value string `json:"value"`
-	// Source names where the value comes from, so a caller can tell a
-	// deliberate topic setting from an inherited cluster default.
-	Source    string `json:"source"`
-	IsDefault bool   `json:"is_default"`
-	// Sensitive marks a config whose value the broker refuses to disclose.
-	// The value is then empty because it is hidden, not because it is unset.
-	Sensitive bool `json:"sensitive,omitempty"`
-}
+//
+// The type lives in internal/domain/topicconfig because compare_clusters needs
+// the same distinction between a deliberate setting and an inherited default.
+// It is aliased here so this tool's output shape is unchanged.
+type Config = topicconfig.Entry
 
 // Output is the result returned by the describe_topic tool.
 type Output struct {
@@ -268,18 +262,6 @@ func timestampRange(
 	return oldest, newest, nil
 }
 
-// configSources names the ConfigSource values Kafka can report. The protocol
-// sends a bare integer, which tells a caller nothing, so it is mapped to the
-// name used in Kafka's own documentation and tooling.
-var configSources = map[kmsg.ConfigSource]string{
-	kmsg.ConfigSourceDynamicTopicConfig:         "DYNAMIC_TOPIC_CONFIG",
-	kmsg.ConfigSourceDynamicBrokerConfig:        "DYNAMIC_BROKER_CONFIG",
-	kmsg.ConfigSourceDynamicDefaultBrokerConfig: "DYNAMIC_DEFAULT_BROKER_CONFIG",
-	kmsg.ConfigSourceStaticBrokerConfig:         "STATIC_BROKER_CONFIG",
-	kmsg.ConfigSourceDefaultConfig:              "DEFAULT_CONFIG",
-	kmsg.ConfigSourceDynamicBrokerLoggerConfig:  "DYNAMIC_BROKER_LOGGER_CONFIG",
-}
-
 // topicConfigs returns every configuration entry of a topic, sorted by key.
 func topicConfigs(
 	ctx context.Context,
@@ -287,53 +269,5 @@ func topicConfigs(
 	topic string,
 ) ([]Config, error) {
 
-	described, err := admin.DescribeTopicConfigs(ctx, topic)
-	if err != nil {
-		return nil, fmt.Errorf("describe configs for %q: %w", topic, err)
-	}
-
-	resource, err := described.On(topic, nil)
-	if err != nil {
-		return nil, fmt.Errorf("describe configs for %q: %w", topic, err)
-	}
-
-	// A per-resource error would otherwise surface as a topic with no
-	// configuration at all, which reads as "nothing is configured" rather than
-	// "the configuration could not be read".
-	if resource.Err != nil {
-		if resource.ErrMessage != "" {
-			return nil, fmt.Errorf(
-				"describe configs for %q: %w: %s", topic, resource.Err, resource.ErrMessage)
-		}
-
-		return nil, fmt.Errorf("describe configs for %q: %w", topic, resource.Err)
-	}
-
-	configs := make([]Config, 0, len(resource.Configs))
-
-	for _, config := range resource.Configs {
-		source, known := configSources[config.Source]
-		if !known {
-			// Naming an unrecognised source honestly beats reporting one that
-			// the broker did not send.
-			source = fmt.Sprintf("UNKNOWN(%d)", config.Source)
-		}
-
-		configs = append(configs, Config{
-			Key:   config.Key,
-			Value: config.MaybeValue(),
-			// Only a value set on the topic itself is a deliberate choice.
-			// Everything else is inherited, whatever level it comes from.
-			IsDefault: config.Source != kmsg.ConfigSourceDynamicTopicConfig,
-			Source:    source,
-			Sensitive: config.Sensitive,
-		})
-	}
-
-	// kadm returns configs in no guaranteed order, so sort for a stable report.
-	sort.Slice(configs, func(i, j int) bool {
-		return configs[i].Key < configs[j].Key
-	})
-
-	return configs, nil
+	return topicconfig.For(ctx, admin, topic)
 }

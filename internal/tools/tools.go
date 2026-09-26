@@ -22,6 +22,7 @@ import (
 	"github.com/denizgursoy/kafka-mcp/internal/domain/kafkaclient"
 	"github.com/denizgursoy/kafka-mcp/internal/tools/addpartitions"
 	"github.com/denizgursoy/kafka-mcp/internal/tools/commitoffset"
+	"github.com/denizgursoy/kafka-mcp/internal/tools/compareclusters"
 	"github.com/denizgursoy/kafka-mcp/internal/tools/consumerlag"
 	"github.com/denizgursoy/kafka-mcp/internal/tools/copymessage"
 	"github.com/denizgursoy/kafka-mcp/internal/tools/createtopic"
@@ -56,6 +57,7 @@ func Names() []string {
 	return []string{
 		"add_partitions",
 		"commit_offset",
+		"compare_clusters",
 		"consumer_lag",
 		"copy_message",
 		"create_topic",
@@ -144,13 +146,15 @@ func Register(
 	}
 
 	// These need the whole roster rather than one cluster: copy_message and
-	// produce_message so they can write to another cluster, list_clusters so a
-	// caller can discover which names are valid.
+	// produce_message so they can write to another cluster, compare_clusters so
+	// it can read another cluster's topics, list_clusters so a caller can
+	// discover which names are valid.
 	//
 	// A read-only endpoint keeps them. read_only protects the cluster being
 	// written to, and the destination is chosen per call, so hiding them here
 	// would block rescuing a message out of a protected cluster, or seeding a
 	// writable one from a protected session, which is what they exist for.
+	endpoint.add("compare_clusters", func() { compareclusters.Register(server, clusters, name) })
 	endpoint.add("copy_message", func() { copymessage.Register(server, clusters, name) })
 	endpoint.add("produce_message", func() { producemessage.Register(server, clusters, name) })
 	endpoint.add("list_clusters", func() { listclusters.Register(server, clusters) })

@@ -782,3 +782,44 @@ func (e *Environment) CreateTopicWithConfig(
 
 	return name
 }
+
+// CreateNamedTopic creates a topic with an exact name, partition count and
+// configs, and returns that name.
+//
+// Every other creation helper generates a unique suffix, because a suite shares
+// one broker and a fixed name would let one case see another's topics. Comparing
+// two clusters needs the opposite: the same name has to exist on both, since a
+// topic present on one and absent from the other is the thing being measured.
+// The caller therefore supplies a name it has already made unique.
+func (e *Environment) CreateNamedTopic(
+	t *testing.T,
+	name string,
+	partitions int32,
+	configs map[string]string,
+) string {
+	t.Helper()
+
+	values := make(map[string]*string, len(configs))
+
+	for key, value := range configs {
+		values[key] = kadm.StringPtr(value)
+	}
+
+	responses, err := e.admin.CreateTopics(t.Context(), partitions, 1, values, name)
+	if err != nil {
+		t.Fatalf("create topic %s with %d partition(s) and config %v: %v",
+			name, partitions, configs, err)
+	}
+
+	for _, response := range responses {
+		if response.Err != nil {
+			t.Fatalf("create topic %s: %v", response.Topic, response.Err)
+		}
+	}
+
+	e.mu.Lock()
+	e.topics = append(e.topics, name)
+	e.mu.Unlock()
+
+	return name
+}

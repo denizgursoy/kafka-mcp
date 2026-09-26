@@ -1,11 +1,11 @@
 ---
 name: kafka-debugging
-description: Use when debugging a Kafka cluster through the kafka-mcp server — finding a message by order id, correlation id, key or a field condition; measuring consumer lag, throughput and when a backlog will clear; unblocking a consumer stuck on a poison message; adding partitions to a topic; creating a topic; or producing a message into one. Use for requests like "find the message for order 12345", "which message had this correlation id", "is there lag on orders", "how far behind is this consumer group", "how fast are we consuming", "the consumer is stuck", "skip this bad message", "add partitions to this topic", "create a topic", "we need a dead letter topic", "put this message back", "send a corrected message", "reproduce this in preprod", "seed this topic with test data", or "when will the backlog clear". Routes to the guide for the scenario, so read this before calling the tools.
+description: Use when debugging a Kafka cluster through the kafka-mcp server — finding a message by order id, correlation id, key or a field condition; measuring consumer lag, throughput and when a backlog will clear; unblocking a consumer stuck on a poison message; adding partitions to a topic; creating a topic; producing a message into one; or comparing two clusters to find missing topics and configuration drift. Use for requests like "find the message for order 12345", "which message had this correlation id", "is there lag on orders", "how far behind is this consumer group", "how fast are we consuming", "the consumer is stuck", "skip this bad message", "add partitions to this topic", "create a topic", "we need a dead letter topic", "put this message back", "send a corrected message", "reproduce this in preprod", "seed this topic with test data", "which topics does preprod have that prod does not", "are these two environments the same", "create the missing topics", or "when will the backlog clear". Routes to the guide for the scenario, so read this before calling the tools.
 ---
 
 # Kafka debugging
 
-Six scenarios, one per guide. Read the guide for the scenario before calling
+Seven scenarios, one per guide. Read the guide for the scenario before calling
 any tool: each one exists because the obvious sequence of calls gets the answer
 wrong in a specific way.
 
@@ -19,6 +19,7 @@ wrong in a specific way.
 | Whether to add partitions, and doing it safely | [scale-partitions](references/scale-partitions.md) |
 | For a new topic, with a partition count and retention chosen on purpose | [create-topic](references/create-topic.md) |
 | To write a message: repaired, reproduced elsewhere, or seeded | [produce-message](references/produce-message.md) |
+| What differs between two clusters, or to create what one is missing | [compare-clusters](references/compare-clusters.md) |
 
 ## When "the consumer is behind" is ambiguous
 
@@ -43,7 +44,8 @@ problem; the other adds capacity to a consumer that is not consuming.
 cluster with different paths, purposes and permissions. Every tool is bound to
 the cluster and policy of the endpoint it was called on. No tool takes a cluster
 parameter, except `copy_message` and `produce_message`, which choose a
-destination, and `list_clusters`, which reports the roster.
+destination, `compare_clusters`, which names the cluster to compare against, and
+`list_clusters`, which reports the roster.
 
 **Check `server_config` before promising a change.** A read-only endpoint does
 not expose `add_partitions`, `commit_offset` or `create_topic` at all, and any

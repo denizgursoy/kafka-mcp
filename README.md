@@ -438,7 +438,8 @@ mistake.
 
 Lists the clusters this server serves, with whether each is reachable and
 whether it accepts writes. Takes no parameters. Available from every endpoint,
-so a session can discover what `copy_message` and `produce_message` may target.
+so a session can discover what `copy_message`, `produce_message` and
+`compare_clusters` may target.
 
 ```json
 {"clusters": [
@@ -451,6 +452,58 @@ so a session can discover what `copy_message` and `produce_message` may target.
 that has since gone down is reported honestly. Only the name, reachability and
 writability are reported: broker addresses and credentials are deliberately
 not, because this tool is reachable from every endpoint.
+
+### `compare_clusters`
+
+Compares the topics of other clusters against the one this endpoint serves, and
+reports what differs. Use it to find what preproduction has that production does
+not, or to check whether two environments still match.
+
+| Parameter | Type     | Required | Meaning                          |
+| --------- | -------- | -------- | -------------------------------- |
+| `items`   | object[] | yes      | 1 to 100 clusters to compare against |
+
+Item fields:
+
+| Field              | Type   | Required | Meaning                                                    |
+| ------------------ | ------ | -------- | ---------------------------------------------------------- |
+| `cluster`          | string | yes      | The other cluster. Use `list_clusters` for valid names     |
+| `search`           | string | no       | Case-insensitive substring a topic name must contain       |
+| `include_internal` | bool   | no       | Default false: internal topics are excluded                |
+
+```json
+{"here": "preprod", "there": "prod",
+ "here_cluster": {"name": "preprod", "brokers": 1, "topics": 12},
+ "there_cluster": {"name": "prod", "brokers": 3, "topics": 11},
+ "only_here": [{"topic": "orders-v2", "partitions": 6, "replication_factor": 1,
+                "configs": {"retention.ms": "604800000"}}],
+ "only_there": [],
+ "differing": [{"topic": "orders", "differences": ["partitions"],
+                "here": {"partitions": 1}, "there": {"partitions": 12}}],
+ "in_both": 11}
+```
+
+`only_here` and `only_there` name the direction, which is decided by the
+endpoint you call: "here" is always the cluster this endpoint serves. Entries
+carry the partition count, replication factor and explicitly-set configs of the
+cluster that has the topic, so they can be passed straight to `create_topic`.
+
+**This tool creates and changes nothing.** To create the missing topics, hand
+the chosen entries to `create_topic`, which previews them against the broker
+first and warns that a partition count can never be reduced.
+
+`differing` is usually the more valuable half: a topic that exists on both sides
+with a different partition count or `retention.ms` is the common reason a bug
+reproduces in one environment and not the other. Only configs a topic sets for
+itself are compared, because two clusters may carry different broker defaults
+and comparing inherited values would report every topic as different.
+
+A difference is not necessarily a mistake. A topic missing from production is
+often deliberate, so the report says what differs, never what is correct.
+
+Topic listings come from the Kafka client's metadata cache, which is a few
+seconds old, so a topic created moments earlier may still appear in
+`only_there`. Repeat the comparison rather than creating it twice.
 
 ### `list_topics`
 
@@ -894,7 +947,7 @@ deleted; it stays until retention removes it.
 
 `skills/kafka-debugging/SKILL.md` is the one skill an agent loads. It routes to
 the scenario guides under `skills/kafka-debugging/references/`, rather than
-holding all six workflows itself, so a session reads only the one it needs:
+holding all seven workflows itself, so a session reads only the one it needs:
 
 - `find-message.md` — locating a message from something the user knows about it.
 - `check-lag.md` — measuring lag and throughput, and judging when a backlog will
@@ -907,6 +960,8 @@ holding all six workflows itself, so a session reads only the one it needs:
   chosen on purpose, including as a `copy_message` destination.
 - `produce-message.md` — writing a message: repairing and re-injecting one,
   reproducing a failure in another cluster, or seeding a topic.
+- `compare-clusters.md` — finding what differs between two environments, and
+  creating the topics one of them is missing.
 
 The umbrella also resolves the overlap between them: "the consumer is behind"
 opens three of these guides, and `consumer_lag`'s `status` is what decides which
