@@ -21,9 +21,14 @@ or "did we ever receive an event for this customer".
 
 ### 1. Establish the topic
 
-If the user named a topic, use it. Otherwise call `list_topics`, with `search`
-if their wording suggests a name, and ask them to choose when several are
-plausible. Do not guess.
+If the user named a topic, use it. Otherwise call `list_topics`, narrowing with
+a `script` when their wording suggests a name:
+
+```js
+return topic.indexOf('order') >= 0
+```
+
+Ask them to choose when several are plausible. Do not guess.
 
 ### 2. Learn the shape first
 

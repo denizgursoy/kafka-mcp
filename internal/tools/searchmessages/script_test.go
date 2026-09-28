@@ -50,7 +50,7 @@ func (s *ScriptSuite) matches(source string) bool {
 	s.Require().NoError(err,
 		"the script must compile, otherwise the case is testing the compiler rather than matching")
 
-	defer script.close()
+	defer script.Close()
 
 	matched, err := script.match(s.record())
 	s.Require().NoError(err,
@@ -135,7 +135,7 @@ func (s *ScriptSuite) TestKeyIsNullWhenAbsent() {
 	script, err := compileScript(`return key === null`)
 	s.Require().NoError(err, "the script must compile")
 
-	defer script.close()
+	defer script.Close()
 
 	matched, err := script.match(&kgo.Record{Value: []byte(`{}`)})
 
@@ -148,7 +148,7 @@ func (s *ScriptSuite) TestNonJSONValueIsAString() {
 	script, err := compileScript(`return value.indexOf('ERROR') >= 0`)
 	s.Require().NoError(err, "the script must compile")
 
-	defer script.close()
+	defer script.Close()
 
 	matched, err := script.match(&kgo.Record{Value: []byte("level=ERROR msg=failed")})
 
@@ -196,7 +196,7 @@ func (s *ScriptSuite) TestReportsAScriptErrorPerMessage() {
 	script, err := compileScript(`return value.payload.amount > 0`)
 	s.Require().NoError(err, "the script must compile")
 
-	defer script.close()
+	defer script.Close()
 
 	// A plain string value has no payload, so reading through it throws.
 	_, err = script.match(&kgo.Record{Value: []byte("not json at all")})
@@ -209,7 +209,7 @@ func (s *ScriptSuite) TestStopsAnInfiniteLoop() {
 	script, err := compileScript(`while (true) {} return true`)
 	s.Require().NoError(err, "an infinite loop is valid JavaScript and must compile")
 
-	defer script.close()
+	defer script.Close()
 
 	done := make(chan error, 1)
 
@@ -220,7 +220,7 @@ func (s *ScriptSuite) TestStopsAnInfiniteLoop() {
 
 	// The interrupt is what makes user-supplied scripts safe to run at all.
 	time.Sleep(50 * time.Millisecond)
-	script.interrupt()
+	script.Interrupt("test")
 
 	select {
 	case err := <-done:
@@ -236,7 +236,7 @@ func (s *ScriptSuite) TestStopsRunawayRecursion() {
 	script, err := compileScript(`function f() { return f() } return f()`)
 	s.Require().NoError(err, "unbounded recursion is valid JavaScript and must compile")
 
-	defer script.close()
+	defer script.Close()
 
 	_, err = script.match(s.record())
 
@@ -256,7 +256,7 @@ func (s *ScriptSuite) TestIsDeterministic() {
 		script, err := compileScript(`return Math.random()`)
 		s.Require().NoError(err, "the script must compile")
 
-		defer script.close()
+		defer script.Close()
 
 		// Two evaluations of the same runtime must agree, so a scan cannot
 		// produce a different answer for identical messages.

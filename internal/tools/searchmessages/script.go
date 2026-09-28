@@ -1,103 +1,75 @@
 package searchmessages
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
-	"math/rand"
-	"time"
 	"unicode/utf8"
 
-	"github.com/dop251/goja"
 	"github.com/twmb/franz-go/pkg/kgo"
+
+	"github.com/denizgursoy/kafka-mcp/internal/domain/script"
 )
 
-// maxCallStackSize turns runaway recursion into a catchable JavaScript error
-// rather than letting it exhaust the host stack and take the server with it.
-const maxCallStackSize = 2000
-
-// script is a compiled user filter, evaluated once per message.
-//
-// The program is compiled once and the runtime is reused across a whole scan,
-// because creating either per message would cost more than the filtering.
-// A runtime is not safe for concurrent use, so each scanning goroutine owns
-// one of its own.
-type script struct {
-	runtime *goja.Runtime
-	fn      goja.Callable
-	source  string
+// scriptParameters are the variables a search predicate sees, in the order
+// match supplies them.
+var scriptParameters = []string{
+	"value", "key", "headers", "partition", "offset", "timestamp",
 }
 
-// compileScript prepares a user script for evaluation.
+// filter is a compiled user predicate bound to Kafka records.
 //
-// The script body is wrapped in a function so that a bare "return" works at
-// the top level, which is the form a caller naturally writes.
-//
-// Compilation happens here rather than per message, so a malformed script is
-// reported before any message is read.
-func compileScript(source string) (*script, error) {
-	program, err := goja.Compile(
-		"filter.js",
-		"(function (value, key, headers, partition, offset, timestamp) {\n"+
-			source+
-			"\n})",
-		true,
-	)
+// The runtime and its hardening live in internal/domain/script, which
+// list_topics shares. What stays here is the part that is specific to a
+// message: how a record's fields are rendered for JavaScript.
+type filter struct {
+	*script.Script
+}
+
+// compileScript prepares a user script for evaluation against records.
+func compileScript(source string) (*filter, error) {
+	compiled, err := script.Compile(source, scriptParameters...)
 	if err != nil {
-		return nil, fmt.Errorf("script does not compile: %w", err)
+		return nil, err
 	}
 
-	runtime := goja.New()
+	return &filter{Script: compiled}, nil
+}
 
-	// Nothing from the host is injected: the runtime has no require, no
-	// filesystem, no network and no clock of its own. A filter has no
-	// business reaching any of them.
-	runtime.SetMaxCallStackSize(maxCallStackSize)
-
-	// A scan must give the same answer twice. Both sources of nondeterminism
-	// in JavaScript are pinned, so Date.now() and Math.random() cannot make
-	// two identical searches disagree.
-	fixed := time.Unix(0, 0).UTC()
-	runtime.SetTimeSource(func() time.Time { return fixed })
-
-	seeded := rand.New(rand.NewSource(1))
-	runtime.SetRandSource(func() float64 { return seeded.Float64() })
-
-	value, err := runtime.RunProgram(program)
-	if err != nil {
-		return nil, fmt.Errorf("script does not load: %w", err)
+// guard interrupts the script when ctx is done, so a predicate that never
+// returns cannot hold a scanning goroutine forever.
+func (f *filter) guard(ctx context.Context) func() {
+	if f == nil {
+		return func() {}
 	}
 
-	fn, ok := goja.AssertFunction(value)
-	if !ok {
-		return nil, fmt.Errorf("script did not produce a function")
-	}
-
-	return &script{runtime: runtime, fn: fn, source: source}, nil
+	return script.Guard(ctx, f.Script, "search stopped")
 }
 
 // match reports whether a record satisfies the script.
 //
 // An error means the script failed on this message, which is different from
 // the message not matching, and the caller counts the two separately.
-func (s *script) match(record *kgo.Record) (bool, error) {
+func (f *filter) match(record *kgo.Record) (bool, error) {
+	runtime := f.Runtime()
+
 	// A time.Time passed through ToValue arrives as a wrapped Go value with no
 	// Date methods, so the timestamp is constructed as a real JavaScript Date.
-	timestamp, err := s.runtime.New(
-		s.runtime.Get("Date").ToObject(s.runtime),
-		s.runtime.ToValue(record.Timestamp.UnixMilli()),
+	timestamp, err := runtime.New(
+		runtime.Get("Date").ToObject(runtime),
+		runtime.ToValue(record.Timestamp.UnixMilli()),
 	)
 	if err != nil {
 		return false, fmt.Errorf("build timestamp for partition %d offset %d: %w",
 			record.Partition, record.Offset, err)
 	}
 
-	result, err := s.fn(
-		goja.Undefined(),
-		s.runtime.ToValue(decodeValue(record.Value)),
-		s.runtime.ToValue(decodeKey(record.Key)),
-		s.runtime.ToValue(decodeHeaders(record.Headers)),
-		s.runtime.ToValue(record.Partition),
-		s.runtime.ToValue(record.Offset),
+	matched, err := f.Call(
+		f.Value(decodeValue(record.Value)),
+		f.Value(decodeKey(record.Key)),
+		f.Value(decodeHeaders(record.Headers)),
+		f.Value(record.Partition),
+		f.Value(record.Offset),
 		timestamp,
 	)
 	if err != nil {
@@ -105,22 +77,7 @@ func (s *script) match(record *kgo.Record) (bool, error) {
 			record.Partition, record.Offset, err)
 	}
 
-	// Ordinary JavaScript truthiness, so a script may return a field directly
-	// rather than spelling out a comparison.
-	return result.ToBoolean(), nil
-}
-
-// interrupt stops a script that is currently running. It is safe to call from
-// another goroutine, and is what keeps an endless loop from hanging a scan.
-func (s *script) interrupt() {
-	s.runtime.Interrupt("search stopped")
-}
-
-// close releases the interrupt flag. A runtime that was interrupted keeps the
-// flag set, so reusing one without clearing it would kill the next script
-// immediately.
-func (s *script) close() {
-	s.runtime.ClearInterrupt()
+	return matched, nil
 }
 
 // decodeValue turns a record value into what the script sees: the parsed

@@ -16,6 +16,16 @@ import (
 )
 
 // Item is one cluster to compare this endpoint's cluster against.
+//
+// Search is a plain substring rather than the JavaScript predicate list_topics
+// takes, and that difference is deliberate. This filter selects which topics are
+// compared, and it runs once per cluster, so it must choose the same topics on
+// both sides. A name does. A predicate reading partitions or configs would not:
+// a topic with 1 partition here and 6 there would pass the filter on one side
+// and fail it on the other, and the comparison would report a topic both
+// clusters hold as missing from one — with creating it as the documented next
+// step. Only properties that are equal on both sides can safely filter a
+// comparison.
 type Item struct {
 	Cluster         string `json:"cluster" jsonschema:"Name of the other cluster to compare against. Use list_clusters to see which names are valid. Comparing this endpoint's own cluster is allowed and reports no differences."`
 	Search          string `json:"search,omitempty" jsonschema:"Optional case-insensitive substring that a topic name must contain to be compared. Omit to compare every topic. Use it to limit a comparison to one team's prefix, since whole-cluster reports are long."`

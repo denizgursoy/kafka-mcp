@@ -33,7 +33,13 @@ in both cases the answer is this server's configuration rather than Kafka.
 
 ### 1. Confirm the topic does not already exist
 
-Call `list_topics` with a prefix. Two things come out of it:
+Call `list_topics`, narrowing to the prefix with a `script`:
+
+```js
+return topic.indexOf('orders') >= 0
+```
+
+Two things come out of it:
 
 - Whether the name is taken. `create_topic` refuses an existing topic rather
   than adjusting it, so this is the difference between creating something and

@@ -465,3 +465,39 @@ func (s *SearchMessagesSuite) TestErrorsWhenBrokerUnreachable() {
 	s.Require().Error(err,
 		"an unreachable broker must surface as an error, not as a search with no matches")
 }
+
+func (s *SearchMessagesSuite) TestRunawayScriptStopsAtTheTimeout() {
+	topic := s.env.CreateTopic(s.T(), "search-runaway")
+
+	s.env.Produce(s.T(), topic, testenv.Message{Value: `{"order":"1"}`})
+
+	// A script that never returns is valid JavaScript, and goja does not yield,
+	// so nothing outside the runtime can observe the deadline: the context
+	// cannot stop a call that never comes back. Without the interrupt the
+	// scanning goroutine is lost for the lifetime of the process, and the call
+	// never answers.
+	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+
+		_, _ = searchmessages.Run(
+			s.T().Context(),
+			s.env.Admin(),
+			s.env.Reader(),
+			"",
+			searchmessages.Input{
+				Topic:         topic,
+				Script:        `while (true) {} return true`,
+				TimeoutSecond: 1,
+			},
+		)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(20 * time.Second):
+		s.Require().Fail(
+			"a runaway script must be interrupted at the timeout: the tool promises callers that scripts are time-limited, and a scan that never returns holds a goroutine forever")
+	}
+}

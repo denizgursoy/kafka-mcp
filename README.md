@@ -507,19 +507,52 @@ seconds old, so a topic created moments earlier may still appear in
 
 ### `list_topics`
 
-Lists the topics on the cluster, sorted alphabetically, with their count.
+Lists the topics on the cluster, sorted by name, each with its partition count,
+replication factor and the configs it sets for itself.
 
-| Parameter | Type   | Required | Meaning                                                       |
-| --------- | ------ | -------- | ------------------------------------------------------------- |
-| `search`  | string | no       | Substring filter on the topic name, matched case-insensitively |
+| Parameter         | Type   | Required | Meaning                                                  |
+| ----------------- | ------ | -------- | -------------------------------------------------------- |
+| `script`          | string | no       | JavaScript predicate deciding whether a topic is listed  |
+| `timeout_seconds` | int    | no       | Limit for evaluating the script. Default 30              |
 
-```json
-{"name": "list_topics", "arguments": {"search": "orders"}}
+The predicate sees:
+
+| Variable             | Type    | Meaning                                              |
+| -------------------- | ------- | ---------------------------------------------------- |
+| `topic`              | string  | The topic name                                       |
+| `partitions`         | number  | Partition count                                      |
+| `replication_factor` | number  | Replicas of the first partition                      |
+| `internal`           | boolean | Kafka's own topics, such as `__consumer_offsets`     |
+| `configs`            | object  | Values this topic sets for itself, e.g. `configs['retention.ms']` |
+
+```js
+return topic.indexOf('orders') >= 0
+return partitions > 6
+return configs['cleanup.policy'] === 'compact'
+return replication_factor === 1 && !internal
 ```
 
 ```json
-{"topics": ["orders", "orders-dlq"], "count": 2}
+{"name": "list_topics", "arguments": {"script": "return partitions > 6"}}
 ```
+
+```json
+{"topics": [{"topic": "orders", "partitions": 12, "replication_factor": 3,
+             "configs": {"retention.ms": "604800000"}}],
+ "count": 1}
+```
+
+Filtering is JavaScript only, as it is for `search_messages`: a name match is
+`return topic.indexOf('orders') >= 0`. The predicate can also answer what a
+substring never could — which topics have more than six partitions, only one
+replica, or a compacted cleanup policy.
+
+Only configs a topic sets for itself are reported. Inherited cluster defaults
+are excluded, because including them would make every topic look configured.
+
+A topic whose predicate throws, or is cut short by the timeout, is counted in
+`script_errors` rather than listed, so a broken filter is never mistaken for an
+empty cluster.
 
 ### `describe_topic`
 

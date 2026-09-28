@@ -92,8 +92,9 @@ key, headers, partition, offset and timestamp. Omit it to match all messages.
 
 Kafka has no server-side search, so scans are bounded. Check complete,
 stopped_reason and scanned_ranges before treating no matches as conclusive.
-Use count_only or output_file for large result sets. Scripts are time-limited
-but not memory-sandboxed; keep predicates simple.
+Use count_only or output_file for large result sets. A script that runs past
+timeout_seconds is interrupted and counted in script_errors; scripts are not
+memory-sandboxed, so keep predicates simple.
 `
 
 // Register adds the search_messages tool to the MCP server.
@@ -270,7 +271,14 @@ func (s *scanState) scanSlice(
 	}
 
 	if filter != nil {
-		defer filter.close()
+		// The guard is what makes the timeout real. goja does not yield, so a
+		// predicate that never returns is never preempted and the context is
+		// not observed until the call comes back. Interrupting the runtime from
+		// outside is the only thing that can stop it.
+		stop := filter.guard(ctx)
+		defer stop()
+
+		defer filter.Close()
 	}
 
 	session, err := reader.Session(topic)
@@ -329,7 +337,7 @@ func (s *scanState) scanSlice(
 // visit filters one record and reports whether scanning should continue.
 func (s *scanState) visit(
 	record *kgo.Record,
-	filter *script,
+	filter *filter,
 	found *[]records.Message,
 ) (bool, error) {
 
@@ -642,7 +650,7 @@ func newOptions(input Input) (*options, error) {
 			return nil, err
 		}
 
-		compiled.close()
+		compiled.Close()
 	}
 
 	return o, nil
@@ -650,7 +658,7 @@ func newOptions(input Input) (*options, error) {
 
 // newScript builds a script for one reader. Each reader needs its own,
 // because a goja runtime cannot be used from two goroutines at once.
-func (o *options) newScript() (*script, error) {
+func (o *options) newScript() (*filter, error) {
 	if o.source == "" {
 		return nil, nil
 	}
