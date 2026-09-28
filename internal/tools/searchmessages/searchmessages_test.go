@@ -501,3 +501,84 @@ func (s *SearchMessagesSuite) TestRunawayScriptStopsAtTheTimeout() {
 			"a runaway script must be interrupted at the timeout: the tool promises callers that scripts are time-limited, and a scan that never returns holds a goroutine forever")
 	}
 }
+
+func (s *SearchMessagesSuite) TestNewestFirstSpansEveryPartition() {
+	// Kafka orders records within a partition, never across them, so "the
+	// newest matches in this topic" can only mean newest by timestamp. A scan
+	// that drains one partition before looking at the next answers with
+	// whichever partition it happened to read first, which is a confidently
+	// wrong answer rather than a slow one.
+	topic := s.env.CreateTopicWithPartitions(s.T(), "search-newest-across", 3)
+
+	old := time.Now().Add(-24 * time.Hour)
+	recent := time.Now().Add(-1 * time.Minute)
+
+	s.env.Produce(s.T(), topic,
+		// Partition 0 holds enough stale matches to satisfy max_matches on its
+		// own, so a per-partition scan stops here and never reads the rest.
+		testenv.Message{Value: "hit day-old a", Partition: 0, Timestamp: old},
+		testenv.Message{Value: "hit day-old b", Partition: 0, Timestamp: old.Add(time.Second)},
+		testenv.Message{Value: "hit day-old c", Partition: 0, Timestamp: old.Add(2 * time.Second)},
+
+		// The genuinely newest matches are on later partitions.
+		testenv.Message{Value: "hit minutes-old p1", Partition: 1, Timestamp: recent},
+		testenv.Message{Value: "hit minutes-old p2", Partition: 2, Timestamp: recent.Add(time.Second)},
+	)
+
+	out, err := searchmessages.Run(
+		s.T().Context(),
+		s.env.Admin(),
+		s.env.Reader(),
+		"",
+		searchmessages.Input{Topic: topic, Script: hitScript, MaxMatches: 2},
+	)
+
+	s.Require().NoError(err, "a newest-first search across partitions must succeed")
+	s.Require().Len(out.Matches, 2, "the match limit of two must be respected")
+
+	partitions := []int32{out.Matches[0].Partition, out.Matches[1].Partition}
+
+	s.Run("the newest matches are returned whichever partition holds them", func() {
+		s.Require().NotContains(partitions, int32(0),
+			"partition 0 holds only day-old matches, so returning one means the search answered from the partition it read first rather than from the whole topic")
+		s.Require().ElementsMatch([]int32{2, 1}, partitions,
+			"the two newest matches live on partitions 2 and 1, and newest_first must find them wherever they are")
+	})
+
+	s.Run("matches are ordered newest first across partitions", func() {
+		s.Require().False(out.Matches[0].Timestamp.Before(out.Matches[1].Timestamp),
+			"newest_first must order the merged result by time, or the caller cannot tell which of two partitions holds the more recent message")
+	})
+}
+
+func (s *SearchMessagesSuite) TestNewestFirstReadsEveryPartitionBeforeStopping() {
+	// The observable symptom of the same bug: a partition that was never read
+	// cannot appear in scanned_ranges, and a caller checking coverage would be
+	// told the search was complete when most of the topic went unexamined.
+	topic := s.env.CreateTopicWithPartitions(s.T(), "search-newest-coverage", 3)
+
+	s.env.Produce(s.T(), topic,
+		testenv.Message{Value: "hit a", Partition: 0},
+		testenv.Message{Value: "hit b", Partition: 0},
+		testenv.Message{Value: "hit c", Partition: 1},
+		testenv.Message{Value: "hit d", Partition: 2},
+	)
+
+	out, err := searchmessages.Run(
+		s.T().Context(),
+		s.env.Admin(),
+		s.env.Reader(),
+		"",
+		searchmessages.Input{Topic: topic, Script: hitScript, MaxMatches: 1},
+	)
+
+	s.Require().NoError(err, "the search must succeed")
+
+	scanned := make([]int32, 0, len(out.ScannedRanges))
+	for _, rng := range out.ScannedRanges {
+		scanned = append(scanned, rng.Partition)
+	}
+
+	s.Require().ElementsMatch([]int32{0, 1, 2}, scanned,
+		"every partition must be examined before a newest-first search can claim to have found the newest match, since another partition may hold a more recent one")
+}

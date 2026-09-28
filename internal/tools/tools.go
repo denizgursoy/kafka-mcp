@@ -26,6 +26,7 @@ import (
 	"github.com/denizgursoy/kafka-mcp/internal/tools/consumerlag"
 	"github.com/denizgursoy/kafka-mcp/internal/tools/copymessage"
 	"github.com/denizgursoy/kafka-mcp/internal/tools/createtopic"
+	"github.com/denizgursoy/kafka-mcp/internal/tools/deletetopic"
 	"github.com/denizgursoy/kafka-mcp/internal/tools/describetopic"
 	"github.com/denizgursoy/kafka-mcp/internal/tools/getmessage"
 	"github.com/denizgursoy/kafka-mcp/internal/tools/listclusters"
@@ -61,6 +62,7 @@ func Names() []string {
 		"consumer_lag",
 		"copy_message",
 		"create_topic",
+		"delete_topic",
 		"describe_topic",
 		"get_message",
 		"list_clusters",
@@ -143,6 +145,7 @@ func Register(
 		endpoint.add("add_partitions", func() { addpartitions.Register(server, kafka, kafka.Reader()) })
 		endpoint.add("commit_offset", func() { commitoffset.Register(server, kafka) })
 		endpoint.add("create_topic", func() { createtopic.Register(server, kafka) })
+		endpoint.add("delete_topic", func() { deletetopic.Register(server, kafka) })
 	}
 
 	// These need the whole roster rather than one cluster: copy_message and

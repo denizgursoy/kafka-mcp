@@ -130,13 +130,16 @@ investigation goes wrong.
 
 ### 6. Consider parallelism for large scans
 
-`parallelism` splits each partition's offsets between that many readers, so
-even a single-partition topic is scanned concurrently. It is worth setting for
-`count_only`, `output_file` or a full-range search.
+`parallelism` splits a **single-partition** topic's offsets between that many
+readers, which is what makes a full scan of one large partition fast. It is
+worth setting for `count_only`, `output_file` or a full-range search on such a
+topic.
 
-It is usually **not** worth it for a narrow newest-first lookup: a sequential
-scan reads the newest chunk and stops, while parallel readers have already read
-the older ranges that sequential scanning would never have touched.
+A multi-partition topic is already read across its partitions together, so the
+setting does not apply there. Every partition's newest chunk is read before any
+partition is read more deeply, which is what makes `newest_first` mean newest
+in the topic rather than newest in the partition that happened to be read
+first. Matches are merged by timestamp.
 
 ### 7. Handle large result sets deliberately
 

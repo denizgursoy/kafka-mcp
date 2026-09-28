@@ -8,8 +8,6 @@ import (
 	"sync"
 	"time"
 
-	"golang.org/x/sync/errgroup"
-
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/twmb/franz-go/pkg/kadm"
 	"github.com/twmb/franz-go/pkg/kgo"
@@ -21,13 +19,13 @@ import (
 type Input struct {
 	Topic         string     `json:"topic" jsonschema:"Topic to search. Matched exactly and case-sensitively."`
 	Script        string     `json:"script,omitempty" jsonschema:"Optional JavaScript that decides whether a message matches. Return true to keep it. In scope: value (the parsed JSON document, or the raw text when the message is not JSON), key (string or null), headers (object of header name to string), partition, offset and timestamp (a Date). Examples: return key === 'order-123'; return value.eventType === 'NEW' && value.payload.amount >= 500; return value.payload.cancelledAt === null. Omit to match every message."`
-	Parallelism   int        `json:"parallelism,omitempty" jsonschema:"Optional number of concurrent readers, from 1 to 16. Defaults to 1. Each reader takes its own slice of a partition, so a topic with one partition is parallelised too. Worth using for count_only, output_file or a full scan; a narrow newest-first search is usually faster without it, because sequential scanning can stop after the newest chunk."`
+	Parallelism   int        `json:"parallelism,omitempty" jsonschema:"Optional number of concurrent readers, from 1 to 16. Defaults to 1. It splits a single-partition topic's offsets between readers, which makes a full scan of one large partition faster. A multi-partition topic is already read across its partitions together, so this does not apply there. Worth using for count_only, output_file or a full scan of one partition."`
 	Partitions    []int32    `json:"partitions,omitempty" jsonschema:"Optional partitions to restrict the search to. Defaults to every partition. Do not guess a partition from a message key: producers may set the partition explicitly, so the key does not determine it."`
 	FromOffset    *int64     `json:"from_offset,omitempty" jsonschema:"Optional inclusive offset to start scanning from, applied to every searched partition."`
 	ToOffset      *int64     `json:"to_offset,omitempty" jsonschema:"Optional exclusive offset to stop scanning at, applied to every searched partition."`
 	FromTimestamp *time.Time `json:"from_timestamp,omitempty" jsonschema:"Optional inclusive start time (RFC3339). Resolved to the first offset at or after this time."`
 	ToTimestamp   *time.Time `json:"to_timestamp,omitempty" jsonschema:"Optional exclusive end time (RFC3339). Resolved to the first offset at or after this time."`
-	Direction     string     `json:"direction,omitempty" jsonschema:"Optional scan direction: newest_first (default) or oldest_first. Decides which matches are found first when max_matches cuts the search short."`
+	Direction     string     `json:"direction,omitempty" jsonschema:"Optional scan direction: newest_first (default) or oldest_first. Decides which matches are kept when max_matches cuts the search short. Every partition is read together, so newest_first means newest in the topic, ordered by timestamp, rather than newest in one partition."`
 	MaxMatches    int        `json:"max_matches,omitempty" jsonschema:"Optional maximum number of matches to return. Defaults to 10."`
 	MaxScanned    int        `json:"max_messages_scanned,omitempty" jsonschema:"Optional maximum number of messages to read before giving up. Defaults to 10000."`
 	MaxValueBytes int        `json:"max_value_bytes,omitempty" jsonschema:"Optional maximum value bytes to return per match. Defaults to 512. Longer values are cut and flagged with truncated=true."`
@@ -89,6 +87,12 @@ const description = `
 Search message key, value, headers or metadata with a JavaScript predicate.
 The script returns true for a match and receives value (parsed JSON or text),
 key, headers, partition, offset and timestamp. Omit it to match all messages.
+
+Every partition is read together, one chunk deep at a time, so a limited
+newest-first search returns the newest matches in the topic rather than the
+newest in whichever partition was read first. Kafka orders records only within a
+partition, so matches are merged by timestamp; producers set timestamps unless
+the topic uses LogAppendTime.
 
 Kafka has no server-side search, so scans are bounded. Check complete,
 stopped_reason and scanned_ranges before treating no matches as conclusive.
@@ -177,30 +181,20 @@ func Run(
 		collecting: !options.countOnly && export == nil,
 	}
 
-	// Partitions are scanned one at a time, with every reader working on the
-	// same partition. That keeps the number of connections at parallelism
-	// regardless of how many partitions the topic has, and it means a
-	// partition is complete before the next begins, so its matches can be
-	// merged without waiting on other partitions.
-	for _, window := range windows {
-		if out.StoppedReason != reasonExhausted {
-			break
-		}
-
-		if err := state.scanPartition(ctx, reader, input.Topic, window); err != nil {
-			return Output{}, err
-		}
-
-		// Stopping here means later partitions go unscanned. That is reported
-		// through stopped_reason and scanned_ranges, so a caller can see the
-		// answer is partial rather than assume the topic was covered.
-		if state.collecting && len(out.Matches) >= options.maxMatches {
-			out.Matches = out.Matches[:options.maxMatches]
-
-			if out.StoppedReason == reasonExhausted {
-				out.StoppedReason = reasonMaxMatches
-			}
-		}
+	// Every partition is scanned together, one chunk deep at a time, rather
+	// than one partition being drained before the next begins.
+	//
+	// Kafka orders records within a partition and never across them, so "the
+	// newest matches in this topic" can only mean newest by timestamp. Draining
+	// partition 0 first and stopping at max_matches answers with whichever
+	// partition happened to be read first: a topic whose newest messages live
+	// on partition 5 would report day-old matches from partition 0 as the
+	// newest. That is a confidently wrong answer rather than a slow one.
+	//
+	// One Scan takes every partition's current chunk, so this costs one
+	// connection however many partitions the topic has.
+	if err := state.scan(ctx, reader, input.Topic, windows); err != nil {
+		return Output{}, err
 	}
 
 	if export != nil {
@@ -223,6 +217,12 @@ type scanState struct {
 	export     *exporter
 	out        *Output
 	collecting bool
+	// ordered is true when a round reads a single range, so records arrive in
+	// offset order and the first matches seen really are the oldest. An
+	// oldest-first search can then stop the moment it has enough, instead of
+	// reading the rest of the chunk. With several partitions in flight the
+	// arrival order means nothing and the whole round has to be read.
+	ordered bool
 
 	// mu guards every field below it, because readers run concurrently.
 	mu      sync.Mutex
@@ -230,40 +230,30 @@ type scanState struct {
 	matches map[int32]int
 }
 
-// scanPartition reads one partition, splitting its offset range between the
-// configured number of readers.
-func (s *scanState) scanPartition(
+// scan reads every partition together, one chunk deep at a time.
+//
+// A round takes the current chunk of every partition in a single Scan, so the
+// newest records of the whole topic are seen before any partition is read more
+// deeply. Only when a round leaves the search short of max_matches does it step
+// every partition back another chunk.
+//
+// The alternative — draining one partition before starting the next — makes
+// "newest" mean "newest in the partition that happened to be read first".
+func (s *scanState) scan(
 	ctx context.Context,
 	reader *records.Reader,
 	topic string,
-	window records.Range,
+	windows []records.Range,
 ) error {
 
-	slices := splitRange(window, s.options.parallelism)
-
-	if len(slices) == 1 {
-		return s.scanSlice(ctx, reader, topic, slices[0])
+	rounds := rounds(windows, s.options.newestFirst, s.options.parallelism)
+	if len(rounds) == 0 {
+		return nil
 	}
 
-	group, groupCtx := errgroup.WithContext(ctx)
-
-	for _, slice := range slices {
-		group.Go(func() error {
-			return s.scanSlice(groupCtx, reader, topic, slice)
-		})
-	}
-
-	return group.Wait()
-}
-
-// scanSlice reads one contiguous offset range with a connection and a script
-// of its own, because neither can be shared between goroutines.
-func (s *scanState) scanSlice(
-	ctx context.Context,
-	reader *records.Reader,
-	topic string,
-	slice records.Range,
-) error {
+	// A round covering one range delivers records in offset order, which is
+	// what lets an oldest-first search stop at the match that satisfies it.
+	s.setOrdered(len(rounds[0]) == 1)
 
 	filter, err := s.options.newScript()
 	if err != nil {
@@ -288,21 +278,22 @@ func (s *scanState) scanSlice(
 
 	defer session.Close()
 
-	for _, chunk := range chunks([]records.Range{slice}, s.options.newestFirst) {
+	for _, round := range rounds {
 		if s.stopped() {
 			return nil
 		}
 
-		// Records inside a chunk always arrive oldest first, because Kafka
-		// only reads forward. A newest-first search therefore cannot stop at
-		// the first match in a chunk: that is the chunk's oldest match. It
-		// reads the whole chunk and keeps the newest matches instead, which is
-		// affordable because a chunk is bounded to chunkSize records.
+		// Records inside a chunk always arrive oldest first, because Kafka only
+		// reads forward, and records from different partitions arrive in no
+		// order at all. A newest-first search therefore cannot stop at the
+		// first match: it reads the whole round and keeps the newest matches,
+		// which is affordable because a round is bounded by chunkSize per
+		// partition.
 		found := make([]records.Message, 0, s.options.maxMatches)
 
 		var scanErr error
 
-		err := session.Scan(ctx, []records.Range{chunk}, func(record *kgo.Record) bool {
+		err := session.Scan(ctx, round, func(record *kgo.Record) bool {
 			matched, err := s.visit(record, filter, &found)
 			if err != nil {
 				scanErr = err
@@ -378,7 +369,14 @@ func (s *scanState) visit(
 		case s.collecting:
 			*found = append(*found, records.Render(record, s.options.maxValueBytes))
 
-			if !s.options.newestFirst &&
+			// Stopping mid-round is only sound when the round reads a single
+			// range, because then records arrive oldest first and the matches
+			// in hand are genuinely the oldest. With several partitions in
+			// flight they arrive in no order, so stopping here would return
+			// whichever partition answered first rather than the oldest
+			// matches. A round is bounded by chunkSize per partition, so
+			// reading it out costs little, and keep sorts by timestamp after.
+			if s.ordered && !s.options.newestFirst &&
 				len(s.out.Matches)+len(*found) >= s.options.maxMatches {
 				s.out.StoppedReason = reasonMaxMatches
 
@@ -404,11 +402,17 @@ func (s *scanState) keep(found []records.Message) {
 		return
 	}
 
-	s.out.Matches = append(s.out.Matches, keep(found, s.options)...)
+	// Merging across rounds, not only within one: a later round reads deeper
+	// into every partition, and a match found there is older than what an
+	// earlier round returned. Re-sorting the whole set keeps the reported
+	// order true no matter which round produced a match.
+	s.out.Matches = append(s.out.Matches, found...)
+	s.out.Matches = keep(s.out.Matches, s.options)
 
-	// Stopping as soon as the limit is met is what keeps a narrow newest-first
-	// search cheap: it reads the newest chunk and goes no further. Without
-	// this the scan would read the whole range to return the same answer.
+	// Stopping once the limit is met is what keeps a narrow newest-first search
+	// cheap. It is only sound because a round covers every partition at the
+	// same depth: the matches in hand are the newest in the topic, not merely
+	// the newest in the partition read first.
 	if len(s.out.Matches) >= s.options.maxMatches &&
 		s.out.StoppedReason == reasonExhausted {
 
@@ -423,8 +427,16 @@ func (s *scanState) timedOut(found []records.Message) {
 	s.out.StoppedReason = reasonTimeout
 
 	if s.collecting {
-		s.out.Matches = append(s.out.Matches, keep(found, s.options)...)
+		s.out.Matches = keep(append(s.out.Matches, found...), s.options)
 	}
+}
+
+// setOrdered records whether records arrive in offset order for this search.
+func (s *scanState) setOrdered(ordered bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.ordered = ordered
 }
 
 func (s *scanState) stopped() bool {
@@ -468,31 +480,56 @@ func splitRange(window records.Range, parallelism int) []records.Range {
 	return slices
 }
 
-// keep reduces a chunk's matches to the ones worth returning: the newest when
+// keep reduces a round's matches to the ones worth returning: the newest when
 // searching newest first, the oldest otherwise.
+//
+// A round spans every partition, and records from different partitions arrive
+// in no order at all, so arrival order says nothing about which match is newer.
+// The matches are sorted by timestamp, which is the only thing comparable
+// across partitions: Kafka orders offsets within a partition and never between
+// them.
+//
+// Timestamps are set by the producer unless the topic uses LogAppendTime, so
+// they can be skewed or even out of order within a partition. That is still the
+// best available answer to "which of these is newer", and it is the answer the
+// caller asked for.
 func keep(found []records.Message, options *options) []records.Message {
-	if len(found) <= options.maxMatches {
-		if options.newestFirst {
-			reverse(found)
-		}
+	sortByTime(found, options.newestFirst)
 
-		return found
+	if len(found) > options.maxMatches {
+		found = found[:options.maxMatches]
 	}
 
-	if options.newestFirst {
-		found = found[len(found)-options.maxMatches:]
-		reverse(found)
-
-		return found
-	}
-
-	return found[:options.maxMatches]
+	return found
 }
 
-func reverse(messages []records.Message) {
-	for i, j := 0, len(messages)-1; i < j; i, j = i+1, j-1 {
-		messages[i], messages[j] = messages[j], messages[i]
-	}
+// sortByTime orders matches by timestamp, newest or oldest first.
+//
+// Partition and offset break ties so that two messages sharing a timestamp —
+// common when a producer batches — always come back in the same order. Without
+// that, two identical searches could disagree.
+func sortByTime(messages []records.Message, newestFirst bool) {
+	sort.SliceStable(messages, func(i, j int) bool {
+		left, right := messages[i], messages[j]
+
+		if !left.Timestamp.Equal(right.Timestamp) {
+			if newestFirst {
+				return left.Timestamp.After(right.Timestamp)
+			}
+
+			return left.Timestamp.Before(right.Timestamp)
+		}
+
+		if left.Partition != right.Partition {
+			return left.Partition < right.Partition
+		}
+
+		if newestFirst {
+			return left.Offset > right.Offset
+		}
+
+		return left.Offset < right.Offset
+	})
 }
 
 func track(scanned map[int32]*ScannedRange, record *kgo.Record) {
@@ -542,19 +579,11 @@ func finish(
 		return out.MatchesByPart[i].Partition < out.MatchesByPart[j].Partition
 	})
 
-	// Matches arrive in the order the chunks were read. Present them the way
-	// the caller asked to search: newest first means highest offset first.
-	sort.SliceStable(out.Matches, func(i, j int) bool {
-		if out.Matches[i].Partition != out.Matches[j].Partition {
-			return out.Matches[i].Partition < out.Matches[j].Partition
-		}
-
-		if options.newestFirst {
-			return out.Matches[i].Offset > out.Matches[j].Offset
-		}
-
-		return out.Matches[i].Offset < out.Matches[j].Offset
-	})
+	// Present the matches the way the caller asked to search. Grouping by
+	// partition first would undo the merge: it would bury a match from a late
+	// partition below every match from partition 0, whatever their times, and
+	// the newest message in the topic would not be the one reported first.
+	sortByTime(out.Matches, options.newestFirst)
 
 	// When bodies are returned, the count reports what the caller received.
 	// Counting and exporting instead report every match seen, which is the
@@ -798,6 +827,72 @@ func offsetsAt(
 	})
 
 	return resolved, nil
+}
+
+// rounds groups the partitions' chunks so that one round reads the same depth
+// of every partition at once.
+//
+// Round 0 is the newest chunk of every partition (or the oldest, for an
+// oldest-first search), round 1 the chunk behind it, and so on. Scanning a
+// round therefore covers the whole topic at that depth before going deeper,
+// which is what lets a limited search return the newest matches of the topic
+// rather than of whichever partition was read first.
+//
+// Partitions run out at different depths, because they rarely hold the same
+// number of records. A round simply contains fewer partitions once the short
+// ones are exhausted.
+func rounds(windows []records.Range, newestFirst bool, parallelism int) [][]records.Range {
+	// One partition needs no merging: its chunks are already in the order the
+	// caller asked for, and splitting it between readers is what keeps a full
+	// scan of a wide partition fast. Each chunk is its own round, because a
+	// Scan consumes at most one range per partition — it keys its bookkeeping
+	// by partition number, so two slices of the same partition in one round
+	// would silently collide and half the range would go unread.
+	if len(windows) == 1 {
+		sliced := chunks(splitRange(windows[0], parallelism), newestFirst)
+
+		grouped := make([][]records.Range, 0, len(sliced))
+
+		for _, chunk := range sliced {
+			grouped = append(grouped, []records.Range{chunk})
+		}
+
+		return grouped
+	}
+
+	perPartition := make([][]records.Range, 0, len(windows))
+	deepest := 0
+
+	for _, window := range windows {
+		sliced := chunks([]records.Range{window}, newestFirst)
+		if len(sliced) == 0 {
+			continue
+		}
+
+		perPartition = append(perPartition, sliced)
+
+		if len(sliced) > deepest {
+			deepest = len(sliced)
+		}
+	}
+
+	grouped := make([][]records.Range, 0, deepest)
+
+	for depth := range deepest {
+		round := make([]records.Range, 0, len(perPartition))
+
+		for _, chunked := range perPartition {
+			if depth < len(chunked) {
+				round = append(round, chunked[depth])
+			}
+		}
+
+		if len(round) > 0 {
+			grouped = append(grouped, round)
+		}
+	}
+
+	return grouped
 }
 
 // chunks splits the windows into bounded scan ranges. Kafka only reads

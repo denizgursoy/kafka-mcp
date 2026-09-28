@@ -309,10 +309,10 @@ Three layers, and only one of them is real security:
 ### What a read-only endpoint exposes
 
 `read_only: true` does more than refuse a write: the endpoint does not list the
-tools whose only purpose is to write. `add_partitions`, `commit_offset` and
-`create_topic` are absent from `tools/list` on a read-only endpoint, so a client
-never sees a tool it could not have used, and their preview cannot describe a
-change this endpoint would never apply.
+tools whose only purpose is to write. `add_partitions`, `commit_offset`,
+`create_topic` and `delete_topic` are absent from `tools/list` on a read-only
+endpoint, so a client never sees a tool it could not have used, and their
+preview cannot describe a change this endpoint would never apply.
 
 A writable endpoint can withhold individual tools too, with its `tools` map.
 That is the same mechanism seen from the client: the tool is
@@ -673,18 +673,34 @@ and are stopped if they exceed the search timeout. They are **not** bounded by
 memory: something like `'x'.repeat(1e12)` can exhaust the server process.
 Scripts are trusted input; the blast radius is this server, not the cluster.
 
+#### Scan order
+
+Every partition is read together, one chunk deep at a time: the newest chunk of
+every partition, then the chunk behind it, and so on. A limited newest-first
+search therefore returns the newest matches **in the topic**, not the newest in
+whichever partition happened to be read first.
+
+Kafka orders records within a partition and never across them, so matches are
+merged and reported by **timestamp**, with partition and offset breaking ties.
+Timestamps are set by the producer unless the topic uses `LogAppendTime`, so
+they can be skewed; it is still the only thing comparable between partitions.
+
+One scan reads every partition through a single connection, so a wide topic
+costs no more connections than a narrow one. It does read more: a limited
+search on a 12-partition topic examines the newest chunk of all twelve rather
+than stopping inside the first. `max_messages_scanned` still bounds it, and may
+become the `stopped_reason` on a wide topic sooner than on a narrow one.
+
 #### Parallelism
 
-`parallelism` splits each partition's offset range between that many readers,
-so a single-partition topic is parallelised too. Partitions are scanned one at
-a time, so the number of connections stays at `parallelism` however many
-partitions the topic has. A partition too small to divide is read by one
+`parallelism` splits a **single-partition** topic's offset range between that
+many readers, which is what makes a full scan of one large partition fast. A
+multi-partition topic is already read in parallel across its partitions, so the
+setting does not apply there, and a range too small to divide is read by one
 reader.
 
-It pays off for `count_only`, `output_file` and full scans. A narrow
-newest-first search is usually faster without it, because a sequential scan
-stops after the newest chunk while parallel readers have already read the
-older ranges.
+It pays off for `count_only`, `output_file` and full scans of a single
+partition.
 
 #### Result
 
@@ -799,7 +815,8 @@ export directory and the tools this endpoint exposes. Takes no parameters. The
 password is never reported.
 
 `tools` is the list for this endpoint, not for the deployment: a read-only
-endpoint omits `add_partitions`, `commit_offset` and `create_topic`, because it
+endpoint omits `add_partitions`, `commit_offset`, `create_topic` and
+`delete_topic`, because it
 does not register them, and any endpoint omits whatever its `tools`
 configuration switches off.
 
@@ -869,6 +886,49 @@ validate-only request catches it.
 
 Use `add_partitions` to change an existing topic's partition count; this tool
 never modifies a topic it did not create.
+
+### `delete_topic`
+
+Deletes topics. **The most destructive tool here**: deleting a topic destroys
+every message in it, Kafka has no undo, and any consumer group reading it
+breaks. Not exposed on a read-only endpoint.
+
+| Parameter | Type     | Required | Meaning                                       |
+| --------- | -------- | -------- | --------------------------------------------- |
+| `items`   | object[] | yes      | 1 to 100 topics to delete                     |
+| `confirm` | bool     | no       | Default false: preview only, nothing is deleted |
+
+Item fields:
+
+| Field                   | Type   | Required | Meaning                                              |
+| ----------------------- | ------ | -------- | ---------------------------------------------------- |
+| `topic`                 | string | yes      | Topic to delete. It must exist                       |
+| `acknowledge_data_loss` | bool   | no       | Required when the topic still holds messages         |
+
+Without `confirm` it reports, per topic, how many messages would be destroyed,
+how many partitions it had, and which consumer groups had committed offsets for
+it:
+
+```json
+{"results": [{"index": 0, "result": {
+   "topic": "orders-old", "partitions": 6, "message_count": 41207,
+   "consumer_groups": ["payments"], "deleted": false, "would_delete": true,
+   "warnings": ["41207 message(s) would be destroyed, and Kafka cannot restore them: the only recovery is a backup taken beforehand"]}}],
+ "succeeded": 1, "failed": 0, "applied": 0, "atomic": false}
+```
+
+Two separate acknowledgements are required, because they answer different
+questions. `confirm` says the caller meant to delete; `acknowledge_data_loss`
+says they know what is inside. A topic holding messages is refused without both,
+and the count is re-read at deletion time, so a topic that gained messages since
+the preview is still caught.
+
+Internal topics such as `__consumer_offsets` are refused outright at any level
+of acknowledgement: they hold cluster state rather than a caller's data, and
+deleting one breaks every consumer at once.
+
+Duplicate topics in one batch are refused before anything is deleted. Deletion
+is not atomic — topics removed before a later item failed stay removed.
 
 ### `commit_offset`
 
@@ -980,7 +1040,7 @@ deleted; it stays until retention removes it.
 
 `skills/kafka-debugging/SKILL.md` is the one skill an agent loads. It routes to
 the scenario guides under `skills/kafka-debugging/references/`, rather than
-holding all seven workflows itself, so a session reads only the one it needs:
+holding all eight workflows itself, so a session reads only the one it needs:
 
 - `find-message.md` — locating a message from something the user knows about it.
 - `check-lag.md` — measuring lag and throughput, and judging when a backlog will
@@ -995,6 +1055,8 @@ holding all seven workflows itself, so a session reads only the one it needs:
   reproducing a failure in another cluster, or seeding a topic.
 - `compare-clusters.md` — finding what differs between two environments, and
   creating the topics one of them is missing.
+- `delete-topic.md` — removing a topic and everything in it, after the user has
+  seen what that destroys.
 
 The umbrella also resolves the overlap between them: "the consumer is behind"
 opens three of these guides, and `consumer_lag`'s `status` is what decides which

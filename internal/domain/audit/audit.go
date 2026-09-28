@@ -42,7 +42,19 @@ var mutating = map[string]bool{
 	"commit_offset":   true,
 	"copy_message":    true,
 	"create_topic":    true,
+	"delete_topic":    true,
 	"produce_message": true,
+}
+
+// Mutates reports whether a tool changes the cluster, and so is recorded at
+// info rather than debug.
+//
+// It is exported so the registration tests can assert that every tool a
+// read-only endpoint withholds is audited as a write. Those two lists are
+// maintained in different packages, and a tool added to one and missed in the
+// other is silently absent from a deployment's audit trail.
+func Mutates(tool string) bool {
+	return mutating[tool]
 }
 
 // item is the target-naming half of one batch entry.

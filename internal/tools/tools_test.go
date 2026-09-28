@@ -8,6 +8,7 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/stretchr/testify/suite"
 
+	"github.com/denizgursoy/kafka-mcp/internal/domain/audit"
 	"github.com/denizgursoy/kafka-mcp/internal/domain/config"
 	"github.com/denizgursoy/kafka-mcp/internal/domain/kafkaclient"
 	"github.com/denizgursoy/kafka-mcp/internal/tools/serverconfig"
@@ -168,6 +169,8 @@ func (s *RegistrationSuite) TestExposedTools() {
 			"add_partitions can only ever refuse on a read-only cluster, and offering its preview advertises a capability the server does not have")
 		s.Require().NotContains(listed, "commit_offset",
 			"commit_offset can only ever refuse on a read-only cluster, so listing it wastes a call and misleads the caller about what is possible")
+		s.Require().NotContains(listed, "delete_topic",
+			"delete_topic is the most destructive tool here, so a read-only endpoint must not even advertise it: the tool list is what says this endpoint cannot destroy anything")
 	})
 
 	s.Run("a read-only cluster still exposes every tool that only reads", func() {
@@ -273,4 +276,33 @@ func (s *RegistrationSuite) TestRejectsAnUnusableToolConfiguration() {
 		s.Require().Contains(err.Error(), "server_config",
 			"the error must name the tool it refuses to withhold")
 	})
+}
+
+// TestEveryWriteToolIsAudited guards a drift this suite has already caught
+// once: delete_topic was registered here and left out of the audit package's
+// set of mutating tools, so the most destructive operation the server has was
+// logged at debug and did not appear in a default deployment's audit trail.
+//
+// A tool a read-only endpoint refuses is, by definition, one that changes the
+// cluster, so the registration in this package already knows the answer. This
+// asserts the audit package agrees with it.
+func (s *RegistrationSuite) TestEveryWriteToolIsAudited() {
+	writable, _ := s.exposed("writable")
+	readOnly, _ := s.exposed("readonly")
+
+	withheld := make(map[string]struct{}, len(readOnly))
+	for _, name := range readOnly {
+		withheld[name] = struct{}{}
+	}
+
+	for _, name := range writable {
+		if _, exposed := withheld[name]; exposed {
+			continue
+		}
+
+		// Only a tool whose sole purpose is to change this cluster is dropped
+		// on a read-only endpoint, so everything left here is a write.
+		s.Require().True(audit.Mutates(name),
+			"%s is withheld from a read-only endpoint, so it changes the cluster and must be audited at info: a write that only appears at debug is missing from the trail a deployment actually keeps", name)
+	}
 }
