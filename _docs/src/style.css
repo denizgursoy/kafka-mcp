@@ -1,3 +1,29 @@
+/* Vite embeds these WOFF2 files in the production CSS, so fonts arrive with
+   the render-blocking stylesheet instead of requiring another network request. */
+@font-face {
+  font-family: 'Geist Pixel';
+  font-style: normal;
+  font-weight: 400;
+  font-display: block;
+  src: url('../node_modules/@fontsource/geist-pixel/files/geist-pixel-latin-400-normal.woff2') format('woff2');
+}
+
+@font-face {
+  font-family: 'IBM Plex Mono';
+  font-style: normal;
+  font-weight: 400;
+  font-display: block;
+  src: url('../node_modules/@fontsource/ibm-plex-mono/files/ibm-plex-mono-latin-400-normal.woff2') format('woff2');
+}
+
+@font-face {
+  font-family: 'IBM Plex Mono';
+  font-style: normal;
+  font-weight: 500;
+  font-display: block;
+  src: url('../node_modules/@fontsource/ibm-plex-mono/files/ibm-plex-mono-latin-500-normal.woff2') format('woff2');
+}
+
 :root {
   --bg: #0b0b0a;
   --bg-2: #121210;
@@ -15,6 +41,9 @@
   --violet: #cdb3ea;
 
   --pixel: 'Geist Pixel', ui-monospace, monospace;
+  /* Geist Pixel draws on a 38-unit grid in a 1000-unit em. Pixel text is sized
+     in whole multiples of this, so each font pixel lands on whole screen pixels. */
+  --cell: calc(1000px / 38);
   --mono: 'IBM Plex Mono', ui-monospace, 'SFMono-Regular', Menlo, monospace;
 
   --max: 1180px;
@@ -74,7 +103,7 @@ code { font-family: var(--mono); font-size: 0.92em; color: var(--amber-ink); }
 .mcp-logo { width: 30px; height: 30px; color: var(--ink); flex: none; }
 
 .brand-text { display: flex; flex-direction: column; line-height: 1.15; }
-.brand-name { font: 20px var(--pixel); letter-spacing: 0.06em; }
+.brand-name { font: var(--cell) var(--pixel); }
 .brand-name::after {
   content: '';
   display: inline-block;
@@ -124,11 +153,10 @@ h1, h2 {
   font-family: var(--pixel);
   font-weight: 400;
   margin: 0;
-  letter-spacing: -0.01em;
 }
 
 h1 {
-  font-size: clamp(56px, 11vw, 148px);
+  font-size: calc(2 * var(--cell));
   line-height: 0.92;
   color: var(--ink);
 }
@@ -137,6 +165,10 @@ h1 {
   min-height: calc(2 * 0.92em);
 }
 .typed { white-space: pre-line; }
+
+@media (min-width: 720px) { h1 { font-size: calc(3 * var(--cell)); } }
+@media (min-width: 960px) { h1 { font-size: calc(4 * var(--cell)); } }
+@media (min-width: 1200px) { h1 { font-size: calc(5 * var(--cell)); } }
 
 .caret {
   display: inline-block;
@@ -201,7 +233,7 @@ h1 {
   margin-bottom: 4px;
 }
 .spec dd { margin: 0; font-size: 14px; color: var(--ink); }
-.spec .big { font: 56px/1 var(--pixel); color: var(--ink); }
+.spec .big { font: calc(2 * var(--cell))/1 var(--pixel); color: var(--ink); }
 
 /* Session */
 
@@ -260,10 +292,11 @@ h1 {
 
 .section-head { max-width: 68ch; margin-bottom: 48px; }
 .section-head h2 {
-  font-size: clamp(40px, 6vw, 72px);
+  font-size: calc(2 * var(--cell));
   line-height: 1;
   margin-bottom: 20px;
 }
+@media (min-width: 960px) { .section-head h2 { font-size: calc(3 * var(--cell)); } }
 .section-head h2::after {
   content: '';
   display: inline-block;
@@ -278,7 +311,7 @@ h1 {
 h3 { font-weight: 500; }
 
 .sub {
-  font: 22px var(--pixel);
+  font: var(--cell) var(--pixel);
   margin: 64px 0 16px;
 }
 
@@ -296,8 +329,8 @@ h3 { font-weight: 500; }
 .step:first-child { border-top: 0; padding-top: 0; }
 
 .step-label { display: grid; grid-template-columns: 40px 1fr; align-content: start; column-gap: 8px; }
-.step-n { grid-row: span 2; font: 32px/1 var(--pixel); color: var(--amber); }
-.step-label h3 { margin: 0 0 8px; font: 28px/1 var(--pixel); }
+.step-n { grid-row: span 2; font: var(--cell)/1 var(--pixel); color: var(--amber); }
+.step-label h3 { margin: 0 0 8px; font: var(--cell)/1 var(--pixel); }
 .step-label p { margin: 0; color: var(--ink-2); font-size: 14.5px; }
 .step-label a { color: var(--amber); }
 
@@ -405,7 +438,7 @@ pre:hover .copy, .copy:focus-visible { opacity: 1; }
 
 .config-block { padding: 32px 0; border-top: 1px solid var(--rule); }
 .config-block-head { display: flex; gap: 8px 32px; align-items: baseline; flex-wrap: wrap; margin-bottom: 16px; }
-.config-block-head h3 { margin: 0; font: 22px var(--pixel); color: var(--amber); }
+.config-block-head h3 { margin: 0; font: var(--cell) var(--pixel); color: var(--amber); }
 .config-block-head p { margin: 0; max-width: 72ch; color: var(--ink-2); font-size: 14px; }
 
 /* Reference tables */
@@ -556,7 +589,7 @@ table.ref {
 .layer.strong { background: var(--amber); color: var(--bg); }
 .layer-kind { color: var(--ink-3); font: 14px var(--mono); margin-left: 10px; }
 .layer.strong .layer-kind { color: var(--bg); opacity: 0.7; }
-.layer h3 { margin: 0 0 10px; font: 24px var(--pixel); }
+.layer h3 { margin: 0 0 10px; font: var(--cell) var(--pixel); }
 .layer h3 code { font: inherit; color: inherit; }
 .layer p { margin: 0; font-size: 14px; color: var(--ink-2); }
 .layer.strong p { color: var(--bg); }
