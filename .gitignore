@@ -3,3 +3,5 @@
 /dist
 /kafka-mcp.yaml
 /coverage*
+/_docs/node_modules
+/_docs/dist

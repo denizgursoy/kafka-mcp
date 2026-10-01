@@ -2,6 +2,7 @@
 
 [![License](https://img.shields.io/github/license/denizgursoy/kafka-mcp?color=blue&style=flat-square)](https://raw.githubusercontent.com/denizgursoy/kafka-mcp/main/LICENSE)
 [![Coverage](https://img.shields.io/sonar/coverage/denizgursoy_kafka-mcp?logo=sonarcloud&server=https%3A%2F%2Fsonarcloud.io&style=flat-square)](https://sonarcloud.io/summary/overall?id=denizgursoy_kafka-mcp)
+[![Web](https://img.shields.io/badge/web-document-blueviolet?style=flat-square)](https://denizgursoy.github.io/kafka-mcp/)
 
 An MCP server that exposes Kafka debugging as tools an LLM can call. It speaks
 MCP over stdio by default, optionally serves streamable HTTP, and talks to Kafka
@@ -1072,6 +1073,10 @@ one is right.
 | `go test ./...`        | All tests, including container tests     |
 | `go test -short ./...` | Tests that need no containers            |
 | `go vet ./...`         | Vet all packages                         |
+
+The documentation site lives in `_docs` (Vite, pnpm). `pnpm install && pnpm dev`
+there serves it locally; pushing changes under `_docs/` to `main` publishes it to
+GitHub Pages through `.github/workflows/docs.yml`.
 
 Tests run against real containers started by `internal/domain/testenv` (a Redpanda
 broker plus Console), so Docker must be available for the full suite.

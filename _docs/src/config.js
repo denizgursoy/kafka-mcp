@@ -1,0 +1,93 @@
+// The configuration reference shown on the site. Each field is
+// [key, type, default, meaning]; the order is the order they appear in a file.
+
+export const configSections = [
+  {
+    id: 'top',
+    title: 'top level',
+    path: '',
+    intro: 'A file has four blocks. Only clusters is required.',
+    fields: [
+      ['http', 'object', '', 'Where the HTTP server listens. Used only with --server'],
+      ['output_dir', 'string', 'system temp dir', 'Where search_messages writes output_file. Exports never leave this directory'],
+      ['clusters', 'map', 'required', 'Kafka connections, keyed by a name you choose'],
+      ['endpoints', 'map', 'one per cluster', 'MCP views onto a cluster, each with its own path and policy'],
+    ],
+  },
+  {
+    id: 'http',
+    title: 'http',
+    path: 'http.',
+    intro: 'Ignored over stdio.',
+    fields: [
+      ['address', 'string', ':8090', 'Listen address'],
+      ['base_path', 'string', '/', 'Prefix for every endpoint path and /healthz, e.g. /kafka-mcp'],
+      ['cors.allow_origins', 'string[]', '["*"]', 'Origins a browser client may call from. Narrow it for any cluster that matters'],
+      ['cors.allow_methods', 'string[]', 'GET POST DELETE OPTIONS', 'All four are needed by the MCP transport'],
+      ['cors.allow_headers', 'string[]', 'mcp-session-id, …', 'Must include mcp-session-id and mcp-protocol-version'],
+      ['cors.expose_headers', 'string[]', 'Mcp-Session-Id', 'A page that cannot read the session id cannot make a second call'],
+      ['cors.allow_private_network', 'bool', 'true', 'Answers Chrome\u2019s Private Network Access preflight'],
+      ['cors.max_age', 'int', '600', 'Seconds a browser may cache the preflight'],
+    ],
+  },
+  {
+    id: 'clusters',
+    title: 'clusters.<name>',
+    path: 'clusters.<name>.',
+    intro: 'Connection details only: where the brokers are and how to authenticate.',
+    fields: [
+      ['brokers', 'string | string[]', 'required', 'One seed address, or a list'],
+      ['security.tls.enabled', 'bool', 'false', 'TLS 1.2 minimum, system trust store'],
+      ['security.tls.ca_file', 'string', '', 'Add a custom CA'],
+      ['security.tls.cert_file', 'string', '', 'Client certificate for mTLS. Needs key_file'],
+      ['security.tls.key_file', 'string', '', 'Client key for mTLS. Needs cert_file'],
+      ['security.sasl', 'list', '', 'Authentication options in order of preference. Each entry enables one of scram, plain or oauth'],
+    ],
+  },
+  {
+    id: 'sasl',
+    title: 'security.sasl[ ]',
+    path: 'security.sasl[].',
+    intro: 'Each list entry enables exactly one mechanism. The client settles on one the broker offers; it does not retry wrong credentials.',
+    fields: [
+      ['scram.enabled', 'bool', 'false', 'Turn this entry on'],
+      ['scram.algorithm', 'string', '', 'SCRAM-SHA-256 or SCRAM-SHA-512, case-insensitive'],
+      ['scram.user', 'string', '', 'Principal to authenticate as'],
+      ['scram.pass', 'string', '', 'Password. Use "{env:VAR}" to keep it out of the file'],
+      ['scram.password_file', 'string', '', 'Read the password from a file instead'],
+      ['scram.zid', 'string', '', 'Optional authorization identity'],
+      ['scram.is_token', 'bool', 'false', 'Authenticate with a delegation token'],
+      ['plain.enabled', 'bool', 'false', 'PLAIN. Also takes user, pass, password_file and zid, as scram does'],
+      ['oauth.enabled', 'bool', 'false', 'OAUTHBEARER. Configure a static token or client credentials, not both'],
+      ['oauth.token', 'string', '', 'A static token. Not renewed'],
+      ['oauth.token_url', 'string', '', 'Client-credentials token endpoint'],
+      ['oauth.client_id', 'string', '', 'Client id sent to token_url'],
+      ['oauth.client_secret', 'string', '', 'Client secret. Use "{env:VAR}"'],
+      ['oauth.scopes', 'string[]', '', 'Scopes requested with the token'],
+      ['oauth.timeout', 'duration', '10s', 'Token request timeout'],
+      ['oauth.extensions', 'map', '', 'SASL extensions sent with the token'],
+    ],
+  },
+  {
+    id: 'endpoints',
+    title: 'endpoints.<name>',
+    path: 'endpoints.<name>.',
+    intro: 'Policy and route. Several endpoints can share one cluster with different powers.',
+    fields: [
+      ['cluster', 'string', 'required', 'Which entry under clusters this endpoint serves'],
+      ['path', 'string', '/mcp/<name>', 'HTTP route. Exact match: /mcp does not capture /mcp/rw'],
+      ['description', 'string', '', 'Reported by server_config, so a caller knows what the endpoint is for'],
+      ['read_only', 'bool', 'false', 'Hides add_partitions, commit_offset, create_topic and delete_topic, and refuses writes to this cluster'],
+      ['tools', 'map', '', 'tool_name: false withholds a tool. Unknown names stop the server at startup'],
+    ],
+  },
+]
+
+export const runtime = [
+  ['--server', 'flag', 'Serve every endpoint over HTTP instead of stdio'],
+  ['--endpoint <name>', 'flag', 'Pick the endpoint for stdio. Required when there is more than one'],
+  ['CONFIG_FILE', 'env', 'Path to a YAML, TOML or JSON file. Overrides discovery'],
+  ['KAFKA_MCP_*', 'env', 'Override any field, e.g. KAFKA_MCP_HTTP_ADDRESS=:9000'],
+  ['LOG_LEVEL', 'env', 'debug shows read calls in the audit log; writes are always info'],
+  ['LOG_PRETTY', 'env', 'Human-readable logs instead of JSON'],
+]

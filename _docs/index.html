@@ -1,0 +1,432 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>kafka-mcp · Kafka debugging for LLM agents</title>
+    <meta name="description" content="An MCP server that exposes Kafka debugging as tools an LLM can call: find messages, measure lag, unblock stuck consumers and compare clusters, with every write previewed first." />
+    <meta name="theme-color" content="#0b0b0a" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+  </head>
+  <body>
+    <header class="nav">
+      <a class="brand" href="#top" aria-label="kafka-mcp home">
+        <svg class="mcp-logo" viewBox="0 0 195 195" aria-hidden="true">
+          <g fill="none" stroke="currentColor" stroke-width="12" stroke-linecap="round">
+            <path d="M25 97.8528L92.8823 29.9706C102.255 20.598 117.451 20.598 126.823 29.9706C136.196 39.3431 136.196 54.5391 126.823 63.9117L75.5581 115.177" />
+            <path d="M76.2653 114.47L126.823 63.9117C136.196 54.5391 151.392 54.5391 160.765 63.9117L161.118 64.2652C170.491 73.6378 170.491 88.8338 161.118 98.2063L99.7248 159.6C96.6006 162.724 96.6006 167.789 99.7248 170.913L112.331 183.52" />
+            <path d="M109.853 46.9411L59.6482 97.1457C50.2757 106.518 50.2757 121.714 59.6482 131.087C69.0208 140.459 84.2168 140.459 93.5894 131.087L143.794 80.8822" />
+          </g>
+        </svg>
+        <span class="brand-text">
+          <span class="brand-name">KAFKA-MCP</span>
+          <span class="brand-sub">model context protocol server</span>
+        </span>
+      </a>
+      <nav aria-label="Sections">
+        <a href="#start">start</a>
+        <a href="#configure">configure</a>
+        <a href="#tools">tools</a>
+        <a href="#scenarios">scenarios</a>
+        <a href="#safety">safety</a>
+        <a class="gh" href="https://github.com/denizgursoy/kafka-mcp">github ↗</a>
+      </nav>
+    </header>
+
+    <main id="top">
+      <section class="hero">
+        <canvas id="field" class="field" aria-hidden="true"></canvas>
+        <div class="hero-grid">
+          <div class="hero-text">
+            <h1 class="typer">
+              <span class="sr-only">find the message</span>
+              <span class="typed" id="typed" aria-hidden="true">find the
+message</span><span class="caret" aria-hidden="true"></span>
+            </h1>
+            <p class="lede">
+              kafka-mcp lets an LLM agent debug Kafka for you. It finds a message
+              by order id, measures lag, unblocks a stuck consumer and compares
+              two clusters. Every answer says what it covered. Every write shows
+              a preview before anything changes.
+            </p>
+            <div class="cta">
+              <a class="btn primary" href="#start"><span aria-hidden="true">&gt;</span> get started</a>
+              <a class="btn ghost" href="#tools">browse the tools <span aria-hidden="true">▸</span></a>
+            </div>
+          </div>
+
+          <dl class="spec">
+            <div>
+              <dt>transport</dt>
+              <dd>stdio · streamable http</dd>
+            </div>
+            <div>
+              <dt>tools</dt>
+              <dd><span id="tool-count" class="big"></span></dd>
+            </div>
+            <div>
+              <dt>clusters per process</dt>
+              <dd>as many as you configure</dd>
+            </div>
+            <div>
+              <dt>client</dt>
+              <dd>franz-go</dd>
+            </div>
+          </dl>
+        </div>
+
+        <div class="session" aria-label="Example session">
+          <div class="session-head">
+            <span>session</span>
+            <span class="muted">kafka-prod-read · read-only</span>
+          </div>
+          <ol id="session-log" class="session-log"></ol>
+        </div>
+      </section>
+
+      <section class="section" id="start">
+        <header class="section-head">
+          <h2>get started</h2>
+          <p>Install it, point it at a cluster, register it with your agent.</p>
+        </header>
+
+        <ol class="steps">
+          <li class="step">
+            <div class="step-label">
+              <span class="step-n">1</span>
+              <h3>install</h3>
+              <p>
+                Let your agent do it: paste the prompt and it installs the binary,
+                the skill, a config and the MCP registration. Or install by hand.
+              </p>
+            </div>
+            <div class="step-body tabs" data-tabs>
+              <div class="tab-bar" role="tablist">
+                <button class="active" data-tab="agent" role="tab">ask your agent</button>
+                <button data-tab="bin" role="tab">binary</button>
+                <button data-tab="docker" role="tab">docker</button>
+                <button data-tab="src" role="tab">from source</button>
+              </div>
+              <div class="tab-panel active" data-panel="agent">
+                <pre class="prose"><code>Install the kafka-mcp MCP server for me.
+
+1. Open https://github.com/denizgursoy/kafka-mcp/releases/latest and download
+   the archive for this OS and CPU: kafka-mcp_&lt;Os&gt;_&lt;arch&gt;.tar.gz, or .zip
+   on Windows. Check it against the checksums file, extract it, and put the
+   kafka-mcp binary on my PATH.
+2. From the same release tag, copy the skills/kafka-debugging directory of the
+   repository into your skills directory, so you know how to use the tools.
+3. Ask me for my Kafka brokers, how to authenticate, and whether this should
+   be read-only. Then write a kafka-mcp.yaml as described at
+   https://denizgursoy.github.io/kafka-mcp/#configure. Never put a password
+   in the file: use "{env:VAR}" and tell me which variable to set.
+4. Register kafka-mcp as a local stdio MCP server in your own configuration,
+   with CONFIG_FILE pointing at that file.
+5. Tell me to restart you so the tools and the skill load.</code></pre>
+                <p class="hint">
+                  Works with any agent that can run shell commands and edit its own
+                  config, such as Claude Code or OpenCode. Read what it plans to run
+                  before you approve it.
+                </p>
+              </div>
+              <div class="tab-panel" data-panel="bin">
+                <pre><code><span class="c"># 1. the binary, from https://github.com/denizgursoy/kafka-mcp/releases</span>
+tar -xzf kafka-mcp_Darwin_arm64.tar.gz
+sudo mv kafka-mcp /usr/local/bin/
+
+<span class="c"># 2. the skill, into your agent's skills directory</span>
+<span class="c">#    Claude Code: ~/.claude/skills   OpenCode: ~/.config/opencode/skills</span>
+curl -sL https://github.com/denizgursoy/kafka-mcp/archive/refs/heads/main.tar.gz \
+  | tar -xz --strip-components=2 -C ~/.claude/skills kafka-mcp-main/skills/kafka-debugging</code></pre>
+              </div>
+              <div class="tab-panel" data-panel="docker">
+                <pre><code>docker run --rm -p 8090:8090 \
+  -v $PWD/kafka-mcp.yaml:/kafka-mcp.yaml \
+  -e CONFIG_FILE=/kafka-mcp.yaml \
+  ghcr.io/denizgursoy/kafka-mcp:latest</code></pre>
+                <p class="hint">The image starts with <code>--server</code>, so it serves HTTP on :8090.</p>
+              </div>
+              <div class="tab-panel" data-panel="src">
+                <pre><code>git clone https://github.com/denizgursoy/kafka-mcp
+cd kafka-mcp
+make env-up   <span class="c"># local Redpanda on :19092, Console on :8080</span>
+make run      <span class="c"># serves kafka-mcp.local.yaml on :8090</span></code></pre>
+                <p class="hint">Requires Go 1.27. Tests need Docker.</p>
+              </div>
+            </div>
+          </li>
+
+          <li class="step">
+            <div class="step-label">
+              <span class="step-n">2</span>
+              <h3>configure</h3>
+              <p>
+                Write a <code>kafka-mcp.yaml</code>. This one is enough for a
+                local broker. The <a href="#configure">full reference</a> is below.
+              </p>
+            </div>
+            <div class="step-body">
+              <pre><code><span class="k">clusters:</span>
+  <span class="k">local:</span>
+    <span class="k">brokers:</span> localhost:19092
+<span class="k">endpoints:</span>
+  <span class="k">local:</span>
+    <span class="k">cluster:</span> local
+    <span class="k">path:</span> /mcp/local</code></pre>
+              <p class="hint">
+                Looked up in order: <code>CONFIG_FILE</code>, the working directory,
+                <code>~/.config/kafka-mcp/</code>, then <code>/etc</code>. The first
+                match wins; files are not merged.
+              </p>
+            </div>
+          </li>
+
+          <li class="step">
+            <div class="step-label">
+              <span class="step-n">3</span>
+              <h3>connect</h3>
+              <p>
+                Over stdio the client launches the binary. Over HTTP every endpoint
+                has its own URL.
+              </p>
+            </div>
+            <div class="step-body tabs" data-tabs>
+              <div class="tab-bar" role="tablist">
+                <button class="active" data-tab="stdio" role="tab">stdio</button>
+                <button data-tab="http" role="tab">http</button>
+                <button data-tab="curl" role="tab">curl</button>
+              </div>
+              <div class="tab-panel active" data-panel="stdio">
+                <pre><code>{
+  <span class="k">"mcp"</span>: {
+    <span class="k">"kafka-local"</span>: {
+      <span class="k">"type"</span>: <span class="s">"local"</span>,
+      <span class="k">"command"</span>: [<span class="s">"kafka-mcp"</span>, <span class="s">"--endpoint"</span>, <span class="s">"local"</span>],
+      <span class="k">"environment"</span>: { <span class="k">"CONFIG_FILE"</span>: <span class="s">"/path/to/kafka-mcp.yaml"</span> }
+    }
+  }
+}</code></pre>
+                <p class="hint"><code>--endpoint</code> can be left out when the file has only one endpoint.</p>
+              </div>
+              <div class="tab-panel" data-panel="http">
+                <pre><code><span class="c"># start once: kafka-mcp --server</span>
+{
+  <span class="k">"mcp"</span>: {
+    <span class="k">"kafka-local"</span>: {
+      <span class="k">"type"</span>: <span class="s">"remote"</span>,
+      <span class="k">"url"</span>: <span class="s">"http://localhost:8090/mcp/local"</span>
+    }
+  }
+}</code></pre>
+                <p class="hint">The key becomes the tool prefix: <code>kafka-local_list_topics</code>. Name it after the cluster and the policy.</p>
+              </div>
+              <div class="tab-panel" data-panel="curl">
+                <pre><code>curl http://localhost:8090/healthz
+
+curl -s -X POST http://localhost:8090/mcp/local \
+  -H 'Content-Type: application/json' \
+  -H 'Accept: application/json, text/event-stream' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}'</code></pre>
+                <p class="hint">Send the returned <code>Mcp-Session-Id</code> header on every later request.</p>
+              </div>
+            </div>
+          </li>
+
+          <li class="step">
+            <div class="step-label">
+              <span class="step-n">4</span>
+              <h3>ask</h3>
+              <p>Ask in plain words. The bundled skill tells the agent which tools to call, in which order.</p>
+            </div>
+            <div class="step-body">
+              <div class="prompt">
+                <span class="prompt-mark">&gt;</span> is there lag on orders, and when will it clear?
+              </div>
+              <p class="hint">
+                Copy <code>skills/kafka-debugging</code> into your agent's skills directory.
+                It routes each request to one of <a href="#scenarios">eight guides</a>.
+              </p>
+            </div>
+          </li>
+        </ol>
+      </section>
+
+      <section class="section" id="configure">
+        <header class="section-head">
+          <h2>configure</h2>
+          <p>
+            Two ideas. <strong>Clusters</strong> say how to reach Kafka.
+            <strong>Endpoints</strong> say what a session may do there. One
+            cluster can sit behind several endpoints, such as a read-only one
+            for investigating and a writable one for approved changes.
+          </p>
+        </header>
+
+        <div class="config-example">
+          <div class="config-file">
+            <div class="file-head">kafka-mcp.yaml</div>
+            <pre><code><span class="k">http:</span>
+  <span class="k">address:</span> <span class="s">":8090"</span>
+  <span class="k">base_path:</span> /kafka-mcp
+<span class="k">output_dir:</span> /var/tmp/kafka-mcp
+
+<span class="k">clusters:</span>
+  <span class="k">prod:</span>
+    <span class="k">brokers:</span>
+      - kafka-1:9093
+      - kafka-2:9093
+    <span class="k">security:</span>
+      <span class="k">tls:</span>
+        <span class="k">enabled:</span> <span class="v">true</span>
+        <span class="k">ca_file:</span> /etc/kafka/ca.pem
+      <span class="k">sasl:</span>
+        - <span class="k">scram:</span>
+            <span class="k">enabled:</span> <span class="v">true</span>
+            <span class="k">algorithm:</span> SCRAM-SHA-256
+            <span class="k">user:</span> kafka-mcp-readonly
+            <span class="k">pass:</span> <span class="s">"{env:KAFKA_PASSWORD}"</span>
+  <span class="k">preprod:</span>
+    <span class="k">brokers:</span> kafka-preprod:9093
+
+<span class="k">endpoints:</span>
+  <span class="k">prod-read:</span>
+    <span class="k">cluster:</span> prod
+    <span class="k">path:</span> /mcp
+    <span class="k">description:</span> Production investigation
+    <span class="k">read_only:</span> <span class="v">true</span>
+  <span class="k">prod-write:</span>
+    <span class="k">cluster:</span> prod
+    <span class="k">path:</span> /mcp/rw
+    <span class="k">tools:</span>
+      <span class="k">delete_topic:</span> <span class="v">false</span>
+  <span class="k">preprod:</span>
+    <span class="k">cluster:</span> preprod</code></pre>
+          </div>
+          <ul class="config-notes">
+            <li>
+              <span class="tag">routes</span>
+              With <code>base_path</code> set, the routes become
+              <code>/kafka-mcp/mcp</code>, <code>/kafka-mcp/mcp/rw</code> and
+              <code>/kafka-mcp/mcp/preprod</code>. Paths match exactly.
+            </li>
+            <li>
+              <span class="tag">secrets</span>
+              <code>{env:VAR}</code> reads a value from the environment.
+              <code>password_file</code> reads it from a file. The password never
+              appears in <code>server_config</code>.
+            </li>
+            <li>
+              <span class="tag">one connection</span>
+              <code>prod-read</code> and <code>prod-write</code> share a single
+              Kafka client. Only their policies differ.
+            </li>
+            <li>
+              <span class="tag">withholding</span>
+              <code>tools</code> only narrows an endpoint. It cannot bring back
+              what <code>read_only</code> hides.
+            </li>
+            <li>
+              <span class="tag">down at startup</span>
+              An unreachable cluster is still served. <code>list_clusters</code>
+              reports it as disconnected, so one outage does not block the rest.
+            </li>
+          </ul>
+        </div>
+
+        <div id="config-ref" class="config-ref"></div>
+
+        <h3 class="sub">flags and environment</h3>
+        <div class="table-wrap">
+          <table class="ref" id="runtime-table">
+            <thead><tr><th>name</th><th>kind</th><th>what it does</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="section" id="tools">
+        <header class="section-head">
+          <h2>tools</h2>
+          <p>
+            A tool that names a topic, partition or group takes it in an
+            <code>items</code> array. One call can cover ten topics, and each item
+            succeeds or fails on its own. Open a row to see its parameters, a call
+            and a response.
+          </p>
+        </header>
+
+        <div class="filters" id="filters" role="toolbar" aria-label="Filter tools"></div>
+        <div class="tool-list" id="tool-list"></div>
+      </section>
+
+      <section class="section" id="scenarios">
+        <header class="section-head">
+          <h2>scenarios</h2>
+          <p>
+            Each tool exists because a debugging scenario needed it. The skill
+            ships one guide per scenario, because the obvious sequence of calls
+            gets each of them wrong in a specific way.
+          </p>
+        </header>
+        <div class="scenario-list" id="scenario-list"></div>
+      </section>
+
+      <section class="section" id="safety">
+        <header class="section-head">
+          <h2>safety</h2>
+          <p>There are three layers. Only the last one is security.</p>
+        </header>
+
+        <div class="layers">
+          <div class="layer">
+            <h3><code>confirm: true</code><span class="layer-kind">guardrail</span></h3>
+            <p>Every write runs as a preview first. Nothing changes until the whole batch is approved.</p>
+          </div>
+          <div class="layer">
+            <h3><code>read_only: true</code><span class="layer-kind">policy</span></h3>
+            <p>
+              The tools that only write are not listed, so the agent never sees
+              them. Each tool also refuses at the moment it would write.
+            </p>
+          </div>
+          <div class="layer strong">
+            <h3>kafka acls<span class="layer-kind">security</span></h3>
+            <p>
+              The broker decides, per SASL principal. Nobody can turn it off by
+              editing a config file.
+            </p>
+          </div>
+        </div>
+
+        <dl class="facts">
+          <div>
+            <dt>honest results</dt>
+            <dd>An empty search means the message is absent only when <code>complete</code> is true.</dd>
+          </div>
+          <div>
+            <dt>provenance</dt>
+            <dd>Copied and produced messages carry headers that say where they came from.</dd>
+          </div>
+          <div>
+            <dt>audit log</dt>
+            <dd>Every call is logged with its targets. Message content is never logged.</dd>
+          </div>
+          <div>
+            <dt>bound sessions</dt>
+            <dd>A session is tied to one endpoint by its URL, and no parameter can redirect it.</dd>
+          </div>
+        </dl>
+      </section>
+    </main>
+
+    <footer class="footer">
+      <span>kafka-mcp · MIT</span>
+      <span>
+        <a href="https://github.com/denizgursoy/kafka-mcp#readme">full reference ↗</a>
+        <a href="https://github.com/denizgursoy/kafka-mcp/releases">releases ↗</a>
+      </span>
+    </footer>
+
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>
