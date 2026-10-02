@@ -39,7 +39,13 @@ type BatchOutput = batch.Output[Output]
 const description = `
 Read 1 to 20 Kafka messages at exact addresses in one call through items, and
 optionally nearby messages for context. Returns key, value, headers, timestamp
-and original value size; binary values are base64 encoded.
+and original value size.
+
+Values carrying a Schema Registry id (Avro, Protobuf, JSON Schema) and topics
+with a configured format are decoded to JSON; format, schema_id and
+message_type say what the bytes were. Anything else is returned as text, or
+base64 when it is binary, and decode_error explains a value that named a
+schema but could not be decoded.
 
 Results follow items order, each carrying index with result or error, so an
 invalid partition or an offset beyond the partition end is reported against its
@@ -136,7 +142,7 @@ func get(
 	var hit bool
 
 	for _, record := range found {
-		message := records.Render(record, input.MaxValueBytes)
+		message := reader.Render(ctx, record, input.MaxValueBytes)
 
 		switch {
 		case record.Offset < input.Offset:

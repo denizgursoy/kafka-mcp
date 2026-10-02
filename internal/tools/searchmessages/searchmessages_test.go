@@ -1,10 +1,13 @@
 package searchmessages_test
 
 import (
+	"fmt"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/suite"
+	"github.com/twmb/avro"
+	"github.com/twmb/franz-go/pkg/sr"
 
 	"github.com/denizgursoy/kafka-mcp/internal/domain/records"
 	"github.com/denizgursoy/kafka-mcp/internal/domain/testenv"
@@ -104,6 +107,39 @@ func (s *SearchMessagesSuite) TestSearchesKeyByDefault() {
 		"the default search covers the key as well as the value, because ids are often only in the key")
 	s.Require().Equal("customer-777", out.Matches[0].Key,
 		"the matching message must be the one whose key contains the query")
+}
+
+func (s *SearchMessagesSuite) TestScriptSeesDecodedSchemaRegistryFields() {
+	topic := s.env.CreateTopic(s.T(), "search-avro")
+
+	const schema = `{"type":"record","name":"Order","namespace":"shop","fields":[
+		{"name":"id","type":"string"},{"name":"amount","type":"long"}]}`
+
+	id := s.env.RegisterSchema(s.T(), topic+"-value", sr.Schema{Schema: schema})
+	codec := avro.MustParse(schema)
+
+	for _, amount := range []int64{100, 900, 300} {
+		payload, err := codec.Encode(map[string]any{"id": fmt.Sprintf("o-%d", amount), "amount": amount})
+		s.Require().NoError(err, "the fixture record must encode")
+
+		s.env.Produce(s.T(), topic, testenv.Message{Value: testenv.WireFormat(s.T(), id, nil, payload)})
+	}
+
+	out, err := searchmessages.Run(
+		s.T().Context(),
+		s.env.Admin(),
+		s.env.Reader(),
+		"",
+		searchmessages.Input{Topic: topic, Script: `return value.amount >= 500`},
+	)
+
+	s.Require().NoError(err, "searching an Avro topic must succeed")
+	s.Require().Zero(out.ScriptErrors,
+		"the script must receive the decoded record; raw bytes would make value.amount throw on every message")
+	s.Require().Len(out.Matches, 1,
+		"a field condition must work on Avro exactly as it does on JSON, which is the point of decoding")
+	s.Require().Equal(`{"amount":900,"id":"o-900"}`, out.Matches[0].Value,
+		"the match must be shown decoded, so the caller can read what was found")
 }
 
 func (s *SearchMessagesSuite) TestSearchInHeadersOnly() {

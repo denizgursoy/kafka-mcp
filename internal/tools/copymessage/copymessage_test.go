@@ -5,7 +5,9 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/suite"
+	"github.com/twmb/avro"
 	"github.com/twmb/franz-go/pkg/kgo"
+	"github.com/twmb/franz-go/pkg/sr"
 
 	"github.com/denizgursoy/kafka-mcp/internal/domain/config"
 	"github.com/denizgursoy/kafka-mcp/internal/domain/kafkaclient"
@@ -43,8 +45,14 @@ func (s *CopyMessageSuite) clusters(readOnly bool, otherReadOnly bool) *kafkacli
 
 	registry, err := kafkaclient.NewRegistry(&config.Config{
 		Clusters: map[string]*config.Cluster{
-			"here":  {Name: "here", Brokers: []string{s.env.Broker()}, ReadOnly: readOnly},
-			"there": {Name: "there", Brokers: []string{s.other.Broker()}, ReadOnly: otherReadOnly},
+			"here": {
+				Name: "here", Brokers: []string{s.env.Broker()}, ReadOnly: readOnly,
+				SchemaRegistry: &config.SchemaRegistry{URLs: []string{s.env.SchemaRegistry()}},
+			},
+			"there": {
+				Name: "there", Brokers: []string{s.other.Broker()}, ReadOnly: otherReadOnly,
+				SchemaRegistry: &config.SchemaRegistry{URLs: []string{s.other.SchemaRegistry()}},
+			},
 		},
 	})
 	s.Require().NoError(err, "building the registry must succeed")
@@ -151,6 +159,144 @@ func (s *CopyMessageSuite) copyOne(
 	}
 
 	return *out.Results[0].Result, nil
+}
+
+const orderAvro = `{"type":"record","name":"Order","namespace":"shop","fields":[
+	{"name":"id","type":"string"},{"name":"amount","type":"long"}]}`
+
+// avroMessage registers the order schema on env under subject and returns a
+// framed message carrying it, with the id the registry assigned.
+func (s *CopyMessageSuite) avroMessage(env *testenv.Environment, subject string) (string, int) {
+	s.T().Helper()
+
+	id := env.RegisterSchema(s.T(), subject, sr.Schema{Schema: orderAvro})
+
+	payload, err := avro.MustParse(orderAvro).Encode(map[string]any{"id": "o-1", "amount": int64(5)})
+	s.Require().NoError(err, "the fixture record must encode")
+
+	return testenv.WireFormat(s.T(), id, nil, payload), id
+}
+
+// schemaID reads the id from a framed message.
+func schemaID(value string) int {
+	return int(value[1])<<24 | int(value[2])<<16 | int(value[3])<<8 | int(value[4])
+}
+
+func (s *CopyMessageSuite) TestWarnsWhenASchemaIDCrossesRegistries() {
+	source := s.env.CreateTopic(s.T(), "copy-schema-src")
+	destination := s.other.CreateTopic(s.T(), "copy-schema-dst")
+
+	// A filler on the source registry makes the source id differ from what
+	// the destination registry would assign the same schema.
+	s.env.RegisterSchema(s.T(), s.env.UniqueName("filler")+"-value", sr.Schema{Schema: `"string"`})
+
+	value, _ := s.avroMessage(s.env, source+"-value")
+	s.env.Produce(s.T(), source, testenv.Message{Value: value})
+
+	out, err := s.copyOne(s.clusters(false, false), "here", false, copymessage.Item{
+		SourceTopic:        source,
+		DestinationTopic:   destination,
+		DestinationCluster: "there",
+	})
+
+	s.Require().NoError(err, "previewing a cross-registry copy must succeed")
+	s.Require().NotEmpty(out.Warnings,
+		"a schema id is only meaningful in the registry that issued it, so copying it unchanged to another must not pass silently")
+	s.Require().Contains(out.Warnings[len(out.Warnings)-1], "translate_schema",
+		"the warning must name the parameter that fixes it")
+}
+
+func (s *CopyMessageSuite) TestTranslatesTheSchemaIDToTheDestinationRegistry() {
+	source := s.env.CreateTopic(s.T(), "copy-translate-src")
+	destination := s.other.CreateTopic(s.T(), "copy-translate-dst")
+
+	s.env.RegisterSchema(s.T(), s.env.UniqueName("filler")+"-value", sr.Schema{Schema: `"string"`})
+
+	value, sourceID := s.avroMessage(s.env, source+"-value")
+	s.env.Produce(s.T(), source, testenv.Message{Key: "o-1", Value: value})
+
+	out, err := s.copyOne(s.clusters(false, false), "here", true, copymessage.Item{
+		SourceTopic:        source,
+		DestinationTopic:   destination,
+		DestinationCluster: "there",
+		TranslateSchema:    true,
+	})
+
+	s.Require().NoError(err, "a translated copy must succeed")
+
+	_, copied, _ := s.readOn(s.other, destination, out.WrittenOffset)
+
+	s.Run("the copy carries the destination's id for the same schema", func() {
+		lookup, err := sr.NewClient(sr.URLs(s.other.SchemaRegistry()))
+		s.Require().NoError(err, "the destination registry must be reachable")
+
+		schema, err := lookup.SchemaByID(s.T().Context(), schemaID(copied))
+		s.Require().NoError(err, "the id in the copy must exist in the destination registry")
+		s.Require().JSONEq(orderAvro, schema.Schema,
+			"the id must name the very schema the message was written with, or the consumer decodes garbage")
+		s.Require().NotEqual(sourceID, schemaID(copied),
+			"this fixture makes the ids differ, so an unchanged id would mean nothing was translated")
+	})
+
+	s.Run("the payload is untouched", func() {
+		s.Require().Equal(value[5:], copied[5:],
+			"translation rewrites the id only; the record itself must arrive byte for byte")
+	})
+
+	s.Run("the schema is registered under the destination topic's subject", func() {
+		s.Require().Equal(destination+"-value", out.ValueSchema.Subject,
+			"the topic name strategy is what a destination consumer looks the schema up by")
+		s.Require().Equal(schemaID(copied), out.ValueSchema.SchemaID,
+			"the reported id must be the one written")
+	})
+}
+
+func (s *CopyMessageSuite) TestTranslationIsRefusedWithoutADestinationRegistry() {
+	source := s.env.CreateTopic(s.T(), "copy-no-registry-src")
+	destination := s.env.CreateTopic(s.T(), "copy-no-registry-dst")
+
+	value, _ := s.avroMessage(s.env, source+"-value")
+	s.env.Produce(s.T(), source, testenv.Message{Value: value})
+
+	registry, err := kafkaclient.NewRegistry(&config.Config{
+		Clusters: map[string]*config.Cluster{
+			"here": {Name: "here", Brokers: []string{s.env.Broker()},
+				SchemaRegistry: &config.SchemaRegistry{URLs: []string{s.env.SchemaRegistry()}}},
+			"bare": {Name: "bare", Brokers: []string{s.env.Broker()}},
+		},
+	})
+	s.Require().NoError(err, "building the registry must succeed")
+	s.T().Cleanup(registry.Close)
+
+	_, err = s.copyOne(registry, "here", false, copymessage.Item{
+		SourceTopic:        source,
+		DestinationTopic:   destination,
+		DestinationCluster: "bare",
+		TranslateSchema:    true,
+	})
+
+	s.Require().ErrorContains(err, "schema_registry",
+		"there is nowhere to register the schema, and copying the source id unchanged is exactly what was asked not to happen")
+}
+
+func (s *CopyMessageSuite) TestTranslationLeavesPlainMessagesAlone() {
+	source := s.env.CreateTopic(s.T(), "copy-plain-src")
+	destination := s.other.CreateTopic(s.T(), "copy-plain-dst")
+
+	s.env.Produce(s.T(), source, testenv.Message{Value: `{"plain":true}`})
+
+	out, err := s.copyOne(s.clusters(false, false), "here", true, copymessage.Item{
+		SourceTopic:        source,
+		DestinationTopic:   destination,
+		DestinationCluster: "there",
+		TranslateSchema:    true,
+	})
+
+	s.Require().NoError(err, "a message without a schema needs no translation, and asking for it must not fail")
+
+	_, copied, _ := s.readOn(s.other, destination, out.WrittenOffset)
+	s.Require().Equal(`{"plain":true}`, copied, "a plain message must be copied byte for byte")
+	s.Require().Nil(out.ValueSchema, "there was no schema to translate, so none may be reported")
 }
 
 func (s *CopyMessageSuite) TestCopiesTheMessageIntact() {

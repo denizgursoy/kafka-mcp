@@ -1,11 +1,14 @@
 package searchmessages
 
 import (
+	"context"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/suite"
 	"github.com/twmb/franz-go/pkg/kgo"
+
+	"github.com/denizgursoy/kafka-mcp/internal/domain/serde"
 )
 
 type ScriptSuite struct {
@@ -42,6 +45,17 @@ func (s *ScriptSuite) record() *kgo.Record {
 	}
 }
 
+// plainMatch runs a script against a record decoded with no schema, the way a
+// reader for a cluster without a registry would hand it over.
+func plainMatch(script *filter, record *kgo.Record) (bool, error) {
+	var codec *serde.Codec
+
+	return script.match(record,
+		codec.Decode(context.Background(), record.Topic, serde.Value, record.Value),
+		codec.Decode(context.Background(), record.Topic, serde.Key, record.Key),
+	)
+}
+
 // matches compiles a script and runs it against the fixture record.
 func (s *ScriptSuite) matches(source string) bool {
 	s.T().Helper()
@@ -52,7 +66,7 @@ func (s *ScriptSuite) matches(source string) bool {
 
 	defer script.Close()
 
-	matched, err := script.match(s.record())
+	matched, err := plainMatch(script, s.record())
 	s.Require().NoError(err,
 		"a well-formed script must not fail against a well-formed message")
 
@@ -137,7 +151,7 @@ func (s *ScriptSuite) TestKeyIsNullWhenAbsent() {
 
 	defer script.Close()
 
-	matched, err := script.match(&kgo.Record{Value: []byte(`{}`)})
+	matched, err := plainMatch(script, &kgo.Record{Value: []byte(`{}`)})
 
 	s.Require().NoError(err, "a message without a key must not fail the script")
 	s.Require().True(matched,
@@ -150,7 +164,7 @@ func (s *ScriptSuite) TestNonJSONValueIsAString() {
 
 	defer script.Close()
 
-	matched, err := script.match(&kgo.Record{Value: []byte("level=ERROR msg=failed")})
+	matched, err := plainMatch(script, &kgo.Record{Value: []byte("level=ERROR msg=failed")})
 
 	s.Require().NoError(err,
 		"a plain text message must not fail a script: not every topic holds JSON")
@@ -199,7 +213,7 @@ func (s *ScriptSuite) TestReportsAScriptErrorPerMessage() {
 	defer script.Close()
 
 	// A plain string value has no payload, so reading through it throws.
-	_, err = script.match(&kgo.Record{Value: []byte("not json at all")})
+	_, err = plainMatch(script, &kgo.Record{Value: []byte("not json at all")})
 
 	s.Require().Error(err,
 		"a script that throws on a message must report an error for that message, so a broken script is distinguishable from a genuine absence of matches")
@@ -214,7 +228,7 @@ func (s *ScriptSuite) TestStopsAnInfiniteLoop() {
 	done := make(chan error, 1)
 
 	go func() {
-		_, err := script.match(s.record())
+		_, err := plainMatch(script, s.record())
 		done <- err
 	}()
 
@@ -238,7 +252,7 @@ func (s *ScriptSuite) TestStopsRunawayRecursion() {
 
 	defer script.Close()
 
-	_, err = script.match(s.record())
+	_, err = plainMatch(script, s.record())
 
 	s.Require().Error(err,
 		"runaway recursion must raise an error rather than exhaust the host stack and take the server down with it")
@@ -260,10 +274,10 @@ func (s *ScriptSuite) TestIsDeterministic() {
 
 		// Two evaluations of the same runtime must agree, so a scan cannot
 		// produce a different answer for identical messages.
-		one, err := script.match(s.record())
+		one, err := plainMatch(script, s.record())
 		s.Require().NoError(err, "the script must run")
 
-		two, err := script.match(s.record())
+		two, err := plainMatch(script, s.record())
 		s.Require().NoError(err, "the script must run again")
 
 		s.Require().Equal(one, two,

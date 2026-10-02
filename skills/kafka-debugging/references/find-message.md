@@ -41,8 +41,15 @@ Read three things from the result:
   key *is* that identifier. This is the single most useful fact in the whole
   investigation.
 - **`key_stats`** — are keys present, and unique?
-- **`value_formats`** and **`json_fields`** — is the value JSON, and which
-  paths and types can a filter use?
+- **`value_formats`** and **`json_fields`** — is the value structured, and
+  which paths and types can a filter use? Avro, Protobuf and JSON Schema values
+  are decoded before they are described, so `avro: 20` with a full
+  `json_fields` list means a field filter works exactly as it would on JSON.
+- **`value_formats.undecodable`** — values that name a Schema Registry schema
+  the server could not decode. The message's `decode_error` says why, usually
+  no `schema_registry` configured (check `server_config`) or a schema id the
+  registry does not have. A field filter cannot match these: say so rather than
+  reporting "not found".
 
 `sampled_ranges` shows which offsets the sample came from. The sample is of the
 newest messages, so a topic whose format changed over time may hold older
@@ -52,7 +59,8 @@ finds nothing.
 ### 3. Write the narrowest script
 
 Filtering is a JavaScript expression. In scope are `value` (the parsed JSON
-document, or the raw text when the message is not JSON), `key`, `headers`,
+document, the decoded record for Avro, Protobuf or JSON Schema, or the raw text
+otherwise), `key`, `headers`,
 `partition`, `offset` and `timestamp`. Return true to keep a message.
 
 **If the identifier is the key**, compare it exactly:

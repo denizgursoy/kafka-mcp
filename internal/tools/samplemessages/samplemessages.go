@@ -3,12 +3,10 @@ package samplemessages
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"sort"
 	"strconv"
 	"strings"
-	"unicode/utf8"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/twmb/franz-go/pkg/kadm"
@@ -16,6 +14,7 @@ import (
 
 	"github.com/denizgursoy/kafka-mcp/internal/domain/batch"
 	"github.com/denizgursoy/kafka-mcp/internal/domain/records"
+	"github.com/denizgursoy/kafka-mcp/internal/domain/serde"
 )
 
 // Item is one topic to sample.
@@ -33,12 +32,26 @@ type Input struct {
 
 // Formats counts how many sampled values were of each kind.
 type Formats struct {
-	JSON   int `json:"json"`
-	Text   int `json:"text"`
-	Binary int `json:"binary"`
+	JSON        int `json:"json"`
+	Text        int `json:"text"`
+	Binary      int `json:"binary"`
+	Avro        int `json:"avro,omitempty"`
+	Protobuf    int `json:"protobuf,omitempty"`
+	JSONSchema  int `json:"json_schema,omitempty"`
+	Msgpack     int `json:"msgpack,omitempty"`
+	Null        int `json:"null,omitempty"`
+	Undecodable int `json:"undecodable,omitempty"`
 }
 
-// Field is one path discovered in the sampled JSON values.
+// Schema is one schema the sampled values were written with.
+type Schema struct {
+	Format      string `json:"format"`
+	SchemaID    int    `json:"schema_id,omitempty"`
+	MessageType string `json:"message_type,omitempty"`
+	Count       int    `json:"count"`
+}
+
+// Field is one path discovered in the sampled values.
 type Field struct {
 	Path    string   `json:"path"`
 	Types   []string `json:"types"`
@@ -71,6 +84,7 @@ type Output struct {
 	JSONFields    []Field           `json:"json_fields"`
 	KeyStats      KeyStats          `json:"key_stats"`
 	KeyInValue    []string          `json:"key_in_value"`
+	Schemas       []Schema          `json:"schemas"`
 }
 
 type BatchOutput = batch.Output[Output]
@@ -84,8 +98,14 @@ const (
 
 const description = `
 Sample the newest messages of 1 to 20 topics in one call through items, and
-summarize value formats, JSON field paths, key usage and sampled offset ranges.
-Use this to design a search_messages predicate.
+summarize value formats, field paths, key usage, the schemas values were
+written with, and sampled offset ranges. Use this to design a search_messages
+predicate, and to find the schema to produce against.
+
+Avro, Protobuf and JSON Schema values carrying a Schema Registry id, and topics
+with a configured format, are decoded, so their field paths are reported like
+JSON. value_formats.undecodable counts values that named a schema but could not
+be decoded; decode_error on each message says why.
 
 Results follow items order, each carrying index with result or error. Sampling
 one topic is an items array of length one. The sample describes recent data
@@ -162,6 +182,7 @@ func sample(
 		SampledRanges: []SampledRange{},
 		JSONFields:    []Field{},
 		KeyInValue:    []string{},
+		Schemas:       []Schema{},
 	}
 
 	for _, rng := range ranges {
@@ -196,7 +217,7 @@ func sample(
 		return collected[i].Offset < collected[j].Offset
 	})
 
-	describe(&out, collected, maxValueBytes)
+	describe(ctx, reader, &out, collected, maxValueBytes)
 
 	return out, nil
 }
@@ -300,45 +321,61 @@ func newestRanges(
 }
 
 // describe fills in the shape report from the sampled records.
-func describe(out *Output, collected []*kgo.Record, maxValueBytes int) {
+func describe(ctx context.Context, reader *records.Reader, out *Output, collected []*kgo.Record, maxValueBytes int) {
 	fields := make(map[string]*Field)
 	keys := make(map[string]bool)
 	keyPaths := make(map[string]int)
+	schemas := make(map[Schema]int)
+	structuredCount := 0
 
 	for _, record := range collected {
-		out.Messages = append(out.Messages, records.Render(record, maxValueBytes))
+		key := reader.Decode(ctx, record, serde.Key)
+		value := reader.Decode(ctx, record, serde.Value)
+
+		out.Messages = append(out.Messages, records.RenderDecoded(record, key, value, maxValueBytes))
 
 		if record.Key == nil {
 			out.KeyStats.Absent++
 		} else {
 			out.KeyStats.Present++
-			keys[string(record.Key)] = true
+			keys[key.Text] = true
 
 			if len(out.KeyStats.Examples) < maxExamples {
-				out.KeyStats.Examples = append(out.KeyStats.Examples, string(record.Key))
+				out.KeyStats.Examples = append(out.KeyStats.Examples, key.Text)
 			}
 		}
 
-		var document any
+		count(&out.ValueFormats, value)
 
-		if err := json.Unmarshal(record.Value, &document); err != nil {
-			if utf8.Valid(record.Value) {
-				out.ValueFormats.Text++
-			} else {
-				out.ValueFormats.Binary++
-			}
+		if value.SchemaID != 0 || value.MessageType != "" {
+			schemas[Schema{Format: value.Format, SchemaID: value.SchemaID, MessageType: value.MessageType}]++
+		}
 
+		if value.Document == nil {
 			continue
 		}
 
-		out.ValueFormats.JSON++
+		structuredCount++
 
-		walk("", document, fields)
+		walk("", value.Document, fields)
 
 		if record.Key != nil {
-			findKey(string(record.Key), "", document, keyPaths)
+			findKey(key.Text, "", value.Document, keyPaths)
 		}
 	}
+
+	for schema, seen := range schemas {
+		schema.Count = seen
+		out.Schemas = append(out.Schemas, schema)
+	}
+
+	sort.Slice(out.Schemas, func(i, j int) bool {
+		if out.Schemas[i].SchemaID != out.Schemas[j].SchemaID {
+			return out.Schemas[i].SchemaID < out.Schemas[j].SchemaID
+		}
+
+		return out.Schemas[i].MessageType < out.Schemas[j].MessageType
+	})
 
 	out.KeyStats.Unique = len(keys)
 	out.KeyStats.AllUnique = out.KeyStats.Present > 0 &&
@@ -354,16 +391,44 @@ func describe(out *Output, collected []*kgo.Record, maxValueBytes int) {
 		return out.JSONFields[i].Path < out.JSONFields[j].Path
 	})
 
-	// Only report a path as carrying the key when it did so for every JSON
-	// message sampled: a single coincidence must not be presented as the
-	// identifier.
+	// Only report a path as carrying the key when it did so for every
+	// structured message sampled: a single coincidence must not be presented
+	// as the identifier.
 	for path, count := range keyPaths {
-		if count == out.ValueFormats.JSON {
+		if count == structuredCount {
 			out.KeyInValue = append(out.KeyInValue, path)
 		}
 	}
 
 	sort.Strings(out.KeyInValue)
+}
+
+// count adds one value to the format tally.
+func count(formats *Formats, value serde.Decoded) {
+	if value.Error != "" {
+		formats.Undecodable++
+
+		return
+	}
+
+	switch value.Format {
+	case serde.FormatJSON:
+		formats.JSON++
+	case serde.FormatText:
+		formats.Text++
+	case serde.FormatAvro:
+		formats.Avro++
+	case serde.FormatProtobuf:
+		formats.Protobuf++
+	case serde.FormatJSONSchema:
+		formats.JSONSchema++
+	case serde.FormatMsgpack:
+		formats.Msgpack++
+	case serde.FormatNull:
+		formats.Null++
+	default:
+		formats.Binary++
+	}
 }
 
 // walk records every leaf path in a JSON document, with the types seen at it.

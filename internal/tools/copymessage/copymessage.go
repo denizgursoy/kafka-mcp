@@ -15,6 +15,7 @@ import (
 	"github.com/denizgursoy/kafka-mcp/internal/domain/batch"
 	"github.com/denizgursoy/kafka-mcp/internal/domain/kafkaclient"
 	"github.com/denizgursoy/kafka-mcp/internal/domain/records"
+	"github.com/denizgursoy/kafka-mcp/internal/domain/serde"
 )
 
 // Item is one source address and destination for a copy.
@@ -24,6 +25,7 @@ type Item struct {
 	SourceOffset       int64  `json:"source_offset" jsonschema:"Exact offset of the message to copy."`
 	DestinationTopic   string `json:"destination_topic" jsonschema:"Topic to write the copy to. It must already exist. It must differ from the source topic when both are on the same cluster."`
 	DestinationCluster string `json:"destination_cluster,omitempty" jsonschema:"Optional cluster to write the copy to. Defaults to the cluster this endpoint serves. Use list_clusters to see which names are valid. The destination cluster must not be read-only; the source may be."`
+	TranslateSchema    bool   `json:"translate_schema,omitempty" jsonschema:"Optional. When the key or value carries a Schema Registry id and the destination cluster uses a different registry, register that schema in the destination registry under <destination_topic>-value (or -key) and rewrite the id in the copy, so destination consumers can decode it. Without it the copy keeps the source id, which the destination registry may not have or may map to a different schema. Writes to the destination registry. Has no effect on messages without a schema id."`
 	MaxValueBytes      int    `json:"max_value_bytes,omitempty" jsonschema:"Optional maximum number of value bytes to show in the response. Defaults to 4096. This affects the preview only: the copy always carries the whole value."`
 }
 
@@ -61,6 +63,8 @@ type Output struct {
 	SourceOffset       int64           `json:"source_offset"`
 	DestinationTopic   string          `json:"destination_topic"`
 	Message            records.Message `json:"message"`
+	KeySchema          *serde.Encoded  `json:"key_schema,omitempty"`
+	ValueSchema        *serde.Encoded  `json:"value_schema,omitempty"`
 	Applied            bool            `json:"applied"`
 	WrittenPartition   int32           `json:"written_partition,omitempty"`
 	WrittenOffset      int64           `json:"written_offset,omitempty"`
@@ -84,6 +88,11 @@ result or error.
 
 The destination must be writable and requires Kafka write permission; a
 read-only cluster may still be the source.
+
+A key or value carrying a Schema Registry id is copied byte for byte. When the
+destination cluster uses a different registry the id may mean nothing there, so
+the response warns; set translate_schema to register the schema in the
+destination registry and rewrite the id.
 `
 
 // Register adds the copy_message tool to the MCP server.
@@ -256,7 +265,7 @@ func run(
 		SourcePartition:    input.SourcePartition,
 		SourceOffset:       input.SourceOffset,
 		DestinationTopic:   input.DestinationTopic,
-		Message:            records.Render(record, input.MaxValueBytes),
+		Message:            source.Reader().Render(ctx, record, input.MaxValueBytes),
 		Warnings:           []string{},
 	}
 
@@ -270,13 +279,27 @@ func run(
 			key))
 	}
 
+	key, value := record.Key, record.Value
+
+	key, out.KeySchema, err = schemaFor(ctx, source, destination, input, serde.Key, key, confirm, &out.Warnings)
+	if err != nil {
+		return Output{}, err
+	}
+
+	value, out.ValueSchema, err = schemaFor(ctx, source, destination, input, serde.Value, value, confirm, &out.Warnings)
+	if err != nil {
+		return Output{}, err
+	}
+
 	if !confirm {
 		out.Note = "nothing was written. Call again with confirm true to copy the message."
 
 		return out, nil
 	}
 
-	written, err := produce(ctx, destination, input.DestinationTopic, record, headers)
+	copied := &kgo.Record{Key: key, Value: value}
+
+	written, err := produce(ctx, destination, input.DestinationTopic, copied, headers)
 	if err != nil {
 		return Output{}, err
 	}
@@ -289,6 +312,55 @@ func run(
 		destinationName, input.DestinationTopic, written.Partition, written.Offset)
 
 	return out, nil
+}
+
+// schemaFor decides what happens to a schema id one part of the copy carries.
+//
+// Within one registry an id means the same schema on both sides and nothing
+// changes. Across registries it may not: unless translate_schema asks for the
+// id to be rewritten, the copy keeps it and a warning says so. Translation
+// registers the schema in the destination registry, which is a write, so it
+// only happens on confirm; the preview reports the subject it would use.
+func schemaFor(
+	ctx context.Context,
+	source, destination *kafkaclient.Client,
+	input Item,
+	part serde.Part,
+	data []byte,
+	confirm bool,
+	warnings *[]string,
+) ([]byte, *serde.Encoded, error) {
+
+	id, framed := serde.SchemaID(data)
+	if !framed || serde.SameRegistry(source.Codec(), destination.Codec()) {
+		return data, nil, nil
+	}
+
+	subject := input.DestinationTopic + "-" + string(part)
+
+	if !input.TranslateSchema {
+		*warnings = append(*warnings, fmt.Sprintf(
+			"the %s carries schema id %d from the source cluster's schema registry, and the destination uses a different one or none, where that id may be missing or name a different schema. Set translate_schema to register the schema in the destination registry under %q and rewrite the id",
+			part, id, subject))
+
+		return data, nil, nil
+	}
+
+	if !destination.Codec().HasRegistry() {
+		return nil, nil, fmt.Errorf(
+			"translate_schema was set but the destination cluster has no schema_registry configured to register schema id %d in", id)
+	}
+
+	if !confirm {
+		return data, &serde.Encoded{Subject: subject}, nil
+	}
+
+	translated, encoded, err := serde.Translate(ctx, source.Codec(), destination.Codec(), subject, data)
+	if err != nil {
+		return nil, nil, fmt.Errorf("translate the %s schema: %w", part, err)
+	}
+
+	return translated, &encoded, nil
 }
 
 // withProvenance returns the headers the copy will carry: the original ones,

@@ -3,10 +3,14 @@ package producemessage_test
 import (
 	"encoding/base64"
 	"errors"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/suite"
+	"github.com/twmb/avro"
 	"github.com/twmb/franz-go/pkg/kgo"
+	"github.com/twmb/franz-go/pkg/sr"
 
 	"github.com/denizgursoy/kafka-mcp/internal/domain/config"
 	"github.com/denizgursoy/kafka-mcp/internal/domain/kafkaclient"
@@ -20,6 +24,9 @@ type ProduceMessageSuite struct {
 
 	env   *testenv.Environment
 	other *testenv.Environment
+
+	// formats is the topic_formats the local cluster is built with.
+	formats map[string]*config.TopicFormat
 }
 
 func TestProduceMessageSuite(t *testing.T) {
@@ -44,8 +51,15 @@ func (s *ProduceMessageSuite) clusters(readOnly bool, otherReadOnly bool) *kafka
 
 	registry, err := kafkaclient.NewRegistry(&config.Config{
 		Clusters: map[string]*config.Cluster{
-			"here":  {Name: "here", Brokers: []string{s.env.Broker()}, ReadOnly: readOnly},
-			"there": {Name: "there", Brokers: []string{s.other.Broker()}, ReadOnly: otherReadOnly},
+			"here": {
+				Name: "here", Brokers: []string{s.env.Broker()}, ReadOnly: readOnly,
+				SchemaRegistry: &config.SchemaRegistry{URLs: []string{s.env.SchemaRegistry()}},
+				TopicFormats:   s.formats,
+			},
+			"there": {
+				Name: "there", Brokers: []string{s.other.Broker()}, ReadOnly: otherReadOnly,
+				SchemaRegistry: &config.SchemaRegistry{URLs: []string{s.other.SchemaRegistry()}},
+			},
 		},
 	})
 	s.Require().NoError(err, "building the registry must succeed")
@@ -286,6 +300,145 @@ func (s *ProduceMessageSuite) TestProducesBase64Value() {
 
 	s.Require().Equal(raw, value,
 		"base64 must be decoded before writing, or a binary payload arrives as its own encoding rather than as the bytes a consumer expects")
+}
+
+const orderAvro = `{"type":"record","name":"Order","namespace":"shop","fields":[
+	{"name":"id","type":"string"},{"name":"amount","type":"long"}]}`
+
+func (s *ProduceMessageSuite) TestEncodesAgainstARegistrySchema() {
+	topic := s.env.CreateTopic(s.T(), "produce-avro")
+	id := s.env.RegisterSchema(s.T(), topic+"-value", sr.Schema{Schema: orderAvro})
+
+	out, err := s.produceOne(s.client(false), "here", true, producemessage.Item{
+		Topic:       topic,
+		Key:         "o-1",
+		Value:       `{"id":"o-1","amount":42}`,
+		ValueSchema: &producemessage.SchemaRef{},
+	})
+
+	s.Require().NoError(err, "a document that fits the topic's registered schema must be produced")
+
+	s.Run("the bytes are framed avro a consumer can read", func() {
+		_, value, _ := s.read(topic, out.WrittenOffset)
+
+		decoded, err := avro.MustParse(orderAvro).Decode(value[5:], new(any))
+		s.Require().NoError(err, "the payload after the header must be the avro record")
+		s.Require().Empty(decoded, "nothing may follow the record")
+		s.Require().Equal([]byte{0, byte(id >> 24), byte(id >> 16), byte(id >> 8), byte(id)}, value[:5],
+			"the header must carry the schema id, or a registry-aware consumer cannot read the message")
+	})
+
+	s.Run("the response reports the schema used", func() {
+		s.Require().NotNil(out.ValueEncoding, "the caller must see which schema the value was written with")
+		s.Require().Equal(id, out.ValueEncoding.SchemaID, "the schema id written must be reported")
+		s.Require().Equal(topic+"-value", out.ValueEncoding.Subject,
+			"an omitted subject defaults to <topic>-value, and the caller must see which one was used")
+	})
+
+	s.Run("the preview shows the decoded message", func() {
+		s.Require().Equal(`{"amount":42,"id":"o-1"}`, out.Message.Value,
+			"the preview must show what a consumer will read, not the bytes")
+		s.Require().Equal("avro", out.Message.Format, "the format of what was written must be shown")
+	})
+
+	s.Run("the key stays a plain string", func() {
+		key, _, _ := s.read(topic, out.WrittenOffset)
+		s.Require().Equal("o-1", key, "a value schema must not change how the key is written")
+	})
+}
+
+func (s *ProduceMessageSuite) TestRefusesADocumentThatDoesNotFitTheSchema() {
+	topic := s.env.CreateTopic(s.T(), "produce-avro-bad")
+	s.env.RegisterSchema(s.T(), topic+"-value", sr.Schema{Schema: orderAvro})
+
+	_, err := s.produceOne(s.client(false), "here", false, producemessage.Item{
+		Topic:       topic,
+		Value:       `{"id":"o-1","amount":"lots"}`,
+		ValueSchema: &producemessage.SchemaRef{},
+	})
+
+	s.Require().ErrorContains(err, "amount",
+		"the preview must refuse a document a consumer could not read, naming the field to fix")
+	s.Require().Zero(s.endOffset(topic), "nothing may be written when the value does not fit")
+}
+
+func (s *ProduceMessageSuite) TestEncodesAKeyAgainstItsOwnSchema() {
+	topic := s.env.CreateTopic(s.T(), "produce-key-schema")
+	keyID := s.env.RegisterSchema(s.T(), topic+"-key", sr.Schema{Schema: `"string"`})
+
+	out, err := s.produceOne(s.client(false), "here", true, producemessage.Item{
+		Topic:     topic,
+		Key:       `"o-1"`,
+		Value:     "plain",
+		KeySchema: &producemessage.SchemaRef{},
+	})
+
+	s.Require().NoError(err, "a key with a registered schema must be produced")
+
+	key, value, _ := s.read(topic, out.WrittenOffset)
+	s.Require().Equal(string([]byte{0, byte(keyID >> 24), byte(keyID >> 16), byte(keyID >> 8), byte(keyID)}), key[:5],
+		"the key must be framed with the key subject's schema id")
+	s.Require().Equal("plain", string(value), "a value without a schema must be written as given")
+}
+
+func (s *ProduceMessageSuite) TestUsesTheTopicsConfiguredFormat() {
+	dir := s.T().TempDir()
+	schemaFile := filepath.Join(dir, "order.avsc")
+	s.Require().NoError(os.WriteFile(schemaFile, []byte(orderAvro), 0o600), "the schema fixture must be written")
+
+	topic := s.env.CreateTopic(s.T(), "produce-configured")
+	s.formats = map[string]*config.TopicFormat{
+		topic: {Value: &config.PartFormat{Format: config.FormatAvro, SchemaFile: schemaFile}},
+	}
+	defer func() { s.formats = nil }()
+
+	out, err := s.produceOne(s.client(false), "here", true, producemessage.Item{
+		Topic: topic,
+		Value: `{"id":"o-2","amount":7}`,
+	})
+
+	s.Require().NoError(err, "a topic with a configured format must encode without being asked")
+
+	_, value, _ := s.read(topic, out.WrittenOffset)
+	expected, err := avro.MustParse(orderAvro).Encode(map[string]any{"id": "o-2", "amount": int64(7)})
+	s.Require().NoError(err, "the expected bytes must encode")
+	s.Require().Equal(expected, value,
+		"writing the JSON text into an avro topic would put a message there that its consumers cannot read")
+	s.Require().Equal("avro", out.ValueEncoding.Format, "the response must say the configured format was applied")
+}
+
+func (s *ProduceMessageSuite) TestRefusesASchemaTogetherWithBase64() {
+	topic := s.env.CreateTopic(s.T(), "produce-schema-base64")
+
+	_, err := s.produceOne(s.client(false), "here", false, producemessage.Item{
+		Topic:       topic,
+		Value:       "AAAA",
+		Encoding:    "base64",
+		ValueSchema: &producemessage.SchemaRef{},
+	})
+
+	s.Require().ErrorContains(err, "value_schema",
+		"base64 means the bytes are final and a schema means they must be encoded, so asking for both is a mistake to report")
+}
+
+func (s *ProduceMessageSuite) TestEncodesWithTheDestinationClustersRegistry() {
+	topic := s.other.CreateTopic(s.T(), "produce-remote-avro")
+
+	// Different registries assign ids independently; registering a filler
+	// first makes the destination's id differ from the source's.
+	s.other.RegisterSchema(s.T(), s.other.UniqueName("filler")+"-value", sr.Schema{Schema: `"string"`})
+	id := s.other.RegisterSchema(s.T(), topic+"-value", sr.Schema{Schema: orderAvro})
+
+	out, err := s.produceOne(s.clusters(false, false), "here", true, producemessage.Item{
+		Topic:              topic,
+		Value:              `{"id":"o-3","amount":1}`,
+		ValueSchema:        &producemessage.SchemaRef{},
+		DestinationCluster: "there",
+	})
+
+	s.Require().NoError(err, "producing against the destination's registry must succeed")
+	s.Require().Equal(id, out.ValueEncoding.SchemaID,
+		"the schema must come from the destination's registry, because that is where the consumer looks the id up")
 }
 
 func (s *ProduceMessageSuite) TestRejectsInvalidBase64() {

@@ -63,6 +63,12 @@ worse than one more question.
 **Report partition and offset with any message.** That triple is what
 identifies a message for every follow-up call; content alone does not.
 
+**Read `format` before trusting a value.** Avro, Protobuf and JSON Schema
+messages are shown decoded to JSON, with `schema_id` saying which schema; a
+`decode_error` means the server could not decode it, and base64 there is not
+the message's real content. Never write JSON back into a schema-encoded topic
+without `value_schema` — see [produce-message](references/produce-message.md).
+
 **Every target is an `items` array.** The tools that name a topic, partition,
 offset or group take it only inside `items` — there is no single-target form, so
 one operation is an array of length one and several are the same call with more

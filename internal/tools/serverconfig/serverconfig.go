@@ -35,15 +35,26 @@ type Output struct {
 	OutputDir      string                `json:"output_dir"`
 	ConfigFile     string                `json:"config_file,omitempty"`
 	HTTPAddress    string                `json:"http_address,omitempty"`
+	SchemaRegistry []string              `json:"schema_registry,omitempty"`
+	TopicFormats   []TopicFormat         `json:"topic_formats,omitempty"`
 	Tools          []string              `json:"tools"`
 	Note           string                `json:"note"`
 }
 
+// TopicFormat is one topic_formats rule: the topic or pattern, and the format
+// fixed for its key and value.
+type TopicFormat struct {
+	Topic string `json:"topic"`
+	Key   string `json:"key,omitempty"`
+	Value string `json:"value,omitempty"`
+}
+
 const description = `
 Report this endpoint's name, path, purpose, cluster, brokers, authentication,
-TLS, read-only policy and exposed tools. Use it to confirm the target and
-permissions before acting; several endpoints may target one cluster with
-different policies. Passwords are never returned.
+TLS, read-only policy, Schema Registry, configured topic formats and exposed
+tools. Use it to confirm the target and permissions before acting; several
+endpoints may target one cluster with different policies. Passwords are never
+returned.
 `
 
 // Register adds the server_config tool to the MCP server.
@@ -127,6 +138,28 @@ func Run(kafka *kafkaclient.Client, server *config.Config, endpoint *config.Endp
 		out.Authentication = out.SASLOptions[0].Mechanism
 		out.SASLUser = out.SASLOptions[0].User
 	}
+
+	if cfg.SchemaRegistry != nil {
+		out.SchemaRegistry = cfg.SchemaRegistry.URLs
+	}
+
+	for pattern, format := range cfg.TopicFormats {
+		reported := TopicFormat{Topic: pattern}
+
+		if format.Key != nil {
+			reported.Key = format.Key.Format
+		}
+
+		if format.Value != nil {
+			reported.Value = format.Value.Format
+		}
+
+		out.TopicFormats = append(out.TopicFormats, reported)
+	}
+
+	sort.Slice(out.TopicFormats, func(i, j int) bool {
+		return out.TopicFormats[i].Topic < out.TopicFormats[j].Topic
+	})
 
 	sort.Strings(out.Tools)
 

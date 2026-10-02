@@ -62,7 +62,10 @@ The consumer is stuck on the message at its committed offset, which
 `context` to a few messages so the surrounding sequence is visible.
 
 Show the user what it is. Often the message itself explains the failure — a
-truncated payload, an unexpected type, a schema that changed.
+truncated payload, an unexpected type, a schema that changed. Schema-encoded
+messages are shown decoded; a `decode_error` on the poison message, or a
+`schema_id` different from its neighbours', is often the cause itself: a
+producer wrote with a schema the consumer does not know.
 
 ### 3. Offer preservation, and let the user choose
 
@@ -75,7 +78,10 @@ to choose**:
 - **`copy_message` to a dead letter topic** — durable, stays in Kafka, and the
   copy carries headers recording where it came from, when, and by which
   principal. Best when the message will be reprocessed later, or when other
-  systems need to see it. The destination topic must already exist.
+  systems need to see it. The destination topic must already exist. When the
+  dead letter topic is on a cluster with a different Schema Registry, the
+  preview warns about the schema id; set `translate_schema` so the copy stays
+  decodable there.
 - **`search_messages` with `output_file`** — writes the messages as JSON lines
   on the server. Best for several messages at once, or for inspecting them
   outside Kafka. Nothing needs to exist first.

@@ -106,6 +106,8 @@ A minimal local file:
 clusters:
   local:
     brokers: localhost:19092
+    schema_registry:
+      urls: ["http://localhost:18081"]
 endpoints:
   local:
     cluster: local
@@ -182,11 +184,56 @@ A cluster that cannot be reached at startup is still served, and
 `list_clusters` reports it as disconnected. One cluster being down must not
 block debugging the others.
 
+### Message formats
+
+Messages are decoded to JSON for every tool that shows or searches them, by the
+first rule that applies:
+
+1. The topic has a format in `topic_formats`.
+2. The bytes carry a Schema Registry header (Confluent wire format) and the
+   cluster has a `schema_registry`: Avro, Protobuf (with message index and
+   referenced schemas) or JSON Schema.
+3. Otherwise JSON, then UTF-8 text, then base64.
+
+```yaml
+clusters:
+  prod:
+    brokers: kafka-1:9093
+    schema_registry:
+      urls: ["https://schema-registry:8081"]
+      user: kafka-mcp                     # or bearer_token: "{env:SR_TOKEN}"
+      password: "{env:SR_PASSWORD}"       # or password_file
+      # tls: {enabled: true, ca_file: /etc/sr/ca.pem}
+    topic_formats:                        # topics whose messages carry no schema id
+      "orders.*":                         # exact name or glob; longest match wins
+        value:
+          format: protobuf
+          proto_files: [shop/order.proto]
+          import_paths: [./protos]        # or descriptor_set: ./orders.binpb
+          message_type: shop.Order
+      events:
+        value: {format: avro, schema_file: ./schemas/event.avsc}
+      metrics:
+        key: {format: text}
+        value: {format: msgpack}
+```
+
+Formats are `avro`, `protobuf`, `json`, `msgpack`, `text` and `binary`. Schema
+files and `.proto` sources are loaded at startup, so a missing file or type stops
+the server. A message that names a schema but cannot be decoded is returned as
+base64 with `decode_error` saying why, never silently. JSON output has sorted
+keys; Avro longs beyond 2^53 keep their exact value; unset Protobuf fields are
+shown with their defaults.
+
+Each rendered message reports `format`, `schema_id` and `message_type` for the
+value, and `key_format` / `key_schema_id` when the key is not plain text.
+
 `server_config` reports the endpoint name, exact path, description, policy and
 the cluster it serves, and never the password. Its `authentication` and
 `sasl_user` describe the first configured option; `sasl_options` lists all
 configured identities in preference order, not the mechanism negotiated by an
-individual broker connection.
+individual broker connection. It also reports `schema_registry` URLs and
+`topic_formats`.
 
 ### Browser clients (CORS)
 
@@ -407,9 +454,9 @@ acted. A shared credential cannot be made to answer it.
 
 ### Batch operations
 
-`describe_topic`, `sample_messages`, `get_message`, `consumer_lag`,
-`add_partitions`, `create_topic`, `commit_offset`, `copy_message` and
-`produce_message` take their target **only** as a required `items` array. There
+`describe_topic`, `sample_messages`, `get_message`, `get_schema`,
+`consumer_lag`, `add_partitions`, `create_topic`, `commit_offset`,
+`copy_message` and `produce_message` take their target **only** as a required `items` array. There
 is no single-target form: one operation is an `items` array of length one.
 
 ```json
@@ -421,8 +468,8 @@ Everything naming or shaping an operation lives on the item, so each field and
 its description exist in exactly one place. What governs the whole call stays at
 the top level, which in practice means `confirm`.
 
-The message-heavy tools accept at most 20 items; lag and administrative tools
-accept at most 100.
+The message-heavy tools accept at most 20 items; lag, schema and administrative
+tools accept at most 100.
 
 Every response is the same envelope. Results stay in input order, each entry
 carrying `index` and either `result` or `error`, followed by `succeeded`,
@@ -589,9 +636,11 @@ keeps only the latest message per key).
 ### `sample_messages`
 
 Reads a small sample of the newest messages and reports what they look like:
-value formats, JSON field paths with their types, key statistics, and which
-value fields carry the message key. Use it before searching to decide how to
-search.
+value formats, field paths with their types, key statistics, which value fields
+carry the message key, and the schemas the values were written with. Avro,
+Protobuf and JSON Schema values are decoded first, so their field paths are
+reported like JSON. Use it before searching to decide how to search, and before
+producing to find the schema to write against.
 
 | Parameter | Type     | Required | Meaning                   |
 | --------- | -------- | -------- | ------------------------- |
@@ -612,12 +661,16 @@ Item fields:
    "json_fields": [{"path": "payload.amount", "types": ["number"], "present": 20, "example": "500"}],
    "key_stats": {"present": 20, "absent": 0, "unique": 20, "all_unique": true},
    "key_in_value": ["payload.orderId"],
+   "schemas": [{"format": "avro", "schema_id": 7, "message_type": "shop.Order", "count": 20}],
    "sampled_ranges": [{"partition": 0, "start": 980, "end": 1000}]}}],
  "succeeded": 1, "failed": 0, "applied": 0, "atomic": false}
 ```
 
 `key_in_value` naming a field means the key is that identifier, so searching
-the key alone is the precise, cheap lookup.
+the key alone is the precise, cheap lookup. `value_formats` also counts `avro`,
+`protobuf`, `json_schema`, `msgpack`, `null` and `undecodable` — values that
+named a schema but could not be decoded, which is a configuration problem, not
+binary data.
 
 ### `search_messages`
 
@@ -647,8 +700,8 @@ Return true to keep a message. In scope:
 
 | Name | Value |
 | ---- | ----- |
-| `value` | parsed JSON document, or the raw text when the message is not JSON |
-| `key` | string, or `null` when absent |
+| `value` | parsed JSON document; the decoded record for Avro, Protobuf, JSON Schema or a configured format; the raw text otherwise |
+| `key` | string, the decoded document when the key has a schema, or `null` when absent |
 | `headers` | object of header name to string |
 | `partition`, `offset` | numbers |
 | `timestamp` | a `Date` |
@@ -742,8 +795,48 @@ Item fields:
   {"topic": "orders", "partition": 0, "offset": 17, "context": 1}]}}
 ```
 
-Values that are not valid UTF-8 are base64 encoded, with `encoding` set to
-`base64`.
+Schema-encoded values are decoded to JSON, with `format`, `schema_id` and
+`message_type` saying what they were. Values that could not be decoded and are
+not valid UTF-8 are base64 encoded, with `encoding` set to `base64`;
+`decode_error` explains a value that named a schema but could not be decoded.
+
+```json
+{"partition": 0, "offset": 17, "key": "o-1",
+ "value": "{\"amount\":42,\"id\":\"o-1\"}", "format": "avro",
+ "schema_id": 7, "message_type": "shop.Order", "encoding": "utf8", "value_bytes": 12}
+```
+
+### `get_schema`
+
+Reads schemas from the cluster's Schema Registry, by subject or by the
+`schema_id` a message carries. Read the schema before producing to a
+schema-encoded topic: it names every field and enum a value needs, which a
+sampled message may not show.
+
+| Parameter | Type     | Required | Meaning                       |
+| --------- | -------- | -------- | ----------------------------- |
+| `items`   | object[] | yes      | 1 to 100 schemas to look up   |
+
+Item fields, giving `subject` or `id`:
+
+| Field     | Type   | Required | Meaning                                         |
+| --------- | ------ | -------- | ----------------------------------------------- |
+| `subject` | string | either   | Subject, usually `<topic>-value` or `<topic>-key` |
+| `version` | int    | no       | Subject version. Defaults to the latest         |
+| `id`      | int    | either   | Schema id, e.g. from `get_message`              |
+
+```json
+{"results": [{"index": 0, "result": {
+   "schema_id": 7, "subject": "orders-value", "version": 3, "versions": [1, 2, 3],
+   "type": "avro", "schema": "{...}", "references": [],
+   "message_types": null, "used_by": null}}],
+ "succeeded": 1, "failed": 0, "applied": 0, "atomic": false}
+```
+
+`message_types` lists Protobuf messages, which `produce_message` takes as
+`message_type`. Looking up an `id` fills `used_by` with the subject versions
+that use it. The call fails as a whole when the cluster has no
+`schema_registry`.
 
 ### `list_consumer_groups`
 
@@ -975,6 +1068,7 @@ Item fields:
 | `source_topic`, `source_partition`, `source_offset` |        | yes      | Message to copy                                              |
 | `destination_topic`                                 | string | yes      | Where to write it. Must already exist                        |
 | `destination_cluster`                               | string | no       | Another cluster to write to. Defaults to this endpoint's own  |
+| `translate_schema`                                  | bool   | no       | Re-register a schema id in the destination's registry         |
 | `max_value_bytes`                                   | int    | no       | Preview value limit. The whole value is always copied         |
 
 Set `destination_cluster` to copy into another cluster this server serves,
@@ -987,6 +1081,14 @@ Every copy carries provenance headers — `kafka-mcp-copied-from-cluster`,
 preproduction topic can be traced back to its original. If the message already
 carries one of those headers, the original is kept and the collision is
 reported.
+
+Key and value bytes are copied unchanged. A schema id is only meaningful in the
+registry that issued it, so when the destination cluster uses a different
+registry, or none, the response warns. With `translate_schema` the schema is
+registered in the destination registry under `<destination_topic>-value` (or
+`-key`), with its references, and the id in the copy is rewritten; the payload
+is untouched. That registration is a write to the destination registry and
+happens only with `confirm`.
 
 For a copy within the endpoint's own cluster, its `read_only` policy protects
 the destination. A read-only endpoint can still be the source of a
@@ -1016,7 +1118,9 @@ Item fields:
 | `key`                 | string | no       | Decides the partition when `partition` is omitted           |
 | `headers`             | object | no       | Header name to value                                        |
 | `partition`           | int    | no       | Exact partition. Omit to let the key decide                 |
-| `encoding`            | string | no       | `utf8` (default) or `base64` for binary payloads            |
+| `encoding`            | string | no       | `utf8` (default) or `base64` for exact bytes you already have |
+| `value_schema`        | object | no       | Encode `value` (JSON) to a registry schema                  |
+| `key_schema`          | object | no       | Encode `key` (JSON) to a registry schema                    |
 | `destination_cluster` | string | no       | Another cluster to write to. Defaults to this endpoint's own |
 | `max_value_bytes`     | int    | no       | Preview value limit. The whole value is always written       |
 
@@ -1025,6 +1129,16 @@ Every message carries `kafka-mcp-produced-at`, `kafka-mcp-produced-by-tool`,
 `kafka-mcp-produced-by-client`, so a fabricated message stays distinguishable
 from a genuine one. A header the caller supplies under one of those names is
 kept as given and the collision is reported.
+
+`value_schema` and `key_schema` take `{subject, version, id, message_type}`,
+all optional: `{}` means the latest version of `<topic>-value` (or `-key`) in
+the **destination** cluster's registry, `id` pins an exact schema, and
+`message_type` picks a Protobuf message. The value is given as JSON, validated
+against the schema in the preview — a missing or misspelt field is refused by
+name — and written framed with the schema id, as registry-aware consumers
+expect. A topic with a format in `topic_formats` is encoded to it without being
+asked. Neither can be combined with `encoding: base64`. The response reports
+the schema used in `value_encoding` / `key_encoding`.
 
 The topic must already exist: a missing one is refused rather than left to
 auto-creation. Omit `partition` unless the exact partition is the point — the

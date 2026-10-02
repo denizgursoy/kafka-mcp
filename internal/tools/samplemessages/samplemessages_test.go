@@ -5,6 +5,8 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/suite"
+	"github.com/twmb/avro"
+	"github.com/twmb/franz-go/pkg/sr"
 
 	"github.com/denizgursoy/kafka-mcp/internal/domain/records"
 	"github.com/denizgursoy/kafka-mcp/internal/domain/testenv"
@@ -170,6 +172,56 @@ func (s *SampleMessagesSuite) TestReportsNonJSONFormats() {
 		"no message here is JSON, and claiming otherwise would send the caller down the filter path")
 	s.Require().Empty(out.JSONFields,
 		"a topic with no JSON has no field paths to offer")
+}
+
+func (s *SampleMessagesSuite) TestDescribesSchemaRegistryMessages() {
+	topic := s.env.CreateTopic(s.T(), "sample-avro")
+
+	const schema = `{"type":"record","name":"Order","namespace":"shop","fields":[
+		{"name":"id","type":"string"},
+		{"name":"payload","type":{"type":"record","name":"Payload","fields":[{"name":"amount","type":"long"}]}}]}`
+
+	id := s.env.RegisterSchema(s.T(), topic+"-value", sr.Schema{Schema: schema})
+	codec := avro.MustParse(schema)
+
+	for _, order := range []string{"o-1", "o-2"} {
+		payload, err := codec.Encode(map[string]any{"id": order, "payload": map[string]any{"amount": int64(5)}})
+		s.Require().NoError(err, "the fixture record must encode")
+
+		s.env.Produce(s.T(), topic, testenv.Message{Key: order, Value: testenv.WireFormat(s.T(), id, nil, payload)})
+	}
+
+	out, err := s.sample(samplemessages.Item{Topic: topic})
+
+	s.Require().NoError(err, "sampling an Avro topic must succeed")
+	s.Require().Equal(2, out.ValueFormats.Avro,
+		"Avro values must be counted as Avro, so the caller knows the topic is schema-encoded")
+	s.Require().Zero(out.ValueFormats.Binary,
+		"a decoded Avro message is not opaque binary, and counting it so would hide that it can be searched")
+
+	paths := make(map[string]samplemessages.Field, len(out.JSONFields))
+	for _, field := range out.JSONFields {
+		paths[field.Path] = field
+	}
+
+	s.Require().Contains(paths, "payload.amount",
+		"field paths inside an Avro record must be reported, or a search predicate cannot be designed for it")
+	s.Require().Equal([]string{"id"}, out.KeyInValue,
+		"the key carried in a decoded Avro field must be found, which is what makes a key search safe")
+	s.Require().Equal([]samplemessages.Schema{{Format: "avro", SchemaID: id, MessageType: "shop.Order", Count: 2}}, out.Schemas,
+		"the schemas seen must be reported, so the caller can fetch the one to write against")
+}
+
+func (s *SampleMessagesSuite) TestCountsUndecodableMessages() {
+	topic := s.env.CreateTopic(s.T(), "sample-undecodable")
+
+	s.env.Produce(s.T(), topic, testenv.Message{Value: testenv.WireFormat(s.T(), 987654, nil, []byte{0x02})})
+
+	out, err := s.sample(samplemessages.Item{Topic: topic})
+
+	s.Require().NoError(err, "a topic of undecodable messages must still sample")
+	s.Require().Equal(1, out.ValueFormats.Undecodable,
+		"a message that names a schema the registry lacks must be counted apart from ordinary binary, because it is a configuration problem")
 }
 
 func (s *SampleMessagesSuite) TestSamplesTheNewestMessages() {

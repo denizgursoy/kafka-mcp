@@ -20,6 +20,7 @@ indistinguishable to a consumer from a real one, and it will be processed.
 | `list_topics`     | Confirming the destination exists and is the right one |
 | `describe_topic`  | The partition count, and whether the topic is compacted |
 | `get_message`     | Reading the original a repaired message is based on   |
+| `get_schema`      | The schema a schema-encoded topic's values must fit   |
 | `search_messages` | Finding the original when its offset is not known     |
 | `produce_message` | Previewing and writing                                |
 | `create_topic`    | Creating the destination when it does not exist yet   |
@@ -89,12 +90,40 @@ headers alongside them.
 
 ### 4. Choose the encoding
 
-`encoding` defaults to `utf8`, which is right for JSON and text.
+Read `format` and `schema_id` on the original from `get_message` (or `schemas`
+from `sample_messages` for a topic you are seeding). They decide how the value
+must be written, and getting it wrong breaks the consumer as surely as a
+corrupt payload:
 
-Use `base64` when the payload is binary — protobuf, Avro, anything that is not
-text. `get_message` reports `encoding: base64` for exactly these, and a value
-that arrived base64 must go back as base64, or the consumer receives the
-characters of the encoding rather than the bytes it expects.
+- **`avro`, `protobuf` or `json_schema` with a `schema_id`.** The topic is
+  Schema Registry encoded. Write the value as **JSON** and set `value_schema`.
+  `{}` uses the latest version of `<topic>-value` in the **destination**
+  cluster's registry; set `id` to pin the original's exact schema, and
+  `message_type` (from the original's `message_type`, or `get_schema`'s
+  `message_types`) for Protobuf. Call `get_schema` first when changing more
+  than a value: it lists every field and enum, including ones the original
+  happens not to set. The preview refuses a document that does not fit,
+  naming the field, before anything is written. Never write plain JSON into
+  such a topic: its consumers cannot read it.
+- **A format with no `schema_id`** (Avro, Protobuf or msgpack from the
+  cluster's `topic_formats`). Write the value as JSON and leave `value_schema`
+  unset; the configured format is applied, and `value_encoding` in the response
+  says so.
+- **`json` or `text`.** `encoding` defaults to `utf8`; write the value as is.
+- **`binary`.** Use `encoding: base64` with the exact bytes, or the consumer
+  receives the characters of the encoding rather than the bytes it expects.
+  base64 cannot be combined with a schema. If the original has a
+  `decode_error`, the server could not read its schema; fix that (see
+  `server_config`) rather than editing bytes by hand.
+
+The key follows the same rules with `key_schema`, when `key_format` shows the
+key has a schema.
+
+For **reproduce in preprod**, the destination registry may not have the
+schema, or may give it another id. To move an existing message unchanged, use
+`copy_message` with `translate_schema`, which registers the schema there and
+rewrites the id. To produce a variant, register the schema in the destination
+first or ask whoever owns that registry.
 
 ### 5. Leave the partition alone unless it is the point
 

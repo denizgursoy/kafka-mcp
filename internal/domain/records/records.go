@@ -14,52 +14,83 @@ import (
 	"unicode/utf8"
 
 	"github.com/twmb/franz-go/pkg/kgo"
+
+	"github.com/denizgursoy/kafka-mcp/internal/domain/serde"
 )
 
 // Message is a Kafka record rendered for an MCP client.
 //
-// Values are strings so they can be read directly by the caller. A payload
-// that is not valid UTF-8 cannot survive JSON, so it is base64 encoded and
-// Encoding says so.
+// Values are strings so they can be read directly by the caller. A value with
+// a schema, from the registry or from topic_formats, is decoded to JSON and
+// Format says which. A payload that is not valid UTF-8 and could not be decoded
+// cannot survive JSON, so it is base64 encoded and Encoding says so.
 type Message struct {
-	Partition  int32             `json:"partition"`
-	Offset     int64             `json:"offset"`
-	Timestamp  time.Time         `json:"timestamp"`
-	Key        string            `json:"key"`
-	Value      string            `json:"value"`
-	Headers    map[string]string `json:"headers,omitempty"`
-	Encoding   string            `json:"encoding"`
-	ValueBytes int               `json:"value_bytes"`
-	Truncated  bool              `json:"truncated"`
+	Partition   int32             `json:"partition"`
+	Offset      int64             `json:"offset"`
+	Timestamp   time.Time         `json:"timestamp"`
+	Key         string            `json:"key"`
+	KeyFormat   string            `json:"key_format,omitempty"`
+	KeySchemaID int               `json:"key_schema_id,omitempty"`
+	Value       string            `json:"value"`
+	Headers     map[string]string `json:"headers,omitempty"`
+	Encoding    string            `json:"encoding"`
+	Format      string            `json:"format"`
+	SchemaID    int               `json:"schema_id,omitempty"`
+	MessageType string            `json:"message_type,omitempty"`
+	DecodeError string            `json:"decode_error,omitempty"`
+	ValueBytes  int               `json:"value_bytes"`
+	Truncated   bool              `json:"truncated"`
 }
 
 // DefaultMaxValueBytes bounds a rendered value when the caller sets no limit,
 // so one large message cannot flood an MCP client's context window.
 const DefaultMaxValueBytes = 4096
 
-// Render converts a Kafka record into a Message, truncating the value to
-// maxValueBytes. A maxValueBytes of zero or less means DefaultMaxValueBytes.
+// Render converts a Kafka record into a Message without any schema: JSON and
+// text are shown as they are and anything else as base64. Readers with a
+// codec should use Reader.Render, which also decodes schema-encoded messages.
 func Render(record *kgo.Record, maxValueBytes int) Message {
+	var codec *serde.Codec
+
+	return RenderDecoded(
+		record,
+		codec.Decode(context.Background(), record.Topic, serde.Key, record.Key),
+		codec.Decode(context.Background(), record.Topic, serde.Value, record.Value),
+		maxValueBytes,
+	)
+}
+
+// RenderDecoded converts a record whose key and value were already decoded,
+// so a caller that inspects the decoded value does not decode it twice.
+// A maxValueBytes of zero or less means DefaultMaxValueBytes.
+func RenderDecoded(record *kgo.Record, key, value serde.Decoded, maxValueBytes int) Message {
 	if maxValueBytes <= 0 {
 		maxValueBytes = DefaultMaxValueBytes
 	}
 
 	message := Message{
-		Partition:  record.Partition,
-		Offset:     record.Offset,
-		Timestamp:  record.Timestamp.UTC(),
-		Key:        renderText(record.Key),
-		ValueBytes: len(record.Value),
-		Encoding:   "utf8",
+		Partition:   record.Partition,
+		Offset:      record.Offset,
+		Timestamp:   record.Timestamp.UTC(),
+		Key:         key.Text,
+		Value:       value.Text,
+		ValueBytes:  len(record.Value),
+		Encoding:    "utf8",
+		Format:      value.Format,
+		SchemaID:    value.SchemaID,
+		MessageType: value.MessageType,
+		DecodeError: value.Error,
 	}
 
-	value := record.Value
-
-	if !utf8.Valid(value) {
+	if value.Format == serde.FormatBinary {
 		message.Encoding = "base64"
-		message.Value = base64.StdEncoding.EncodeToString(value)
-	} else {
-		message.Value = string(value)
+	}
+
+	// A text key is the common case and says nothing a caller needs; any other
+	// format changes how Key must be read.
+	if key.Format != serde.FormatText {
+		message.KeyFormat = key.Format
+		message.KeySchemaID = key.SchemaID
 	}
 
 	if len(message.Value) > maxValueBytes {
@@ -105,6 +136,7 @@ func (r Range) Empty() bool {
 // would disturb any other tool call running at the same time.
 type Reader struct {
 	options []kgo.Opt
+	codec   *serde.Codec
 }
 
 // NewReader returns a Reader for the given seed brokers.
@@ -116,6 +148,33 @@ func NewReader(seeds ...string) *Reader {
 // SASL, into each independent reading session. Do not pass consumer options.
 func NewReaderWithOptions(options ...kgo.Opt) *Reader {
 	return &Reader{options: append([]kgo.Opt(nil), options...)}
+}
+
+// WithCodec returns a reader that decodes messages with codec: Schema
+// Registry framing and the cluster's topic_formats.
+func (r *Reader) WithCodec(codec *serde.Codec) *Reader {
+	return &Reader{options: r.options, codec: codec}
+}
+
+// Decode decodes one part of a record with this reader's codec.
+func (r *Reader) Decode(ctx context.Context, record *kgo.Record, part serde.Part) serde.Decoded {
+	data := record.Value
+	if part == serde.Key {
+		data = record.Key
+	}
+
+	return r.codec.Decode(ctx, record.Topic, part, data)
+}
+
+// Render converts a record into a Message, decoding its key and value with
+// this reader's codec.
+func (r *Reader) Render(ctx context.Context, record *kgo.Record, maxValueBytes int) Message {
+	return RenderDecoded(record, r.Decode(ctx, record, serde.Key), r.Decode(ctx, record, serde.Value), maxValueBytes)
+}
+
+// Codec returns the codec this reader decodes with, which may be nil.
+func (r *Reader) Codec() *serde.Codec {
+	return r.codec
 }
 
 const (

@@ -103,9 +103,9 @@ export const tools = [
     name: 'sample_messages',
     group: 'read',
     batch: 20,
-    summary: 'What recent messages look like: formats, JSON field paths, and which field the key is.',
+    summary: 'What recent messages look like: formats, field paths, schemas, and which field the key is.',
     detail:
-      'When key_in_value names a field, the key is that identifier, and searching the key is the exact, cheap lookup.',
+      'Avro, Protobuf and JSON Schema values are decoded first, so their fields are listed like JSON. When key_in_value names a field, the key is that identifier, and searching the key is the exact, cheap lookup.',
     params: [
       ['topic', 'string', true, 'Topic to sample'],
       ['sample_size', 'int', false, 'Messages to read in total. Default 20'],
@@ -115,9 +115,10 @@ export const tools = [
     call: { items: [{ topic: 'orders', sample_size: 20 }] },
     result: {
       results: [{ index: 0, result: {
-        value_formats: { json: 20, text: 0, binary: 0 },
+        value_formats: { json: 0, text: 0, binary: 0, avro: 20 },
         json_fields: [{ path: 'payload.amount', types: ['number'], present: 20 }],
         key_in_value: ['payload.orderId'],
+        schemas: [{ format: 'avro', schema_id: 7, message_type: 'shop.Order', count: 20 }],
       } }],
       succeeded: 1, failed: 0, applied: 0, atomic: false,
     },
@@ -154,7 +155,8 @@ export const tools = [
     group: 'read',
     batch: 20,
     summary: 'Messages at exact offsets, with neighbours on either side.',
-    detail: 'Values that are not valid UTF-8 come back base64 encoded, with encoding set to base64.',
+    detail:
+      'Schema Registry values (Avro, Protobuf, JSON Schema) and configured formats come back decoded to JSON, with format and schema_id. Anything else that is not UTF-8 is base64; decode_error says why a schema-framed value could not be read.',
     params: [
       ['topic', 'string', true, 'Topic to read from'],
       ['partition', 'int', true, 'Partition to read from'],
@@ -164,7 +166,28 @@ export const tools = [
     ],
     call: { items: [{ topic: 'orders', partition: 3, offset: 48211, context: 1 }] },
     result: {
-      results: [{ index: 0, result: { topic: 'orders', message: { partition: 3, offset: 48211, key: 'ORD-12345' }, before: ['…'], after: ['…'] } }],
+      results: [{ index: 0, result: { topic: 'orders', message: { partition: 3, offset: 48211, key: 'ORD-12345', value: '{"status":"NEW",…}', format: 'avro', schema_id: 7 }, before: ['…'], after: ['…'] } }],
+      succeeded: 1, failed: 0, applied: 0, atomic: false,
+    },
+  },
+  {
+    name: 'get_schema',
+    group: 'read',
+    batch: 100,
+    summary: 'A Schema Registry schema, by subject or by the schema id a message carries.',
+    detail:
+      'Read it before producing to a schema-encoded topic: it names every field a value needs. For Protobuf, message_types are the names produce_message accepts. Looking up an id lists the subjects that use it.',
+    params: [
+      ['subject', 'string', false, 'Usually <topic>-value. Give subject or id'],
+      ['version', 'int', false, 'Defaults to the latest'],
+      ['id', 'int', false, 'Schema id, e.g. from get_message'],
+    ],
+    call: { items: [{ subject: 'orders-value' }] },
+    result: {
+      results: [{ index: 0, result: {
+        schema_id: 7, subject: 'orders-value', version: 3, versions: [1, 2, 3],
+        type: 'avro', schema: '{"type":"record","name":"Order",…}', references: [],
+      } }],
       succeeded: 1, failed: 0, applied: 0, atomic: false,
     },
   },
@@ -297,13 +320,14 @@ export const tools = [
     write: 'destination',
     summary: 'Copies a message by its address, to a dead letter topic or into another cluster.',
     detail:
-      'Key, value and headers are preserved, and provenance headers record where it came from. A read-only endpoint can still be the source; only the destination must be writable.',
+      'Key, value and headers are preserved, and provenance headers record where it came from. A read-only endpoint can still be the source; only the destination must be writable. Across Schema Registries, translate_schema registers the schema at the destination and rewrites the id.',
     params: [
       ['source_topic', 'string', true, 'Message to copy'],
       ['source_partition', 'int', true, ''],
       ['source_offset', 'int', true, ''],
       ['destination_topic', 'string', true, 'Must already exist'],
       ['destination_cluster', 'string', false, 'Defaults to this endpoint\u2019s cluster'],
+      ['translate_schema', 'bool', false, 'Re-register a schema id in the destination registry'],
       ['max_value_bytes', 'int', false, 'Preview limit. The whole value is always copied'],
     ],
     call: {
@@ -325,7 +349,7 @@ export const tools = [
     write: 'destination',
     summary: 'Writes a new message into an existing topic, marked so it is never mistaken for a real one.',
     detail:
-      'Omit partition unless the exact partition is the point: the key decides placement, and a named partition breaks ordering for that key. A produced message cannot be deleted.',
+      'Omit partition unless the exact partition is the point: the key decides placement, and a named partition breaks ordering for that key. For a schema-encoded topic give the value as JSON with value_schema; it is validated and encoded before anything is written. A produced message cannot be deleted.',
     params: [
       ['topic', 'string', true, 'Existing topic'],
       ['value', 'string', true, 'The message body'],
@@ -333,12 +357,15 @@ export const tools = [
       ['headers', 'object', false, 'Header name to value'],
       ['partition', 'int', false, 'Exact partition'],
       ['encoding', 'string', false, 'utf8 (default) or base64'],
+      ['value_schema', 'object', false, 'Encode value to a registry schema. {} = latest <topic>-value'],
+      ['key_schema', 'object', false, 'Encode key to a registry schema. {} = latest <topic>-key'],
       ['destination_cluster', 'string', false, 'Defaults to this endpoint\u2019s cluster'],
     ],
-    call: { items: [{ topic: 'orders', key: 'ORD-12345', value: '{"status":"NEW"}' }], confirm: false },
+    call: { items: [{ topic: 'orders', key: 'ORD-12345', value: '{"status":"NEW"}', value_schema: {} }], confirm: false },
     result: {
       results: [{ index: 0, result: {
         destination_cluster: 'preprod', topic: 'orders', applied: false,
+        value_encoding: { format: 'avro', schema_id: 7, subject: 'orders-value', version: 3 },
         provenance_headers: ['kafka-mcp-produced-at', 'kafka-mcp-produced-by-tool', '…'],
       } }],
       succeeded: 1, failed: 0, applied: 0, atomic: false,
@@ -380,7 +407,7 @@ export const scenarios = [
   {
     guide: 'produce-message',
     ask: 'reproduce this in preprod',
-    flow: ['get_message', 'list_clusters', 'copy_message', 'produce_message'],
+    flow: ['get_message', 'get_schema', 'list_clusters', 'copy_message', 'produce_message'],
     note: 'Takes a production message into preprod without writing a byte to production.',
   },
   {

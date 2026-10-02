@@ -29,6 +29,7 @@ import (
 	"github.com/denizgursoy/kafka-mcp/internal/tools/deletetopic"
 	"github.com/denizgursoy/kafka-mcp/internal/tools/describetopic"
 	"github.com/denizgursoy/kafka-mcp/internal/tools/getmessage"
+	"github.com/denizgursoy/kafka-mcp/internal/tools/getschema"
 	"github.com/denizgursoy/kafka-mcp/internal/tools/listclusters"
 	"github.com/denizgursoy/kafka-mcp/internal/tools/listconsumergroups"
 	"github.com/denizgursoy/kafka-mcp/internal/tools/listtopics"
@@ -65,6 +66,7 @@ func Names() []string {
 		"delete_topic",
 		"describe_topic",
 		"get_message",
+		"get_schema",
 		"list_clusters",
 		"list_consumer_groups",
 		"list_topics",
@@ -133,6 +135,7 @@ func Register(
 		searchmessages.Register(server, kafka.Admin(), kafka.Reader(), cfg.OutputDir)
 	})
 	endpoint.add("get_message", func() { getmessage.Register(server, kafka.Reader()) })
+	endpoint.add("get_schema", func() { getschema.Register(server, kafka.Codec()) })
 
 	// A read-only endpoint is not offered the tools whose only purpose is to
 	// change it. They all refuse at the point of mutation anyway, but a

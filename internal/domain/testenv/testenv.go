@@ -37,10 +37,12 @@ import (
 	"github.com/twmb/franz-go/pkg/kerr"
 	"github.com/twmb/franz-go/pkg/kgo"
 	"github.com/twmb/franz-go/pkg/sasl/scram"
+	"github.com/twmb/franz-go/pkg/sr"
 
 	"github.com/denizgursoy/kafka-mcp/internal/domain/config"
 	"github.com/denizgursoy/kafka-mcp/internal/domain/kafkaclient"
 	"github.com/denizgursoy/kafka-mcp/internal/domain/records"
+	"github.com/denizgursoy/kafka-mcp/internal/domain/serde"
 )
 
 const (
@@ -364,13 +366,25 @@ func (e *Environment) Broker() string {
 }
 
 // Reader returns a record reader pointed at the running broker, for tools that
-// read message content rather than metadata.
+// read message content rather than metadata. It decodes Schema Registry
+// messages against this environment's registry, as a configured cluster does.
 func (e *Environment) Reader() *records.Reader {
-	return records.NewReaderWithOptions(append([]kgo.Opt{kgo.SeedBrokers(e.seed)}, e.authOptions...)...)
+	reader := records.NewReaderWithOptions(append([]kgo.Opt{kgo.SeedBrokers(e.seed)}, e.authOptions...)...)
+
+	codec, err := serde.New(&config.Cluster{
+		Name:           "test",
+		SchemaRegistry: &config.SchemaRegistry{URLs: []string{e.schemaRegistry}},
+	})
+	if err != nil {
+		e.t.Fatalf("build a codec for schema registry %s: %v", e.schemaRegistry, err)
+	}
+
+	return reader.WithCodec(codec)
 }
 
 // ClusterClient builds the same domain client a tool receives in production,
-// pointed at this environment's broker and optionally marked read-only.
+// pointed at this environment's broker and Schema Registry, and optionally
+// marked read-only.
 //
 // The client is closed when the running test ends. Pass that test's *testing.T,
 // not the suite's, so a connection failure aborts the case that asked for it.
@@ -378,9 +392,10 @@ func (e *Environment) ClusterClient(t *testing.T, readOnly bool) *kafkaclient.Cl
 	t.Helper()
 
 	cluster := &config.Cluster{
-		Name:     "test",
-		Brokers:  []string{e.Broker()},
-		ReadOnly: readOnly,
+		Name:           "test",
+		Brokers:        []string{e.Broker()},
+		ReadOnly:       readOnly,
+		SchemaRegistry: &config.SchemaRegistry{URLs: []string{e.schemaRegistry}},
 	}
 
 	if len(e.authOptions) > 0 {
@@ -404,6 +419,41 @@ func (e *Environment) ClusterClient(t *testing.T, readOnly bool) *kafkaclient.Cl
 // SchemaRegistry returns the host address of the Schema Registry.
 func (e *Environment) SchemaRegistry() string {
 	return e.schemaRegistry
+}
+
+// RegisterSchema registers a schema under subject in this environment's
+// Schema Registry and returns its id, so a test can produce messages that
+// carry it. Registering an identical schema again returns the same id.
+func (e *Environment) RegisterSchema(t *testing.T, subject string, schema sr.Schema) int {
+	t.Helper()
+
+	client, err := sr.NewClient(sr.URLs(e.schemaRegistry))
+	if err != nil {
+		t.Fatalf("connect to schema registry %s: %v", e.schemaRegistry, err)
+	}
+
+	registered, err := client.CreateSchema(t.Context(), subject, schema)
+	if err != nil {
+		t.Fatalf("register schema under %s: %v", subject, err)
+	}
+
+	return registered.ID
+}
+
+// WireFormat frames payload the way a Schema Registry serializer does: a zero
+// byte, the big-endian schema id, the protobuf message index when there is
+// one, then the payload. Tests use it to produce what a real client sends.
+func WireFormat(t *testing.T, id int, index []int, payload []byte) string {
+	t.Helper()
+
+	var header sr.ConfluentHeader
+
+	framed, err := header.AppendEncode(nil, id, index)
+	if err != nil {
+		t.Fatalf("frame schema id %d: %v", id, err)
+	}
+
+	return string(append(framed, payload...))
 }
 
 // AdminAPI returns the host address of the Redpanda Admin API.

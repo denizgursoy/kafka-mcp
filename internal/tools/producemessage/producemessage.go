@@ -16,6 +16,7 @@ import (
 	"github.com/denizgursoy/kafka-mcp/internal/domain/batch"
 	"github.com/denizgursoy/kafka-mcp/internal/domain/kafkaclient"
 	"github.com/denizgursoy/kafka-mcp/internal/domain/records"
+	"github.com/denizgursoy/kafka-mcp/internal/domain/serde"
 )
 
 // Provenance headers added to every produced message, so a record this server
@@ -38,13 +39,24 @@ const (
 // Item is one message to write.
 type Item struct {
 	Topic              string            `json:"topic" jsonschema:"Topic to write to. It must already exist."`
-	Value              string            `json:"value" jsonschema:"The message body. Interpreted as text unless encoding is base64."`
-	Key                string            `json:"key,omitempty" jsonschema:"Optional message key. The key decides which partition the message lands on when partition is omitted, so re-injecting a repaired message with its original key keeps that key's ordering."`
+	Value              string            `json:"value" jsonschema:"The message body. Written as text unless encoding is base64. With value_schema, or on a topic with a configured format, give it as JSON and it is encoded to that schema."`
+	Key                string            `json:"key,omitempty" jsonschema:"Optional message key. The key decides which partition the message lands on when partition is omitted, so re-injecting a repaired message with its original key keeps that key's ordering. With key_schema give it as JSON, e.g. a quoted string for a string schema."`
 	Headers            map[string]string `json:"headers,omitempty" jsonschema:"Optional message headers, as a map of name to value. A header that collides with a provenance header is kept as given and the collision is reported."`
 	Partition          *int32            `json:"partition,omitempty" jsonschema:"Optional exact partition to write to. Omit to let the key decide, which is almost always what you want: naming a partition puts a keyed message somewhere its key does not hash to, breaking that key's ordering."`
-	Encoding           string            `json:"encoding,omitempty" jsonschema:"Optional encoding of key and value: utf8 (default) or base64. Use base64 to write a binary payload such as protobuf or Avro, which cannot survive being carried as text."`
+	Encoding           string            `json:"encoding,omitempty" jsonschema:"Optional encoding of key and value: utf8 (default) or base64. Use base64 to write exact bytes you already have, such as a copy of an existing binary message. Cannot be combined with value_schema or key_schema."`
+	ValueSchema        *SchemaRef        `json:"value_schema,omitempty" jsonschema:"Optional. Encode value, given as JSON, to a Schema Registry schema (Avro, Protobuf or JSON Schema) on the destination cluster's registry, framed the way registry-aware consumers expect. An empty object {} uses the latest version of subject <topic>-value. Use this whenever get_message or sample_messages reports the topic's values with a schema_id."`
+	KeySchema          *SchemaRef        `json:"key_schema,omitempty" jsonschema:"Optional. Like value_schema, for the key; an empty object uses subject <topic>-key."`
 	DestinationCluster string            `json:"destination_cluster,omitempty" jsonschema:"Optional cluster to write to. Defaults to the cluster this endpoint serves. Use list_clusters to see which names are valid. The destination must not be read-only; the endpoint you called may be."`
 	MaxValueBytes      int               `json:"max_value_bytes,omitempty" jsonschema:"Optional maximum number of value bytes to show in the response. Defaults to 4096. This affects the preview only: the whole value is always written."`
+}
+
+// SchemaRef names the registry schema to encode against. Every field is
+// optional.
+type SchemaRef struct {
+	Subject     string `json:"subject,omitempty" jsonschema:"Optional subject to take the schema from. Defaults to <topic>-value for value_schema and <topic>-key for key_schema."`
+	Version     int    `json:"version,omitempty" jsonschema:"Optional subject version. Defaults to the latest."`
+	ID          int    `json:"id,omitempty" jsonschema:"Optional exact schema id, e.g. the schema_id get_message reported. Overrides subject and version."`
+	MessageType string `json:"message_type,omitempty" jsonschema:"Optional fully qualified Protobuf message name, e.g. shop.Order, when the schema defines several. Defaults to the first message. Ignored for Avro and JSON Schema."`
 }
 
 // Input is the argument set accepted by the produce_message tool.
@@ -63,6 +75,8 @@ type Output struct {
 	DestinationCluster string          `json:"destination_cluster"`
 	Topic              string          `json:"topic"`
 	Message            records.Message `json:"message"`
+	ValueEncoding      *serde.Encoded  `json:"value_encoding,omitempty"`
+	KeyEncoding        *serde.Encoded  `json:"key_encoding,omitempty"`
 	Applied            bool            `json:"applied"`
 	WrittenPartition   int32           `json:"written_partition"`
 	WrittenOffset      int64           `json:"written_offset"`
@@ -95,6 +109,13 @@ read-only.
 Omit partition unless the exact partition matters. The key decides placement,
 and naming a partition puts a keyed message where its key does not hash to,
 which breaks ordering for that key.
+
+A topic whose consumers read Avro, Protobuf or JSON Schema needs value_schema:
+give the value as JSON and it is encoded to the destination registry's schema,
+refused with the offending field when it does not fit. A topic with a format
+configured in topic_formats is encoded to it without being asked. Check
+get_message or sample_messages first: a schema_id on the existing messages means
+the topic needs value_schema, and writing plain JSON there breaks its consumers.
 `
 
 // Register adds the produce_message tool to the MCP server.
@@ -252,7 +273,7 @@ func run(
 			"value is required: an empty message and an absent one are different messages, and only one of them was intended")
 	}
 
-	key, value, err := decode(input)
+	key, value, keyEncoding, valueEncoding, err := encode(ctx, destination, input)
 	if err != nil {
 		return Output{}, err
 	}
@@ -282,7 +303,9 @@ func run(
 	out := Output{
 		DestinationCluster: destinationName,
 		Topic:              input.Topic,
-		Message:            records.Render(record, input.MaxValueBytes),
+		Message:            destination.Reader().Render(ctx, record, input.MaxValueBytes),
+		ValueEncoding:      valueEncoding,
+		KeyEncoding:        keyEncoding,
 		ProvenanceHeaders:  added,
 		Warnings:           []string{},
 	}
@@ -324,6 +347,101 @@ func run(
 		destinationName, input.Topic, written.Partition, written.Offset)
 
 	return out, nil
+}
+
+// encode turns the caller's key and value into the bytes to write.
+//
+// Each part is encoded by the first of: an explicit schema reference against
+// the destination's registry, the destination topic's configured format, or
+// the plain encoding (utf8 or base64). The destination decides, not the
+// endpoint called, because the destination's consumers are the ones reading.
+func encode(
+	ctx context.Context,
+	destination *kafkaclient.Client,
+	input Item,
+) ([]byte, []byte, *serde.Encoded, *serde.Encoded, error) {
+
+	if input.Encoding == encodingBase64 {
+		if input.ValueSchema != nil {
+			return nil, nil, nil, nil, fmt.Errorf(
+				"value_schema cannot be combined with encoding base64: base64 is for bytes that are already final, and value_schema is for JSON to be encoded")
+		}
+
+		if input.KeySchema != nil {
+			return nil, nil, nil, nil, fmt.Errorf(
+				"key_schema cannot be combined with encoding base64: base64 is for bytes that are already final, and key_schema is for JSON to be encoded")
+		}
+	}
+
+	key, value, err := decode(input)
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+
+	// base64 bytes are final; a configured format must not re-encode them.
+	if input.Encoding == encodingBase64 {
+		return key, value, nil, nil, nil
+	}
+
+	codec := destination.Codec()
+
+	value, valueEncoding, err := encodePart(ctx, codec, input.Topic, serde.Value, input.Value, value, input.ValueSchema)
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+
+	if input.Key != "" {
+		var keyEncoding *serde.Encoded
+
+		key, keyEncoding, err = encodePart(ctx, codec, input.Topic, serde.Key, input.Key, key, input.KeySchema)
+		if err != nil {
+			return nil, nil, nil, nil, err
+		}
+
+		return key, value, keyEncoding, valueEncoding, nil
+	}
+
+	if input.KeySchema != nil {
+		return nil, nil, nil, nil, fmt.Errorf("key_schema was given without a key to encode")
+	}
+
+	return key, value, nil, valueEncoding, nil
+}
+
+func encodePart(
+	ctx context.Context,
+	codec *serde.Codec,
+	topic string,
+	part serde.Part,
+	text string,
+	plain []byte,
+	ref *SchemaRef,
+) ([]byte, *serde.Encoded, error) {
+
+	if ref != nil {
+		data, encoded, err := codec.Encode(ctx, topic, part, text, serde.Target{
+			Subject:     ref.Subject,
+			Version:     ref.Version,
+			ID:          ref.ID,
+			MessageType: ref.MessageType,
+		})
+		if err != nil {
+			return nil, nil, fmt.Errorf("encode %s: %w", part, err)
+		}
+
+		return data, &encoded, nil
+	}
+
+	data, encoded, configured, err := codec.EncodeConfigured(topic, part, text)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	if !configured {
+		return plain, nil, nil
+	}
+
+	return data, &encoded, nil
 }
 
 // decode turns the caller's key and value into bytes.

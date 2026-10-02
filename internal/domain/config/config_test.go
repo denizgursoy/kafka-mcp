@@ -699,6 +699,111 @@ func (s *ConfigSuite) TestSecurityConfiguration() {
 	})
 }
 
+func (s *ConfigSuite) TestSchemaRegistryConfiguration() {
+	s.Run("urls, basic auth and tls are read", func() {
+		s.T().Setenv("SR_PASSWORD", "registry-secret")
+		loaded, err := s.load(s.write(`{"clusters":{"prod":{"brokers":"kafka:9093","schema_registry":{
+			"urls":["https://sr-1:8081"," https://sr-2:8081 "],
+			"user":"reader","password":"{env:SR_PASSWORD}",
+			"tls":{"enabled":true,"ca_file":"ca.pem"}}}}}`))
+		s.Require().NoError(err, "a cluster with a schema registry must load")
+		registry := loaded.Clusters["prod"].SchemaRegistry
+		s.Require().NotNil(registry, "the registry block must survive parsing, or every schema-encoded message stays opaque")
+		s.Require().Equal([]string{"https://sr-1:8081", "https://sr-2:8081"}, registry.URLs,
+			"every registry URL must be kept and trimmed, because the client fails over between them")
+		s.Require().Equal("registry-secret", registry.Password,
+			"the registry password must support {env:VAR} like the broker password, so a config file can be committed")
+		s.Require().True(registry.TLS.Enabled, "a registry behind TLS must be reachable")
+	})
+
+	s.Run("a password file is read and trimmed", func() {
+		secret := s.write("file-secret\n")
+		loaded, err := s.load(s.write(`{"clusters":{"prod":{"brokers":"kafka:9093","schema_registry":{
+			"urls":["http://sr:8081"],"user":"reader","password_file":"` + secret + `"}}}}`))
+		s.Require().NoError(err, "a registry password read from a file must load")
+		s.Require().Equal("file-secret", loaded.Clusters["prod"].SchemaRegistry.Password,
+			"the trailing newline of a mounted secret must not become part of the password")
+	})
+
+	s.Run("a registry without a url is refused", func() {
+		_, err := s.load(s.write(`{"clusters":{"prod":{"brokers":"kafka:9093","schema_registry":{"user":"reader","password":"x"}}}}`))
+		s.Require().ErrorContains(err, "url",
+			"a registry block with nowhere to connect is a mistake, and ignoring it would leave messages undecoded without saying why")
+	})
+
+	s.Run("basic auth and a bearer token together are refused", func() {
+		_, err := s.load(s.write(`{"clusters":{"prod":{"brokers":"kafka:9093","schema_registry":{
+			"urls":["http://sr:8081"],"user":"reader","password":"x","bearer_token":"t"}}}}`))
+		s.Require().ErrorContains(err, "bearer_token",
+			"two credentials for one registry is ambiguous, and silently picking one hides which identity is used")
+	})
+
+	s.Run("a user without a password is refused", func() {
+		_, err := s.load(s.write(`{"clusters":{"prod":{"brokers":"kafka:9093","schema_registry":{"urls":["http://sr:8081"],"user":"reader"}}}}`))
+		s.Require().ErrorContains(err, "password",
+			"configured credentials must not silently become anonymous access")
+	})
+
+	s.Run("credentials are never reported", func() {
+		loaded, err := s.load(s.write(`{"clusters":{"prod":{"brokers":"kafka:9093","schema_registry":{
+			"urls":["http://sr:8081"],"bearer_token":"bearer-secret"}}}}`))
+		s.Require().NoError(err, "a bearer token must be accepted on its own")
+		data, err := json.Marshal(loaded.Clusters["prod"].Describe())
+		s.Require().NoError(err, "the description must stay serializable")
+		s.Require().NotContains(string(data), "bearer-secret",
+			"a registry token sent to an MCP client could be logged or shown to a model")
+		s.Require().Contains(string(data), "http://sr:8081",
+			"the registry URL is what a caller needs to know which registry decoded a message")
+	})
+}
+
+func (s *ConfigSuite) TestTopicFormatsConfiguration() {
+	s.Run("formats are read per topic and part", func() {
+		loaded, err := s.load(s.write(`{"clusters":{"prod":{"brokers":"kafka:9093","topic_formats":{
+			"orders.*":{"value":{"format":"protobuf","proto_files":["order.proto"],"import_paths":["protos"],"message_type":"shop.Order"}},
+			"events":{"key":{"format":"msgpack"},"value":{"format":"avro","schema_file":"event.avsc"}}}}}}`))
+		s.Require().NoError(err, "valid topic formats must load")
+		formats := loaded.Clusters["prod"].TopicFormats
+		s.Require().Len(formats, 2, "every configured topic pattern must survive parsing")
+		s.Require().Equal("protobuf", formats["orders.*"].Value.Format,
+			"a pattern with a dot must stay one key rather than being split into a nested path")
+		s.Require().Equal("shop.Order", formats["orders.*"].Value.MessageType,
+			"a protobuf value cannot be decoded without knowing which message it holds")
+		s.Require().Equal("msgpack", formats["events"].Key.Format,
+			"a key can have its own format, independent of the value")
+	})
+
+	s.Run("an unknown format is refused", func() {
+		_, err := s.load(s.write(`{"clusters":{"prod":{"brokers":"kafka:9093","topic_formats":{"t":{"value":{"format":"thrift"}}}}}}`))
+		s.Require().ErrorContains(err, "thrift",
+			"a typo in a format name would otherwise leave the topic undecoded without any sign of why")
+	})
+
+	s.Run("protobuf needs a message type", func() {
+		_, err := s.load(s.write(`{"clusters":{"prod":{"brokers":"kafka:9093","topic_formats":{"t":{"value":{"format":"protobuf","proto_files":["a.proto"]}}}}}}`))
+		s.Require().ErrorContains(err, "message_type",
+			"protobuf bytes carry no type name, so without one there is nothing to decode them as")
+	})
+
+	s.Run("protobuf needs proto files or a descriptor set", func() {
+		_, err := s.load(s.write(`{"clusters":{"prod":{"brokers":"kafka:9093","topic_formats":{"t":{"value":{"format":"protobuf","message_type":"a.B"}}}}}}`))
+		s.Require().ErrorContains(err, "proto_files",
+			"a message type with no definition to find it in cannot be decoded")
+	})
+
+	s.Run("avro needs a schema file", func() {
+		_, err := s.load(s.write(`{"clusters":{"prod":{"brokers":"kafka:9093","topic_formats":{"t":{"value":{"format":"avro"}}}}}}`))
+		s.Require().ErrorContains(err, "schema_file",
+			"avro binary cannot be read at all without the schema it was written with")
+	})
+
+	s.Run("an invalid pattern is refused", func() {
+		_, err := s.load(s.write(`{"clusters":{"prod":{"brokers":"kafka:9093","topic_formats":{"orders[":{"value":{"format":"msgpack"}}}}}}`))
+		s.Require().ErrorContains(err, "orders[",
+			"a pattern that can never match would leave its topics undecoded while looking configured")
+	})
+}
+
 func (s *ConfigSuite) TestOAuthConfiguration() {
 	s.Run("client credentials and duration", func() {
 		s.T().Setenv("OAUTH_SECRET", "client-secret-value")

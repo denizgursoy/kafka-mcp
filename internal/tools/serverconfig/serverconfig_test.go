@@ -34,6 +34,32 @@ func (s *ServerConfigSuite) client(cfg *config.Cluster) *kafkaclient.Client {
 	return client
 }
 
+func (s *ServerConfigSuite) TestReportsMessageFormats() {
+	client := s.client(&config.Cluster{
+		Name:    "production",
+		Brokers: []string{"kafka-1:9093"},
+		SchemaRegistry: &config.SchemaRegistry{
+			URLs: []string{"https://sr:8081"}, User: "reader", Password: "registry-secret",
+		},
+		TopicFormats: map[string]*config.TopicFormat{
+			"metrics": {Value: &config.PartFormat{Format: config.FormatMsgpack}},
+		},
+	})
+
+	out, err := serverconfig.Run(client, nil, nil, nil)
+
+	s.Require().NoError(err, "reporting the configuration must succeed")
+	s.Require().Equal([]string{"https://sr:8081"}, out.SchemaRegistry,
+		"a caller seeing base64 needs to know whether a registry is configured at all")
+	s.Require().Equal([]serverconfig.TopicFormat{{Topic: "metrics", Value: "msgpack"}}, out.TopicFormats,
+		"the configured formats explain how a topic is being decoded and encoded")
+
+	data, err := json.Marshal(out)
+	s.Require().NoError(err, "the output must serialize")
+	s.Require().NotContains(string(data), "registry-secret",
+		"the registry password must never reach an MCP client")
+}
+
 func (s *ServerConfigSuite) TestReportsTheConnectionAndPermissions() {
 	client := s.client(&config.Cluster{
 		Name:     "production",

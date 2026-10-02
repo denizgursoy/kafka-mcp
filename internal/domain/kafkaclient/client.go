@@ -20,6 +20,7 @@ import (
 
 	"github.com/denizgursoy/kafka-mcp/internal/domain/config"
 	"github.com/denizgursoy/kafka-mcp/internal/domain/records"
+	"github.com/denizgursoy/kafka-mcp/internal/domain/serde"
 )
 
 // Client owns one cluster's Kafka connection, shared by every tool bound to
@@ -28,6 +29,7 @@ type Client struct {
 	client   *kgo.Client
 	admin    *kadm.Client
 	reader   *records.Reader
+	codec    *serde.Codec
 	manual   *manualProducer
 	cfg      *config.Cluster
 	endpoint *config.Endpoint
@@ -81,6 +83,7 @@ func (c *Client) ForEndpoint(endpoint *config.Endpoint) *Client {
 		client:   c.client,
 		admin:    c.admin,
 		reader:   c.reader,
+		codec:    c.codec,
 		manual:   c.manual,
 		cfg:      c.cfg,
 		endpoint: endpoint,
@@ -124,10 +127,18 @@ func New(cfg *config.Cluster) (*Client, error) {
 		return nil, fmt.Errorf("connect to %v: %w", cfg.Brokers, err)
 	}
 
+	codec, err := serde.New(cfg)
+	if err != nil {
+		client.Close()
+
+		return nil, err
+	}
+
 	return &Client{
 		client: client,
 		admin:  kadm.NewClient(client),
-		reader: records.NewReaderWithOptions(options...),
+		reader: records.NewReaderWithOptions(options...).WithCodec(codec),
+		codec:  codec,
 		manual: &manualProducer{options: options},
 		cfg:    cfg,
 	}, nil
@@ -245,6 +256,11 @@ func (c *Client) ManualProducer() (*kgo.Client, error) {
 // Reader returns the reader used by tools that read message content.
 func (c *Client) Reader() *records.Reader {
 	return c.reader
+}
+
+// Codec returns the decoder and encoder for this cluster's message formats.
+func (c *Client) Codec() *serde.Codec {
+	return c.codec
 }
 
 // Ping confirms the brokers answer, so a misconfigured connection fails at

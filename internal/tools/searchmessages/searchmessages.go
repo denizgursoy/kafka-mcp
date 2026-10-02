@@ -13,12 +13,13 @@ import (
 	"github.com/twmb/franz-go/pkg/kgo"
 
 	"github.com/denizgursoy/kafka-mcp/internal/domain/records"
+	"github.com/denizgursoy/kafka-mcp/internal/domain/serde"
 )
 
 // Input is the argument set accepted by the search_messages tool.
 type Input struct {
 	Topic         string     `json:"topic" jsonschema:"Topic to search. Matched exactly and case-sensitively."`
-	Script        string     `json:"script,omitempty" jsonschema:"Optional JavaScript that decides whether a message matches. Return true to keep it. In scope: value (the parsed JSON document, or the raw text when the message is not JSON), key (string or null), headers (object of header name to string), partition, offset and timestamp (a Date). Examples: return key === 'order-123'; return value.eventType === 'NEW' && value.payload.amount >= 500; return value.payload.cancelledAt === null. Omit to match every message."`
+	Script        string     `json:"script,omitempty" jsonschema:"Optional JavaScript that decides whether a message matches. Return true to keep it. In scope: value (the parsed document for JSON, and the decoded record for Avro, Protobuf, JSON Schema or a configured format; the raw text otherwise), key (string, decoded document when the key has a schema, or null), headers (object of header name to string), partition, offset and timestamp (a Date). Examples: return key === 'order-123'; return value.eventType === 'NEW' && value.payload.amount >= 500; return value.payload.cancelledAt === null. Omit to match every message."`
 	Parallelism   int        `json:"parallelism,omitempty" jsonschema:"Optional number of concurrent readers, from 1 to 16. Defaults to 1. It splits a single-partition topic's offsets between readers, which makes a full scan of one large partition faster. A multi-partition topic is already read across its partitions together, so this does not apply there. Worth using for count_only, output_file or a full scan of one partition."`
 	Partitions    []int32    `json:"partitions,omitempty" jsonschema:"Optional partitions to restrict the search to. Defaults to every partition. Do not guess a partition from a message key: producers may set the partition explicitly, so the key does not determine it."`
 	FromOffset    *int64     `json:"from_offset,omitempty" jsonschema:"Optional inclusive offset to start scanning from, applied to every searched partition."`
@@ -85,8 +86,10 @@ const (
 
 const description = `
 Search message key, value, headers or metadata with a JavaScript predicate.
-The script returns true for a match and receives value (parsed JSON or text),
-key, headers, partition, offset and timestamp. Omit it to match all messages.
+The script returns true for a match and receives value (parsed JSON, a decoded
+Avro/Protobuf/JSON Schema record, or text), key, headers, partition, offset and
+timestamp. Omit it to match all messages. Schema-encoded values are searched by
+field exactly like JSON.
 
 Every partition is read together, one chunk deep at a time, so a limited
 newest-first search returns the newest matches in the topic rather than the
@@ -294,7 +297,7 @@ func (s *scanState) scan(
 		var scanErr error
 
 		err := session.Scan(ctx, round, func(record *kgo.Record) bool {
-			matched, err := s.visit(record, filter, &found)
+			matched, err := s.visit(ctx, reader, record, filter, &found)
 			if err != nil {
 				scanErr = err
 
@@ -326,11 +329,20 @@ func (s *scanState) scan(
 }
 
 // visit filters one record and reports whether scanning should continue.
+//
+// The record is decoded before the lock is taken: a first sight of a schema id
+// fetches it from the registry, and holding the lock across that request would
+// stall every other reader of the search.
 func (s *scanState) visit(
+	ctx context.Context,
+	reader *records.Reader,
 	record *kgo.Record,
 	filter *filter,
 	found *[]records.Message,
 ) (bool, error) {
+
+	value := reader.Decode(ctx, record, serde.Value)
+	key := reader.Decode(ctx, record, serde.Key)
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -344,7 +356,7 @@ func (s *scanState) visit(
 	if filter != nil {
 		var err error
 
-		matched, err = filter.match(record)
+		matched, err = filter.match(record, value, key)
 		if err != nil {
 			// A script that throws on one message says nothing about the
 			// others, so the message is counted and the scan continues.
@@ -361,13 +373,13 @@ func (s *scanState) visit(
 		switch {
 		case s.export != nil:
 			if err := s.export.write(
-				records.Render(record, s.options.maxValueBytes),
+				records.RenderDecoded(record, key, value, s.options.maxValueBytes),
 			); err != nil {
 				return false, err
 			}
 
 		case s.collecting:
-			*found = append(*found, records.Render(record, s.options.maxValueBytes))
+			*found = append(*found, records.RenderDecoded(record, key, value, s.options.maxValueBytes))
 
 			// Stopping mid-round is only sound when the round reads a single
 			// range, because then records arrive oldest first and the matches

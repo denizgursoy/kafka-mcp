@@ -5,6 +5,8 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/suite"
+	"github.com/twmb/avro"
+	"github.com/twmb/franz-go/pkg/sr"
 
 	"github.com/denizgursoy/kafka-mcp/internal/domain/records"
 	"github.com/denizgursoy/kafka-mcp/internal/domain/testenv"
@@ -192,6 +194,50 @@ func (s *GetMessageSuite) TestErrorsOnUnknownPartition() {
 
 	s.Require().Error(err,
 		"a partition the topic does not have must fail, not silently return nothing")
+}
+
+func (s *GetMessageSuite) TestDecodesSchemaRegistryMessages() {
+	topic := s.env.CreateTopic(s.T(), "get-avro")
+
+	const schema = `{"type":"record","name":"Order","namespace":"shop","fields":[
+		{"name":"id","type":"string"},{"name":"amount","type":"long"}]}`
+
+	id := s.env.RegisterSchema(s.T(), topic+"-value", sr.Schema{Schema: schema})
+
+	payload, err := avro.MustParse(schema).Encode(map[string]any{"id": "o-1", "amount": int64(42)})
+	s.Require().NoError(err, "the fixture record must encode")
+
+	s.env.Produce(s.T(), topic, testenv.Message{Key: "o-1", Value: testenv.WireFormat(s.T(), id, nil, payload)})
+
+	out, err := s.get(getmessage.Item{Topic: topic, Partition: 0, Offset: 0})
+
+	s.Require().NoError(err, "reading an Avro message must succeed")
+	s.Require().Equal(`{"amount":42,"id":"o-1"}`, out.Message.Value,
+		"an Avro value must be shown as the record it holds, not as base64 nobody can read")
+	s.Require().Equal("avro", out.Message.Format,
+		"the format must say the JSON was decoded from Avro, so the caller knows to write Avro back")
+	s.Require().Equal(id, out.Message.SchemaID,
+		"the schema id lets the caller fetch the schema before producing a corrected message")
+	s.Require().Equal("shop.Order", out.Message.MessageType,
+		"the record name tells the caller which type this topic carries")
+	s.Require().Equal("o-1", out.Message.Key, "a plain text key must still be shown as text")
+	s.Require().Empty(out.Message.DecodeError, "a message that decoded cleanly must carry no error")
+	s.Require().EqualValues(len(payload)+5, out.Message.ValueBytes,
+		"value_bytes must report the size on the wire, not the size of the rendering")
+}
+
+func (s *GetMessageSuite) TestReportsWhyAMessageCouldNotBeDecoded() {
+	topic := s.env.CreateTopic(s.T(), "get-unknown-schema")
+
+	s.env.Produce(s.T(), topic, testenv.Message{Value: testenv.WireFormat(s.T(), 987654, nil, []byte{0x02, 0x41})})
+
+	out, err := s.get(getmessage.Item{Topic: topic, Partition: 0, Offset: 0})
+
+	s.Require().NoError(err, "an undecodable message is still a message, and reading it must succeed")
+	s.Require().Equal("base64", out.Message.Encoding, "the raw bytes must still be returned, recoverably")
+	s.Require().Equal(987654, out.Message.SchemaID, "the schema id the bytes named must be reported")
+	s.Require().Contains(out.Message.DecodeError, "987654",
+		"the caller must learn why the message is opaque rather than guess")
 }
 
 func (s *GetMessageSuite) TestErrorsWhenBrokerUnreachable() {

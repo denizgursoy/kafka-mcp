@@ -17,6 +17,7 @@ their own:
 | ------------------------------------- | ----------- |
 | Which tools exist and are registered  | `internal/tools/tools.go` and the directories beside it |
 | What each tool does, for a user       | `README.md` |
+| What each tool does, for a site visitor | `_docs/src/tools.js` |
 | What each tool does, for an LLM caller| the tool's own `description` and `jsonschema` tags |
 | Which helpers tests have              | `internal/domain/testenv` |
 
@@ -47,6 +48,7 @@ internal/domain/          Everything shared by more than one tool
   records/                Reading and rendering Kafka records
   testenv/                Test container environment (broker + Console)
 skills/kafka-debugging/   One umbrella skill; scenario guides in references/
+_docs/                    Documentation site (Vite, pnpm), published to GitHub Pages
 docker-compose.yml        Local Redpanda + Redpanda Console
 Makefile                  Build, run and compose targets
 ```
@@ -124,7 +126,8 @@ inventing work.
 ### 4. Build what was agreed
 
 Implement the approved tools with the per-tool workflow below, then update the
-skill so its steps name the tools that now exist, and update `README.md`.
+skill so its steps name the tools that now exist, and update `README.md` and
+the documentation site in `_docs`.
 
 A skill must never reference a tool the server does not expose. If a skill
 names a missing tool, that is a gap to raise in step 3, not something to leave
@@ -380,14 +383,15 @@ Responses come back as `text/event-stream`, so each is a line beginning
 `data: `. The session id is required on every request after `initialize`; without
 it the server starts a new session and the call fails.
 
-Also confirm an unknown cluster is refused, since the routing is what binds a
-session to one cluster:
+Also confirm an unknown endpoint is refused, since the routing is what binds a
+session to one cluster. A path no endpoint is configured on is not found, so the
+server answers 404:
 
 ```sh
 curl -s -o /dev/null -w '%{http_code}\n' -X POST http://localhost:8090/mcp/nope \
   -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
   -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}'
-# 400
+# 404
 ```
 
 ## Commands
@@ -505,6 +509,13 @@ at the compose broker and is what local runs use.
   The README stays short: what the server is, how to start it, and how to use
   each tool. It always documents how to start the server and how to call the
   tools.
+- Keep the documentation site in `_docs` current in the same change. Whatever
+  reaches `README.md` reaches the site too: a tool added, removed or renamed, or
+  its parameters or result changed, goes in `_docs/src/tools.js`; a scenario
+  added or rerouted, in that file's `scenarios`; a configuration field, flag or
+  environment variable, in `_docs/src/config.js`. Run `pnpm build` in `_docs` to
+  confirm the site still builds. Never commit `_docs/dist`; the workflow builds
+  it.
 - Prefer editing existing files over creating new ones. The exception is the
   per-tool package structure above, which requires new files.
 - Shared test utilities belong in `internal/domain/testenv`, never duplicated across

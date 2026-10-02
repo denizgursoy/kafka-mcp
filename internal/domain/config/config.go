@@ -166,12 +166,14 @@ func DefaultCORS() mcors.Cors {
 
 // cluster holds a cluster's input before validation and normalization.
 type cluster struct {
-	Security *Security       `cfg:"security"`
-	Brokers  []string        `cfg:"brokers"`
-	ReadOnly bool            `cfg:"read_only"`
-	TLS      *TLS            `cfg:"tls"`
-	SASL     *SASL           `cfg:"sasl"`
-	Tools    map[string]bool `cfg:"tools"`
+	Security       *Security               `cfg:"security"`
+	Brokers        []string                `cfg:"brokers"`
+	ReadOnly       bool                    `cfg:"read_only"`
+	TLS            *TLS                    `cfg:"tls"`
+	SASL           *SASL                   `cfg:"sasl"`
+	Tools          map[string]bool         `cfg:"tools"`
+	SchemaRegistry *SchemaRegistry         `cfg:"schema_registry"`
+	TopicFormats   map[string]*TopicFormat `cfg:"topic_formats"`
 }
 
 // endpoint is the policy and HTTP route applied to one view of a cluster.
@@ -225,6 +227,14 @@ type Cluster struct {
 	// quietly left a tool enabled would be the one failure mode worth having
 	// this for.
 	Tools map[string]bool `cfg:"tools"`
+
+	// SchemaRegistry is where schema-encoded messages are decoded from. Nil
+	// means the cluster has none, and such messages are shown as raw bytes.
+	SchemaRegistry *SchemaRegistry `cfg:"schema_registry"`
+
+	// TopicFormats fixes the format of topics whose messages carry no schema
+	// id, keyed by topic name or glob pattern.
+	TopicFormats map[string]*TopicFormat `cfg:"topic_formats"`
 }
 
 // Endpoint is one MCP view of a Kafka cluster. It owns the route and policy;
@@ -535,6 +545,20 @@ func resolveCluster(name string, parsed *cluster) (*Cluster, error) {
 		return nil, fmt.Errorf("cluster %q needs a broker", name)
 	}
 
+	registry, err := resolveSchemaRegistry(name, parsed.SchemaRegistry)
+	if err != nil {
+		return nil, err
+	}
+
+	resolved.SchemaRegistry = registry
+
+	formats, err := resolveTopicFormats(name, parsed.TopicFormats)
+	if err != nil {
+		return nil, err
+	}
+
+	resolved.TopicFormats = formats
+
 	if parsed.Security != nil {
 		if parsed.TLS != nil || parsed.SASL != nil {
 			return nil, fmt.Errorf("cluster %q: security cannot be combined with legacy tls or sasl", name)
@@ -738,6 +762,14 @@ func (c *Cluster) Describe() map[string]any {
 		described["sasl_options"] = identities
 	} else {
 		described["authentication"] = "none"
+	}
+
+	if c.SchemaRegistry != nil {
+		described["schema_registry"] = c.SchemaRegistry.URLs
+	}
+
+	if len(c.TopicFormats) > 0 {
+		described["topic_formats"] = describeFormats(c.TopicFormats)
 	}
 
 	return described
