@@ -12,6 +12,8 @@ same message", or "skip this record and move on".
 | ---------------------- | --------------------------------------------------- |
 | `server_config`        | Checking whether this server may change anything     |
 | `consumer_lag`         | Confirming the consumer is genuinely stuck           |
+| `open_transactions`    | Ruling out a hung transaction, which looks the same  |
+| `describe_consumer_group` | Which member and host owns the stuck partition   |
 | `list_consumer_groups` | The group's state and member count                   |
 | `get_message`          | Reading the message that is blocking the consumer    |
 | `copy_message`         | Preserving it in a dead letter topic                 |
@@ -54,6 +56,29 @@ It is **not** a poison message when:
 
 Say so plainly when the diagnosis does not fit. Skipping a message that was
 going to be processed anyway destroys data for nothing.
+
+### 1a. Rule out a hung transaction
+
+Call `open_transactions` on the topic before blaming a message. A
+transactional producer that hung or died mid-transaction stops every
+`read_committed` consumer at the first message of its open transaction, and
+`consumer_lag` reports exactly the same `stalled` signature.
+
+If `blocked` is true and a partition's `last_stable_offset` equals the group's
+committed offset there, **this is not a poison message and skipping cannot fix
+it**: the consumer is not refusing the next message, it is not allowed to see
+it. Name the `transactional_id` and how long it has been `open_for`, and point
+the user at the producing application — restart or fence it, or wait for
+`timeout_ms`, after which the broker aborts the transaction. Stop here.
+
+If nothing is blocked, carry on.
+
+### 1b. Find which consumer owns the stuck partition
+
+Call `describe_consumer_group`. Each partition names its `client_id` and
+`host`, which is the pod or machine whose logs explain the failure. Give the
+user that, alongside the offset: the stack trace in that consumer's log is
+usually a faster diagnosis than the message itself.
 
 ### 2. Read the blocking message
 

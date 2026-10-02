@@ -107,7 +107,7 @@ export const configSections = [
       ['cluster', 'string', 'required', 'Which entry under clusters this endpoint serves'],
       ['path', 'string', '/mcp/<name>', 'HTTP route. Exact match: /mcp does not capture /mcp/rw'],
       ['description', 'string', '', 'Reported by server_config, so a caller knows what the endpoint is for'],
-      ['read_only', 'bool', 'false', 'Hides add_partitions, commit_offset, create_topic and delete_topic, and refuses writes to this cluster'],
+      ['read_only', 'bool', 'false', 'Hides every tool that only writes (add_partitions, alter_topic_config, commit_offset, create_topic, delete_consumer_group, delete_records, delete_topic) and refuses writes to this cluster'],
       ['tools', 'map', '', 'tool_name: false withholds a tool. Unknown names stop the server at startup'],
     ],
   },

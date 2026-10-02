@@ -357,9 +357,9 @@ Three layers, and only one of them is real security:
 ### What a read-only endpoint exposes
 
 `read_only: true` does more than refuse a write: the endpoint does not list the
-tools whose only purpose is to write. `add_partitions`, `commit_offset`,
-`create_topic` and `delete_topic` are absent from `tools/list` on a read-only
-endpoint, so a client never sees a tool it could not have used, and their
+tools whose only purpose is to write. `add_partitions`, `alter_topic_config`,
+`commit_offset`, `create_topic`, `delete_consumer_group`, `delete_records` and
+`delete_topic` are absent from `tools/list` on a read-only endpoint, so a client never sees a tool it could not have used, and their
 preview cannot describe a change this endpoint would never apply.
 
 A writable endpoint can withhold individual tools too, with its `tools` map.
@@ -418,8 +418,9 @@ stream, so nothing extra has to be configured:
  "client_version":"1.0.0","confirm":true,"item_count":1,"targets":"orders"}
 ```
 
-The tools that change a cluster — `add_partitions`, `commit_offset`,
-`create_topic`, `copy_message`, `produce_message` — are logged at `INFO`.
+The tools that change a cluster — `add_partitions`, `alter_topic_config`,
+`commit_offset`, `create_topic`, `copy_message`, `delete_consumer_group`,
+`delete_records`, `delete_topic`, `produce_message` — are logged at `INFO`.
 Everything else is logged at `DEBUG`, because reads are constant and change
 nothing, so recording them at the same level would bury the writes among them.
 Raise the log level to see them.
@@ -455,8 +456,10 @@ acted. A shared credential cannot be made to answer it.
 ### Batch operations
 
 `describe_topic`, `sample_messages`, `get_message`, `get_schema`,
-`consumer_lag`, `add_partitions`, `create_topic`, `commit_offset`,
-`copy_message` and `produce_message` take their target **only** as a required `items` array. There
+`consumer_lag`, `describe_consumer_group`, `open_transactions`,
+`add_partitions`, `alter_topic_config`, `create_topic`, `commit_offset`,
+`delete_consumer_group`, `delete_records`, `delete_topic`, `copy_message` and
+`produce_message` take their target **only** as a required `items` array. There
 is no single-target form: one operation is an `items` array of length one.
 
 ```json
@@ -856,6 +859,59 @@ A group in state `Empty` can still report lag: committed offsets outlive the
 consumers that made them. Kafka has no topic-to-group index, so filtering by
 `topic` describes every group on the cluster.
 
+### `describe_consumer_group`
+
+Describes consumer groups in detail: who the members are, which partitions each
+one owns, and where the group stands on every partition. Use it to turn "a
+partition is stuck" into "this pod on this host is stuck".
+
+| Parameter | Type     | Required | Meaning                   |
+| --------- | -------- | -------- | ------------------------- |
+| `items`   | object[] | yes      | 1 to 100 groups, each `{"group": "..."}` |
+
+```json
+{"results": [{"index": 0, "result": {
+   "group": "payments", "state": "Stable", "protocol_type": "consumer", "assignor": "cooperative-sticky",
+   "coordinator": 1, "total_lag": 4200,
+   "members": [{"member_id": "payments-7-…", "client_id": "payments-7", "host": "/10.0.4.17",
+                "assignments": [{"topic": "orders", "partitions": [0, 1]}]}],
+   "partitions": [{"topic": "orders", "partition": 0, "has_commit": true, "committed_offset": 812,
+                   "end_offset": 5012, "lag": 4200, "member_id": "payments-7-…",
+                   "client_id": "payments-7", "host": "/10.0.4.17"}]}}],
+ "succeeded": 1, "failed": 0, "applied": 0, "atomic": false}
+```
+
+Partitions are the union of what members own and what the group has committed,
+so an `Empty` group still shows its positions. `has_commit: false` means the
+group owns a partition it has never committed on, so where it starts is decided
+by the consumer's `auto.offset.reset`, not by an offset.
+
+### `open_transactions`
+
+Finds open transactions holding back `read_committed` consumers. A transactional
+producer that hangs or dies mid-transaction leaves the partition's last stable
+offset stuck, and every `read_committed` consumer stops there. In
+`consumer_lag` that looks exactly like a poison message.
+
+| Parameter | Type     | Required | Meaning                          |
+| --------- | -------- | -------- | -------------------------------- |
+| `items`   | object[] | yes      | 1 to 100 topics, each `{"topic": "..."}` |
+
+```json
+{"results": [{"index": 0, "result": {
+   "topic": "orders", "blocked": true,
+   "partitions": [{"partition": 0, "last_stable_offset": 812, "high_watermark": 5012,
+                   "unreadable_messages": 4200,
+                   "producers": [{"producer_id": 2004, "producer_epoch": 0, "transaction_start_offset": 812,
+                                  "transactional_id": "payments-writer-1", "state": "Ongoing",
+                                  "started_at": "2026-10-02T08:14:03Z", "open_for": "41m12s", "timeout_ms": 900000}]}]}}],
+ "succeeded": 1, "failed": 0, "applied": 0, "atomic": false}
+```
+
+The fix is in the producer: restart or fence the application named by
+`transactional_id`, or wait for `timeout_ms`, after which the broker aborts the
+transaction. Moving the consumer's offset does not help.
+
 ### `consumer_lag`
 
 Measures how far behind a topic's consumers are, how fast messages are produced
@@ -901,6 +957,54 @@ says what the numbers mean: `caught_up`, `draining` (with an ETA), `growing`
 (never clears, with `growing_by_per_minute`), `stalled`, `no_active_consumers`,
 or `not_measured`. An ETA is only given when the lag is genuinely shrinking.
 
+### `cluster_health`
+
+Checks the cluster this endpoint serves in one call: brokers, controller, and
+every partition that is not fully healthy.
+
+| Parameter          | Type   | Required | Meaning                                                         |
+| ------------------ | ------ | -------- | --------------------------------------------------------------- |
+| `search`           | string | no       | Only topics whose name contains this. Case-insensitive          |
+| `include_internal` | bool   | no       | Also check `__consumer_offsets` and other internal topics        |
+
+```json
+{"cluster_id": "…", "controller": 1, "healthy": false,
+ "brokers": [{"id": 1, "host": "kafka-1", "port": 9092, "rack": "eu-1a", "controller": true, "leaders": 61}],
+ "summary": {"topics": 40, "partitions": 182, "offline": 0, "under_replicated": 3, "under_min_isr": 1, "errored": 0},
+ "problems": [{"topic": "orders", "partition": 4, "issues": ["under_replicated", "under_min_isr"],
+               "leader": 1, "replicas": [1, 2, 3], "isr": [1], "min_insync_replicas": 2}],
+ "warnings": []}
+```
+
+`offline` means the partition has no leader, so nothing can be read or written.
+`under_replicated` means a replica is out of sync. `under_min_isr` is the
+condition behind `NOT_ENOUGH_REPLICAS`: producers using `acks=all` fail until
+the in-sync replicas recover. A broker leading no partitions while others lead
+many is usually one that restarted and was never given leadership back.
+
+Some Kafka-compatible brokers, Redpanda among them, do not report
+`min.insync.replicas`. The topics affected are listed in `min_isr_unknown`, and
+`under_min_isr` is not judged for them rather than guessed.
+
+### `list_acls`
+
+Lists access control entries, for when a client fails with
+`TOPIC_AUTHORIZATION_FAILED` or `GROUP_AUTHORIZATION_FAILED`.
+
+| Parameter       | Type   | Required | Meaning                                                              |
+| --------------- | ------ | -------- | -------------------------------------------------------------------- |
+| `principal`     | string | no       | Only this principal, e.g. `User:payments`                            |
+| `resource_type` | string | no       | `topic`, `group`, `cluster`, `transactional_id`, `delegation_token`  |
+| `resource_name` | string | no       | Every ACL applied to this name, including prefixed and `*`. Needs `resource_type` |
+
+```json
+{"acls": [{"principal": "User:payments", "host": "*", "resource_type": "topic", "resource_name": "orders",
+           "pattern_type": "literal", "operation": "read", "permission": "allow"}], "count": 1}
+```
+
+A `deny` overrides every `allow`. A broker without an authorizer fails with
+`SECURITY_DISABLED`, which means ACLs are not enforced at all.
+
 ### `server_config`
 
 Reports the effective configuration: endpoint name, exact path, description,
@@ -909,8 +1013,9 @@ export directory and the tools this endpoint exposes. Takes no parameters. The
 password is never reported.
 
 `tools` is the list for this endpoint, not for the deployment: a read-only
-endpoint omits `add_partitions`, `commit_offset`, `create_topic` and
-`delete_topic`, because it
+endpoint omits `add_partitions`, `alter_topic_config`, `commit_offset`,
+`create_topic`, `delete_consumer_group`, `delete_records` and `delete_topic`,
+because it
 does not register them, and any endpoint omits whatever its `tools`
 configuration switches off.
 
@@ -943,6 +1048,41 @@ Adding partitions changes which partition a key hashes to, so existing keys
 lose their ordering guarantee. A keyed topic therefore requires
 `acknowledge_key_ordering` as well. Requesting fewer partitions than the topic
 has is refused with an explanation rather than attempted.
+
+### `alter_topic_config`
+
+Changes topic-level configuration: retention, cleanup policy, maximum message
+size and anything else Kafka allows per topic. Changes are incremental, so every
+key not named keeps its value. Not exposed on a read-only endpoint.
+
+| Parameter | Type     | Required | Meaning                                       |
+| --------- | -------- | -------- | --------------------------------------------- |
+| `items`   | object[] | yes      | 1 to 100 topics to change                     |
+| `confirm` | bool     | no       | Default false: preview only, nothing changes  |
+
+Item fields:
+
+| Field    | Type     | Required | Meaning                                                   |
+| -------- | -------- | -------- | --------------------------------------------------------- |
+| `topic`  | string   | yes      | Topic to change                                           |
+| `set`    | object   | no       | Keys to set, e.g. `{"retention.ms": "86400000"}`          |
+| `delete` | string[] | no       | Overrides to remove, so the cluster default applies again |
+
+```json
+{"results": [{"index": 0, "result": {
+   "topic": "orders", "applied": false, "messages_past_retention": 18000,
+   "changes": [{"key": "retention.ms", "action": "set", "current": "604800000",
+                "current_source": "DYNAMIC_TOPIC_CONFIG", "requested": "86400000"}],
+   "warnings": ["18000 message(s) are already older than the new retention of 24h0m0s and become eligible for deletion as soon as it applies; Kafka cannot bring them back"]}}],
+ "succeeded": 1, "failed": 0, "applied": 0, "atomic": false}
+```
+
+The preview asks the broker to validate the change, so an unknown key or an
+invalid value is refused before `confirm`. Shortening `retention.ms` reports how
+many messages are already past the new limit; changing `cleanup.policy` or
+setting `retention.bytes` is warned about. After applying, every key is re-read
+from the broker, which is the only way the inherited value of a deleted override
+is known.
 
 ### `create_topic`
 
@@ -1024,26 +1164,95 @@ deleting one breaks every consumer at once.
 Duplicate topics in one batch are refused before anything is deleted. Deletion
 is not atomic — topics removed before a later item failed stay removed.
 
-### `commit_offset`
+### `delete_records`
 
-Moves consumer groups' committed offsets. Forward to skip messages, backward to
-replay them. **Irreversible** in the sense that skipped messages are never
-processed. Not exposed on a read-only endpoint.
+Deletes the oldest messages of a partition without deleting the topic. The
+topic, its configuration and its consumer groups stay. **Irreversible.** Not
+exposed on a read-only endpoint.
 
-| Parameter | Type     | Required | Meaning                                      |
-| --------- | -------- | -------- | -------------------------------------------- |
-| `items`   | object[] | yes      | 1 to 100 offsets to move                     |
-| `confirm` | bool     | no       | Default false: preview only, nothing changes |
+| Parameter | Type     | Required | Meaning                                         |
+| --------- | -------- | -------- | ----------------------------------------------- |
+| `items`   | object[] | yes      | 1 to 100 partitions to truncate                 |
+| `confirm` | bool     | no       | Default false: preview only, nothing is deleted |
 
 Item fields:
 
-| Field                  | Type   | Required | Meaning                                                       |
-| ---------------------- | ------ | -------- | ------------------------------------------------------------- |
-| `topic`                | string | yes      | Topic whose offset is moving                                  |
-| `group`                | string | yes      | Consumer group to move                                        |
-| `partition`            | int    | yes      | Partition to move                                             |
-| `offset`               | int    | yes      | The offset the group reads next. To skip offset 42, commit 43 |
-| `allow_active_members` | bool   | no       | Proceed despite running consumers                             |
+| Field                   | Type   | Required | Meaning                                                         |
+| ----------------------- | ------ | -------- | --------------------------------------------------------------- |
+| `topic`                 | string | yes      | Topic to delete from                                            |
+| `partition`             | int    | yes      | Partition to delete from                                        |
+| `before_offset`         | int    | yes      | Everything below this offset goes; this one becomes the first  |
+| `acknowledge_data_loss` | bool   | no       | Required to apply                                               |
+
+```json
+{"results": [{"index": 0, "result": {
+   "topic": "orders", "partition": 0, "start_offset": 0, "end_offset": 5012, "before_offset": 812,
+   "messages_deleted": 812, "would_delete": true, "deleted": false,
+   "affected_groups": [{"group": "replay-job", "committed_offset": 100, "unprocessed_lost": 712}]}}],
+ "succeeded": 1, "failed": 0, "applied": 0, "atomic": false}
+```
+
+`affected_groups` lists every group committed below the cut, with how many
+messages it would lose without ever processing them; such a group resumes from
+the new start. Use the partition's end offset as `before_offset` to empty it.
+
+### `delete_consumer_group`
+
+Deletes consumer groups and their committed offsets. Use it to clean up groups
+whose consumers were decommissioned: their commits keep reporting lag that
+nobody will ever drain. Not exposed on a read-only endpoint.
+
+| Parameter | Type     | Required | Meaning                                         |
+| --------- | -------- | -------- | ----------------------------------------------- |
+| `items`   | object[] | yes      | 1 to 100 groups, each `{"group": "..."}`        |
+| `confirm` | bool     | no       | Default false: preview only, nothing is deleted |
+
+The preview lists each group's committed offsets and lag. A group with active
+members is refused, and re-checked at deletion time. A consumer that later
+starts with the same group id begins from its `auto.offset.reset`, not from
+where the group left off.
+
+### `commit_offset`
+
+Moves consumer groups' committed offsets. Forward to skip messages, backward to
+replay them, or to a point in time to reprocess everything since. **Irreversible**
+in the sense that skipped messages are never processed. Not exposed on a
+read-only endpoint.
+
+| Parameter | Type     | Required | Meaning                                      |
+| --------- | -------- | -------- | -------------------------------------------- |
+| `items`   | object[] | yes      | 1 to 100 moves to make                       |
+| `confirm` | bool     | no       | Default false: preview only, nothing changes |
+
+Item fields — give exactly one of `offset`, `timestamp` or `position`:
+
+| Field                  | Type   | Required | Meaning                                                                    |
+| ---------------------- | ------ | -------- | -------------------------------------------------------------------------- |
+| `topic`                | string | yes      | Topic whose offset is moving                                               |
+| `group`                | string | yes      | Consumer group to move                                                     |
+| `partition`            | int    | no       | Required with `offset`. Omit with `timestamp` or `position` for every partition |
+| `offset`               | int    | —        | The offset the group reads next. To skip offset 42, commit 43              |
+| `timestamp`            | string | —        | RFC3339. Each partition moves to its first message at or after this time   |
+| `position`             | string | —        | `earliest` or `latest`                                                     |
+| `allow_active_members` | bool   | no       | Proceed despite running consumers                                          |
+
+```json
+{"items": [{"topic": "orders", "group": "payments", "timestamp": "2026-10-01T09:00:00Z"}]}
+```
+
+```json
+{"results": [{"index": 0, "result": {
+   "topic": "orders", "group": "payments", "state": "Empty", "members": 0,
+   "partitions": [{"partition": 0, "current_offset": 5012, "target_offset": 4100, "replayed_messages": 912},
+                  {"partition": 1, "current_offset": 4990, "target_offset": 4021, "replayed_messages": 969}],
+   "replayed_messages": 1881, "applied": false}}],
+ "succeeded": 1, "failed": 0, "applied": 0, "atomic": false}
+```
+
+A partition with no message at or after `timestamp` moves to its end, and its
+entry carries a `note` saying so. A whole-topic item and a partition item for
+the same group and topic in one batch are refused, because which one wins would
+depend on order.
 
 The group must have no active members. A running consumer keeps its position in
 memory and only reads the committed offset when it joins, so a commit made
@@ -1155,7 +1364,7 @@ deleted; it stays until retention removes it.
 
 `skills/kafka-debugging/SKILL.md` is the one skill an agent loads. It routes to
 the scenario guides under `skills/kafka-debugging/references/`, rather than
-holding all eight workflows itself, so a session reads only the one it needs:
+holding every workflow itself, so a session reads only the one it needs:
 
 - `find-message.md` — locating a message from something the user knows about it.
 - `check-lag.md` — measuring lag and throughput, and judging when a backlog will
@@ -1172,6 +1381,15 @@ holding all eight workflows itself, so a session reads only the one it needs:
   creating the topics one of them is missing.
 - `delete-topic.md` — removing a topic and everything in it, after the user has
   seen what that destroys.
+- `replay-messages.md` — reprocessing everything since a moment, after a bug fix
+  ships.
+- `tune-topic-config.md` — changing retention, cleanup policy or message size on
+  a topic, knowing what the change does to data already there.
+- `cluster-health.md` — finding offline and under-replicated partitions behind
+  `NOT_ENOUGH_REPLICAS` and unreadable topics.
+- `purge-messages.md` — deleting old messages from a partition while keeping the
+  topic, or removing abandoned consumer groups.
+- `authorization-error.md` — working out which ACL is refusing a client.
 
 The umbrella also resolves the overlap between them: "the consumer is behind"
 opens three of these guides, and `consumer_lag`'s `status` is what decides which

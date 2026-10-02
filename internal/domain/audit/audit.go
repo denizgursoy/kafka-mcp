@@ -38,12 +38,15 @@ const maxTargets = 10
 // for a new read tool and a visible one for a new write tool, since its records
 // simply appear at debug rather than not at all.
 var mutating = map[string]bool{
-	"add_partitions":  true,
-	"commit_offset":   true,
-	"copy_message":    true,
-	"create_topic":    true,
-	"delete_topic":    true,
-	"produce_message": true,
+	"add_partitions":        true,
+	"alter_topic_config":    true,
+	"commit_offset":         true,
+	"copy_message":          true,
+	"create_topic":          true,
+	"delete_consumer_group": true,
+	"delete_records":        true,
+	"delete_topic":          true,
+	"produce_message":       true,
 }
 
 // Mutates reports whether a tool changes the cluster, and so is recorded at

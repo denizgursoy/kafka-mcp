@@ -226,6 +226,78 @@ export const tools = [
     },
   },
   {
+    name: 'describe_consumer_group',
+    group: 'measure',
+    batch: 100,
+    summary: 'Members, who owns which partition, and the group\u2019s position and lag on each.',
+    detail:
+      'Turns a stuck partition into a pod: every partition names its member, client id and host. has_commit false means the group owns a partition it never committed on, so auto.offset.reset decides where it starts.',
+    params: [['group', 'string', true, 'Consumer group to describe']],
+    call: { items: [{ group: 'payments' }] },
+    result: {
+      results: [{ index: 0, result: {
+        group: 'payments', state: 'Stable', assignor: 'cooperative-sticky', total_lag: 4200,
+        members: [{ client_id: 'payments-7', host: '/10.0.4.17', assignments: [{ topic: 'orders', partitions: [0, 1] }] }],
+        partitions: [{ topic: 'orders', partition: 0, committed_offset: 812, end_offset: 5012, lag: 4200, client_id: 'payments-7' }],
+      } }],
+      succeeded: 1, failed: 0, applied: 0, atomic: false,
+    },
+  },
+  {
+    name: 'open_transactions',
+    group: 'measure',
+    batch: 100,
+    summary: 'Open transactions holding read_committed consumers back, and the producer holding them.',
+    detail:
+      'A hung transactional producer stalls every read_committed consumer at its first uncommitted message, which looks exactly like a poison message. The fix is restarting the producer named by transactional_id, not moving an offset.',
+    params: [['topic', 'string', true, 'Topic to check']],
+    call: { items: [{ topic: 'orders' }] },
+    result: {
+      results: [{ index: 0, result: {
+        topic: 'orders', blocked: true,
+        partitions: [{ partition: 0, last_stable_offset: 812, high_watermark: 5012, unreadable_messages: 4200,
+          producers: [{ transactional_id: 'payments-writer-1', state: 'Ongoing', open_for: '41m12s', timeout_ms: 900000 }] }],
+      } }],
+      succeeded: 1, failed: 0, applied: 0, atomic: false,
+    },
+  },
+  {
+    name: 'cluster_health',
+    group: 'measure',
+    summary: 'Brokers, controller, and every offline, under-replicated or under-min-ISR partition.',
+    detail:
+      'under_min_isr is what makes acks=all producers fail with NOT_ENOUGH_REPLICAS. Brokers that do not report min.insync.replicas are listed in min_isr_unknown instead of being guessed at.',
+    params: [
+      ['search', 'string', false, 'Only topics containing this. Case-insensitive'],
+      ['include_internal', 'bool', false, 'Also check __consumer_offsets and friends'],
+    ],
+    call: { search: 'orders' },
+    result: {
+      controller: 1, healthy: false,
+      brokers: [{ id: 1, host: 'kafka-1', controller: true, leaders: 61 }],
+      summary: { topics: 1, partitions: 12, offline: 0, under_replicated: 1, under_min_isr: 1 },
+      problems: [{ topic: 'orders', partition: 4, issues: ['under_replicated', 'under_min_isr'], isr: [1], min_insync_replicas: 2 }],
+    },
+  },
+  {
+    name: 'list_acls',
+    group: 'discover',
+    summary: 'Access control entries, for when a client is refused with an authorization error.',
+    detail:
+      'A resource_name filter returns every ACL the broker applies to it, including prefixed and wildcard entries. A deny overrides any allow. SECURITY_DISABLED means the broker enforces no ACLs at all.',
+    params: [
+      ['principal', 'string', false, 'Such as User:payments'],
+      ['resource_type', 'string', false, 'topic, group, cluster, transactional_id, delegation_token'],
+      ['resource_name', 'string', false, 'Needs resource_type'],
+    ],
+    call: { principal: 'User:payments', resource_type: 'topic', resource_name: 'orders' },
+    result: {
+      acls: [{ principal: 'User:payments', host: '*', resource_type: 'topic', resource_name: 'orders',
+        pattern_type: 'literal', operation: 'read', permission: 'allow' }],
+      count: 1,
+    },
+  },
+  {
     name: 'create_topic',
     group: 'change',
     batch: 100,
@@ -269,25 +341,50 @@ export const tools = [
     },
   },
   {
+    name: 'alter_topic_config',
+    group: 'change',
+    batch: 100,
+    write: 'own',
+    summary: 'Changes topic config incrementally, showing each key\u2019s current and requested value.',
+    detail:
+      'The broker validates the preview. Shortening retention.ms reports how many messages are already past the new limit; changing cleanup.policy is warned about. Keys not named keep their value.',
+    params: [
+      ['topic', 'string', true, 'Topic to change'],
+      ['set', 'map', false, 'Keys to set, such as retention.ms'],
+      ['delete', 'string[]', false, 'Overrides to remove, so the cluster default applies'],
+    ],
+    call: { items: [{ topic: 'orders', set: { 'retention.ms': '86400000' } }], confirm: false },
+    result: {
+      results: [{ index: 0, result: {
+        topic: 'orders', messages_past_retention: 18000, applied: false,
+        changes: [{ key: 'retention.ms', current: '604800000', current_source: 'DYNAMIC_TOPIC_CONFIG', requested: '86400000' }],
+      } }],
+      succeeded: 1, failed: 0, applied: 0, atomic: false,
+    },
+  },
+  {
     name: 'commit_offset',
     group: 'change',
     batch: 100,
     write: 'own',
-    summary: 'Moves a group\u2019s committed offset, forward to skip or back to replay.',
+    summary: 'Moves a group to an offset, a time or the earliest/latest position, to skip or to replay.',
     detail:
-      'The group must have no active members: a running consumer keeps its position in memory and overwrites the commit. To skip offset 42, commit 43.',
+      'Give exactly one of offset, timestamp or position. With timestamp or position, omit partition to move the whole topic. The group must have no active members: a running consumer overwrites the commit. To skip offset 42, commit 43.',
     params: [
       ['topic', 'string', true, 'Topic whose offset moves'],
       ['group', 'string', true, 'Consumer group'],
-      ['partition', 'int', true, 'Partition'],
-      ['offset', 'int', true, 'The offset the group reads next'],
+      ['partition', 'int', false, 'Required with offset; omit otherwise for every partition'],
+      ['offset', 'int', false, 'The offset the group reads next'],
+      ['timestamp', 'string', false, 'RFC3339; first message at or after it'],
+      ['position', 'string', false, 'earliest or latest'],
       ['allow_active_members', 'bool', false, 'Proceed despite running consumers'],
     ],
-    call: { items: [{ topic: 'orders', group: 'payments', partition: 0, offset: 43 }], confirm: false },
+    call: { items: [{ topic: 'orders', group: 'payments', timestamp: '2026-10-01T09:00:00Z' }], confirm: false },
     result: {
       results: [{ index: 0, result: {
-        topic: 'orders', group: 'payments', state: 'Empty', current_offset: 42, requested_offset: 43,
-        skipped_messages: 1, applied: false,
+        topic: 'orders', group: 'payments', state: 'Empty',
+        partitions: [{ partition: 0, current_offset: 5012, target_offset: 4100, replayed_messages: 912 }],
+        replayed_messages: 912, applied: false,
       } }],
       succeeded: 1, failed: 0, applied: 0, atomic: false,
     },
@@ -309,6 +406,46 @@ export const tools = [
       results: [{ index: 0, result: {
         topic: 'orders-old', partitions: 6, message_count: 41207, consumer_groups: ['payments'],
         deleted: false, would_delete: true,
+      } }],
+      succeeded: 1, failed: 0, applied: 0, atomic: false,
+    },
+  },
+  {
+    name: 'delete_records',
+    group: 'change',
+    batch: 100,
+    write: 'own',
+    summary: 'Deletes a partition\u2019s oldest messages, keeping the topic and its groups.',
+    detail:
+      'Everything below before_offset goes. Needs confirm and acknowledge_data_loss. The preview names every group committed below the cut and how many messages it would lose unread.',
+    params: [
+      ['topic', 'string', true, 'Topic to delete from'],
+      ['partition', 'int', true, 'Partition'],
+      ['before_offset', 'int', true, 'This offset becomes the first readable one'],
+      ['acknowledge_data_loss', 'bool', false, 'Required to apply'],
+    ],
+    call: { items: [{ topic: 'orders', partition: 0, before_offset: 812 }], confirm: false },
+    result: {
+      results: [{ index: 0, result: {
+        topic: 'orders', partition: 0, start_offset: 0, messages_deleted: 812, would_delete: true,
+        affected_groups: [{ group: 'replay-job', committed_offset: 100, unprocessed_lost: 712 }],
+      } }],
+      succeeded: 1, failed: 0, applied: 0, atomic: false,
+    },
+  },
+  {
+    name: 'delete_consumer_group',
+    group: 'change',
+    batch: 100,
+    write: 'own',
+    summary: 'Deletes abandoned consumer groups and the lag they keep reporting.',
+    detail:
+      'Refuses a group with active members. The preview lists every committed offset and the lag that disappears. A consumer that reuses the id later starts from its auto.offset.reset.',
+    params: [['group', 'string', true, 'Consumer group to delete']],
+    call: { items: [{ group: 'old-billing' }], confirm: false },
+    result: {
+      results: [{ index: 0, result: {
+        group: 'old-billing', state: 'Empty', total_lag: 91234, would_delete: true, deleted: false,
       } }],
       succeeded: 1, failed: 0, applied: 0, atomic: false,
     },
@@ -389,8 +526,8 @@ export const scenarios = [
   {
     guide: 'skip-poison-message',
     ask: 'the consumer is stuck',
-    flow: ['consumer_lag', 'get_message', 'copy_message', 'commit_offset'],
-    note: 'Keeps the bad message in a dead letter topic before moving the offset past it.',
+    flow: ['consumer_lag', 'open_transactions', 'describe_consumer_group', 'get_message', 'copy_message', 'commit_offset'],
+    note: 'Rules out a hung transaction first, then keeps the bad message in a dead letter topic before moving past it.',
   },
   {
     guide: 'scale-partitions',
@@ -421,5 +558,35 @@ export const scenarios = [
     ask: 'clean up these test topics',
     flow: ['server_config', 'delete_topic'],
     note: 'Shows message counts and affected groups first.',
+  },
+  {
+    guide: 'replay-messages',
+    ask: 'reprocess everything since 9 this morning',
+    flow: ['server_config', 'describe_consumer_group', 'commit_offset'],
+    note: 'One item moves every partition to the first message at that time, with the replay count shown first.',
+  },
+  {
+    guide: 'tune-topic-config',
+    ask: 'the disk is filling up, cut retention on orders',
+    flow: ['server_config', 'describe_topic', 'alter_topic_config'],
+    note: 'Shows how many messages the new retention makes deletable before anything changes.',
+  },
+  {
+    guide: 'cluster-health',
+    ask: 'producers fail with NOT_ENOUGH_REPLICAS',
+    flow: ['cluster_health', 'describe_topic'],
+    note: 'Names the partitions under min ISR and the broker that fell out of sync.',
+  },
+  {
+    guide: 'purge-messages',
+    ask: 'delete the test data but keep the topic',
+    flow: ['server_config', 'describe_topic', 'delete_records', 'delete_consumer_group'],
+    note: 'Truncates partitions and cleans up abandoned groups, naming every group that would lose unread messages.',
+  },
+  {
+    guide: 'authorization-error',
+    ask: 'payments gets TOPIC_AUTHORIZATION_FAILED',
+    flow: ['server_config', 'list_acls'],
+    note: 'Lists every ACL applied to the principal and resource, including prefixed and deny entries.',
   },
 ]

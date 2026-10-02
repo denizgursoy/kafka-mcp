@@ -21,18 +21,25 @@ import (
 	"github.com/denizgursoy/kafka-mcp/internal/domain/config"
 	"github.com/denizgursoy/kafka-mcp/internal/domain/kafkaclient"
 	"github.com/denizgursoy/kafka-mcp/internal/tools/addpartitions"
+	"github.com/denizgursoy/kafka-mcp/internal/tools/altertopicconfig"
+	"github.com/denizgursoy/kafka-mcp/internal/tools/clusterhealth"
 	"github.com/denizgursoy/kafka-mcp/internal/tools/commitoffset"
 	"github.com/denizgursoy/kafka-mcp/internal/tools/compareclusters"
 	"github.com/denizgursoy/kafka-mcp/internal/tools/consumerlag"
 	"github.com/denizgursoy/kafka-mcp/internal/tools/copymessage"
 	"github.com/denizgursoy/kafka-mcp/internal/tools/createtopic"
+	"github.com/denizgursoy/kafka-mcp/internal/tools/deleteconsumergroup"
+	"github.com/denizgursoy/kafka-mcp/internal/tools/deleterecords"
 	"github.com/denizgursoy/kafka-mcp/internal/tools/deletetopic"
+	"github.com/denizgursoy/kafka-mcp/internal/tools/describeconsumergroup"
 	"github.com/denizgursoy/kafka-mcp/internal/tools/describetopic"
 	"github.com/denizgursoy/kafka-mcp/internal/tools/getmessage"
 	"github.com/denizgursoy/kafka-mcp/internal/tools/getschema"
+	"github.com/denizgursoy/kafka-mcp/internal/tools/listacls"
 	"github.com/denizgursoy/kafka-mcp/internal/tools/listclusters"
 	"github.com/denizgursoy/kafka-mcp/internal/tools/listconsumergroups"
 	"github.com/denizgursoy/kafka-mcp/internal/tools/listtopics"
+	"github.com/denizgursoy/kafka-mcp/internal/tools/opentransactions"
 	"github.com/denizgursoy/kafka-mcp/internal/tools/producemessage"
 	"github.com/denizgursoy/kafka-mcp/internal/tools/samplemessages"
 	"github.com/denizgursoy/kafka-mcp/internal/tools/searchmessages"
@@ -58,18 +65,25 @@ const ServerConfig = "server_config"
 func Names() []string {
 	return []string{
 		"add_partitions",
+		"alter_topic_config",
+		"cluster_health",
 		"commit_offset",
 		"compare_clusters",
 		"consumer_lag",
 		"copy_message",
 		"create_topic",
+		"delete_consumer_group",
+		"delete_records",
 		"delete_topic",
+		"describe_consumer_group",
 		"describe_topic",
 		"get_message",
 		"get_schema",
+		"list_acls",
 		"list_clusters",
 		"list_consumer_groups",
 		"list_topics",
+		"open_transactions",
 		"produce_message",
 		"sample_messages",
 		"search_messages",
@@ -136,6 +150,10 @@ func Register(
 	})
 	endpoint.add("get_message", func() { getmessage.Register(server, kafka.Reader()) })
 	endpoint.add("get_schema", func() { getschema.Register(server, kafka.Codec()) })
+	endpoint.add("describe_consumer_group", func() { describeconsumergroup.Register(server, kafka.Admin()) })
+	endpoint.add("cluster_health", func() { clusterhealth.Register(server, kafka.Admin()) })
+	endpoint.add("list_acls", func() { listacls.Register(server, kafka.Admin()) })
+	endpoint.add("open_transactions", func() { opentransactions.Register(server, kafka.Admin()) })
 
 	// A read-only endpoint is not offered the tools whose only purpose is to
 	// change it. They all refuse at the point of mutation anyway, but a
@@ -146,8 +164,11 @@ func Register(
 	// stays inside each tool, so the refusal survives a registration mistake.
 	if !endpointConfig.ReadOnly {
 		endpoint.add("add_partitions", func() { addpartitions.Register(server, kafka, kafka.Reader()) })
+		endpoint.add("alter_topic_config", func() { altertopicconfig.Register(server, kafka) })
 		endpoint.add("commit_offset", func() { commitoffset.Register(server, kafka) })
 		endpoint.add("create_topic", func() { createtopic.Register(server, kafka) })
+		endpoint.add("delete_consumer_group", func() { deleteconsumergroup.Register(server, kafka) })
+		endpoint.add("delete_records", func() { deleterecords.Register(server, kafka) })
 		endpoint.add("delete_topic", func() { deletetopic.Register(server, kafka) })
 	}
 

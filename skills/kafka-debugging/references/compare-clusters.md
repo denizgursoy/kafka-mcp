@@ -16,6 +16,8 @@ is missing.
 | `compare_clusters` | The difference itself: missing topics and config drift   |
 | `describe_topic`   | The full configuration of one topic, when drift needs detail |
 | `server_config`    | Checking this endpoint may create anything, before promising it |
+| `create_topic`     | Creating the topics the user chose                        |
+| `alter_topic_config` | Bringing a drifted config in line, once the user chose a side |
 | `create_topic`     | Creating the topics that are missing                     |
 
 ## Steps
@@ -106,6 +108,23 @@ and note that a partition count can never be reduced afterwards; see
 Check the broker counts in the report before copying a replication factor. A
 `replication_factor` of 3 cannot be created on a one-broker cluster, and
 `compare_clusters` warns when the two sides differ in size.
+
+### 7. Fix config drift the user chose to fix, if anything
+
+Drift is fixed with `alter_topic_config`, on an endpoint bound to the cluster
+being changed — the same rule as creating. Ask which side is correct first:
+drift reported as `here`/`there` says nothing about which value is right.
+
+Pass the chosen values as `set`, and use `delete` for a key one side sets and
+the other inherits, so the topic falls back to the cluster default instead of
+receiving a copied value. Preview first. A shorter `retention.ms` makes old
+messages deletable straight away and the preview counts them; a
+`cleanup.policy` change alters what consumers see. See
+[tune-topic-config.md](tune-topic-config.md) before confirming either.
+
+A partition count difference cannot be fixed by config. Growing is
+`add_partitions` ([scale-partitions.md](scale-partitions.md)); shrinking is not
+possible at all.
 
 ## Notes
 

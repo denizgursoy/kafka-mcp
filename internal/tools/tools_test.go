@@ -171,6 +171,12 @@ func (s *RegistrationSuite) TestExposedTools() {
 			"commit_offset can only ever refuse on a read-only cluster, so listing it wastes a call and misleads the caller about what is possible")
 		s.Require().NotContains(listed, "delete_topic",
 			"delete_topic is the most destructive tool here, so a read-only endpoint must not even advertise it: the tool list is what says this endpoint cannot destroy anything")
+		s.Require().NotContains(listed, "alter_topic_config",
+			"changing configuration is all alter_topic_config does, so a read-only endpoint must not advertise it")
+		s.Require().NotContains(listed, "delete_consumer_group",
+			"deleting a group throws away its committed position, so a read-only endpoint must not advertise it")
+		s.Require().NotContains(listed, "delete_records",
+			"delete_records destroys messages, so a read-only endpoint must not advertise it")
 	})
 
 	s.Run("a read-only cluster still exposes every tool that only reads", func() {
@@ -182,6 +188,14 @@ func (s *RegistrationSuite) TestExposedTools() {
 			"searching writes only to output_dir, never to the cluster, so read_only does not bear on it")
 		s.Require().Contains(listed, "server_config",
 			"server_config is how a session learns the cluster is read-only, so hiding it would remove the explanation")
+		s.Require().Contains(listed, "cluster_health",
+			"diagnosing a protected cluster is exactly when health matters, and the check only reads metadata")
+		s.Require().Contains(listed, "describe_consumer_group",
+			"finding the consumer that owns a stuck partition only reads, so read_only must not hide it")
+		s.Require().Contains(listed, "open_transactions",
+			"finding a hung transaction only reads, so read_only must not hide it")
+		s.Require().Contains(listed, "list_acls",
+			"listing ACLs only reads, so read_only must not hide it")
 	})
 
 	s.Run("a read-only cluster still exposes copy_message", func() {

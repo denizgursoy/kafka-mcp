@@ -12,6 +12,8 @@ payments consumer", "how fast are we processing", or "when will it catch up".
 | ---------------------- | --------------------------------------------------- |
 | `list_topics`          | Finding the topic when the user does not name one   |
 | `list_consumer_groups` | Finding who consumes the topic, and their state     |
+| `describe_consumer_group` | Which member owns a lagging partition            |
+| `delete_consumer_group` | Removing an abandoned group whose lag nobody drains |
 | `consumer_lag`         | Lag, produce and consume rates, and the estimate    |
 | `describe_topic`       | Retention, when judging whether a backlog is at risk|
 
@@ -110,4 +112,12 @@ loss, and it is worth raising unprompted.
 - Rates are per topic, so a consumer group reading several topics may be busy
   elsewhere.
 - A group can be caught up on one partition and far behind on another; the
-  total alone can hide that.
+  total alone can hide that. `describe_consumer_group` names the member and host
+  owning the lagging partition, which is usually one slow instance rather than a
+  slow application.
+- A `no_active_consumers` group whose consumers were decommissioned keeps
+  reporting lag forever, and keeps firing whatever alert watches it. If the user
+  confirms nothing will use that group id again, `delete_consumer_group` removes
+  it; see [purge-messages.md](purge-messages.md). Never delete a group just
+  because it is `Empty`: an `Empty` group is often a consumer that is only
+  stopped for a deploy.

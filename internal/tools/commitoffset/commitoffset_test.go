@@ -3,6 +3,7 @@ package commitoffset_test
 import (
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/suite"
 
@@ -97,7 +98,7 @@ func (s *CommitOffsetSuite) commitOne(
 func (s *CommitOffsetSuite) TestDryRunDoesNotMoveTheOffset() {
 	topic, group := s.stuckGroup("commit-dry-run", 10, 4)
 
-	out, err := s.commitOne(s.env.ClusterClient(s.T(), false), false, commitoffset.Item{Topic: topic, Group: group, Partition: 0, Offset: 8})
+	out, err := s.commitOne(s.env.ClusterClient(s.T(), false), false, commitoffset.Item{Topic: topic, Group: group, Partition: ptr(int32(0)), Offset: ptr(int64(8))})
 
 	s.Require().NoError(err, "a dry run against a valid request must succeed")
 
@@ -109,9 +110,11 @@ func (s *CommitOffsetSuite) TestDryRunDoesNotMoveTheOffset() {
 	s.Run("the result reports what would happen", func() {
 		s.Require().False(out.Applied,
 			"the caller must be able to tell a preview from a change that happened")
-		s.Require().EqualValues(4, out.CurrentOffset,
+		s.Require().Len(out.Partitions, 1,
+			"an item naming one partition must report exactly that partition")
+		s.Require().EqualValues(4, out.Partitions[0].CurrentOffset,
 			"the starting point must be reported so the caller can judge the move")
-		s.Require().EqualValues(8, out.RequestedOffset,
+		s.Require().EqualValues(8, out.Partitions[0].TargetOffset,
 			"the target must be echoed back so a mistyped offset is visible before confirming")
 		s.Require().EqualValues(4, out.SkippedMessages,
 			"moving from 4 to 8 passes over four messages, and the caller must see that count before agreeing to lose them")
@@ -124,15 +127,16 @@ func (s *CommitOffsetSuite) TestConfirmMovesTheOffsetForward() {
 	out, err := s.commitOne(s.env.ClusterClient(s.T(), false), true, commitoffset.Item{
 		Topic:     topic,
 		Group:     group,
-		Partition: 0,
-		Offset:    7,
+		Partition: ptr(int32(0)),
+		Offset:    ptr(int64(7)),
 	})
 
 	s.Require().NoError(err, "a confirmed commit must succeed")
 	s.Require().True(out.Applied, "a change that happened must be reported as applied")
 	s.Require().EqualValues(7, s.committed(group, topic),
 		"the broker must now report the new offset, which is the only proof the commit took effect")
-	s.Require().EqualValues(7, out.ResultingOffset,
+	s.Require().NotNil(out.Partitions[0].ResultingOffset, "an applied move must report where the broker left the group")
+	s.Require().EqualValues(7, *out.Partitions[0].ResultingOffset,
 		"the resulting offset must be re-read from the broker rather than assumed from the request")
 }
 
@@ -142,8 +146,8 @@ func (s *CommitOffsetSuite) TestConfirmMovesTheOffsetBackward() {
 	out, err := s.commitOne(s.env.ClusterClient(s.T(), false), true, commitoffset.Item{
 		Topic:     topic,
 		Group:     group,
-		Partition: 0,
-		Offset:    2,
+		Partition: ptr(int32(0)),
+		Offset:    ptr(int64(2)),
 	})
 
 	s.Require().NoError(err,
@@ -160,8 +164,8 @@ func (s *CommitOffsetSuite) TestRefusesAnOffsetBeyondTheEnd() {
 	_, err := s.commitOne(s.env.ClusterClient(s.T(), false), true, commitoffset.Item{
 		Topic:     topic,
 		Group:     group,
-		Partition: 0,
-		Offset:    99,
+		Partition: ptr(int32(0)),
+		Offset:    ptr(int64(99)),
 	})
 
 	s.Require().Error(err,
@@ -176,8 +180,8 @@ func (s *CommitOffsetSuite) TestRefusesANegativeOffset() {
 	_, err := s.commitOne(s.env.ClusterClient(s.T(), false), true, commitoffset.Item{
 		Topic:     topic,
 		Group:     group,
-		Partition: 0,
-		Offset:    -5,
+		Partition: ptr(int32(0)),
+		Offset:    ptr(int64(-5)),
 	})
 
 	s.Require().Error(err,
@@ -192,8 +196,8 @@ func (s *CommitOffsetSuite) TestReadOnlyRefusesTheCommit() {
 	_, err := s.commitOne(s.env.ClusterClient(s.T(), true), true, commitoffset.Item{
 		Topic:     topic,
 		Group:     group,
-		Partition: 0,
-		Offset:    7,
+		Partition: ptr(int32(0)),
+		Offset:    ptr(int64(7)),
 	})
 
 	s.Require().Error(err,
@@ -207,7 +211,7 @@ func (s *CommitOffsetSuite) TestReadOnlyRefusesTheCommit() {
 func (s *CommitOffsetSuite) TestReadOnlyStillAllowsADryRun() {
 	topic, group := s.stuckGroup("commit-read-only-dry", 10, 3)
 
-	out, err := s.commitOne(s.env.ClusterClient(s.T(), true), false, commitoffset.Item{Topic: topic, Group: group, Partition: 0, Offset: 7})
+	out, err := s.commitOne(s.env.ClusterClient(s.T(), true), false, commitoffset.Item{Topic: topic, Group: group, Partition: ptr(int32(0)), Offset: ptr(int64(7))})
 
 	s.Require().NoError(err,
 		"a preview only reads the current offset, so a read-only server can still answer what a move would do")
@@ -224,8 +228,8 @@ func (s *CommitOffsetSuite) TestErrorsOnUnknownGroup() {
 	_, err := s.commitOne(s.env.ClusterClient(s.T(), false), true, commitoffset.Item{
 		Topic:     topic,
 		Group:     s.env.UniqueName("never-existed"),
-		Partition: 0,
-		Offset:    1,
+		Partition: ptr(int32(0)),
+		Offset:    ptr(int64(1)),
 	})
 
 	s.Require().Error(err,
@@ -236,8 +240,8 @@ func (s *CommitOffsetSuite) TestErrorsOnUnknownTopic() {
 	_, err := s.commitOne(s.env.ClusterClient(s.T(), false), false, commitoffset.Item{
 		Topic:     s.env.UniqueName("missing"),
 		Group:     s.env.UniqueName("group"),
-		Partition: 0,
-		Offset:    1,
+		Partition: ptr(int32(0)),
+		Offset:    ptr(int64(1)),
 	})
 
 	s.Require().Error(err,
@@ -251,7 +255,7 @@ func (s *CommitOffsetSuite) TestErrorsWhenBrokerUnreachable() {
 	s.T().Cleanup(client.Close)
 
 	_, err = s.commitOne(client, false, commitoffset.Item{
-		Topic: "anything", Group: "anything", Partition: 0, Offset: 1,
+		Topic: "anything", Group: "anything", Partition: ptr(int32(0)), Offset: ptr(int64(1)),
 	})
 
 	s.Require().Error(err,
@@ -267,9 +271,9 @@ func (s *CommitOffsetSuite) TestBatchCommitsSeveralOffsetsAndReportsItemErrors()
 		s.env.ClusterClient(s.T(), false),
 		commitoffset.Input{
 			Items: []commitoffset.Item{
-				{Topic: firstTopic, Group: firstGroup, Partition: 0, Offset: 6},
-				{Topic: secondTopic, Group: secondGroup, Partition: 0, Offset: 5},
-				{Topic: secondTopic, Group: secondGroup, Partition: 99, Offset: 5},
+				{Topic: firstTopic, Group: firstGroup, Partition: ptr(int32(0)), Offset: ptr(int64(6))},
+				{Topic: secondTopic, Group: secondGroup, Partition: ptr(int32(0)), Offset: ptr(int64(5))},
+				{Topic: secondTopic, Group: secondGroup, Partition: ptr(int32(99)), Offset: ptr(int64(5))},
 			},
 			Confirm: true,
 		},
@@ -282,4 +286,219 @@ func (s *CommitOffsetSuite) TestBatchCommitsSeveralOffsetsAndReportsItemErrors()
 	s.Require().EqualValues(6, s.committed(firstGroup, firstTopic), "the first valid offset must be applied")
 	s.Require().EqualValues(5, s.committed(secondGroup, secondTopic), "the second valid offset must be applied")
 	s.Require().Contains(out.Results[2].Error, "partition 99", "the failed item must explain which partition was invalid")
+}
+
+func ptr[T any](value T) *T {
+	return &value
+}
+
+// replayGroup produces messages with known timestamps across two partitions and
+// commits the group to the end of both, which is the state a group is in when a
+// bug fix ships and everything since some moment has to be processed again.
+func (s *CommitOffsetSuite) replayGroup(prefix string, base time.Time) (string, string) {
+	s.T().Helper()
+
+	topic := s.env.CreateTopicWithPartitions(s.T(), prefix, 2)
+
+	messages := make([]testenv.Message, 0, 8)
+	for partition := int32(0); partition < 2; partition++ {
+		for i := 0; i < 4; i++ {
+			messages = append(messages, testenv.Message{
+				Value:     "message",
+				Partition: partition,
+				Timestamp: base.Add(time.Duration(i) * time.Hour),
+			})
+		}
+	}
+
+	s.env.Produce(s.T(), topic, messages...)
+
+	group := s.env.UniqueName(prefix + "-group")
+	s.env.ConsumeAndCommit(s.T(), topic, group, 8)
+
+	return topic, group
+}
+
+func (s *CommitOffsetSuite) committedOn(group string, topic string, partition int32) int64 {
+	s.T().Helper()
+
+	offsets, err := s.env.Admin().FetchOffsets(s.T().Context(), group)
+	s.Require().NoError(err, "reading the committed offset back must succeed")
+
+	offset, ok := offsets.Lookup(topic, partition)
+	s.Require().True(ok, "the group must have a committed offset for partition %d", partition)
+
+	return offset.At
+}
+
+func (s *CommitOffsetSuite) TestTimestampMovesEveryPartitionWhenPartitionIsOmitted() {
+	base := time.Now().Add(-48 * time.Hour).Truncate(time.Second)
+	topic, group := s.replayGroup("commit-timestamp-all", base)
+
+	// Two hours after the first message is offset 2 on both partitions.
+	out, err := s.commitOne(s.env.ClusterClient(s.T(), false), true, commitoffset.Item{
+		Topic:     topic,
+		Group:     group,
+		Timestamp: base.Add(2 * time.Hour).Format(time.RFC3339),
+	})
+
+	s.Require().NoError(err, "replaying from a time across every partition must succeed")
+
+	s.Run("every partition is reported", func() {
+		s.Require().Len(out.Partitions, 2,
+			"omitting partition means the whole topic, so both partitions must be in the result")
+		s.Require().EqualValues(0, out.Partitions[0].Partition,
+			"partitions must be sorted so the report is stable between calls")
+		s.Require().EqualValues(1, out.Partitions[1].Partition,
+			"partitions must be sorted so the report is stable between calls")
+	})
+
+	s.Run("each partition moves to the first message at or after the time", func() {
+		s.Require().EqualValues(2, s.committedOn(group, topic, 0),
+			"partition 0 holds its third message at that time, so the group must read it next")
+		s.Require().EqualValues(2, s.committedOn(group, topic, 1),
+			"partition 1 must move independently to its own offset for that time")
+	})
+
+	s.Run("the replay is counted across partitions", func() {
+		s.Require().EqualValues(4, out.ReplayedMessages,
+			"two messages per partition will be processed again, and the caller must see the total before agreeing to duplicates")
+		s.Require().True(out.Applied, "a confirmed move must be reported as applied")
+	})
+}
+
+func (s *CommitOffsetSuite) TestTimestampPreviewChangesNothing() {
+	base := time.Now().Add(-48 * time.Hour).Truncate(time.Second)
+	topic, group := s.replayGroup("commit-timestamp-dry", base)
+
+	out, err := s.commitOne(s.env.ClusterClient(s.T(), false), false, commitoffset.Item{
+		Topic:     topic,
+		Group:     group,
+		Timestamp: base.Format(time.RFC3339),
+	})
+
+	s.Require().NoError(err, "previewing a replay must succeed")
+	s.Require().False(out.Applied, "a preview must never be reported as applied")
+	s.Require().EqualValues(8, out.ReplayedMessages,
+		"replaying from the first message replays all eight, which the preview must say before anything moves")
+	s.Require().EqualValues(4, s.committedOn(group, topic, 0),
+		"a preview must leave the committed offset where it was")
+}
+
+func (s *CommitOffsetSuite) TestTimestampAfterTheLastMessageGoesToTheEnd() {
+	base := time.Now().Add(-48 * time.Hour).Truncate(time.Second)
+	topic, group := s.replayGroup("commit-timestamp-future", base)
+
+	out, err := s.commitOne(s.env.ClusterClient(s.T(), false), false, commitoffset.Item{
+		Topic:     topic,
+		Group:     group,
+		Partition: ptr(int32(0)),
+		Timestamp: base.Add(24 * time.Hour).Format(time.RFC3339),
+	})
+
+	s.Require().NoError(err, "a time after every message is valid: it means nothing to replay")
+	s.Require().EqualValues(4, out.Partitions[0].TargetOffset,
+		"with no message at or after the time, the target is the end of the partition, as Kafka reports it")
+	s.Require().NotEmpty(out.Partitions[0].Note,
+		"the caller must be told no message matched, or a mistyped date looks like a successful replay of nothing")
+}
+
+func (s *CommitOffsetSuite) TestPositionEarliestReplaysEverything() {
+	topic, group := s.stuckGroup("commit-earliest", 6, 6)
+
+	out, err := s.commitOne(s.env.ClusterClient(s.T(), false), true, commitoffset.Item{
+		Topic:    topic,
+		Group:    group,
+		Position: "earliest",
+	})
+
+	s.Require().NoError(err, "moving to earliest must succeed")
+	s.Require().EqualValues(0, s.committed(group, topic),
+		"earliest means the first offset the partition still holds")
+	s.Require().EqualValues(6, out.ReplayedMessages,
+		"every consumed message will be processed again, and the caller must see how many")
+}
+
+func (s *CommitOffsetSuite) TestPositionLatestSkipsTheBacklog() {
+	topic, group := s.stuckGroup("commit-latest", 9, 2)
+
+	out, err := s.commitOne(s.env.ClusterClient(s.T(), false), true, commitoffset.Item{
+		Topic:     topic,
+		Group:     group,
+		Partition: ptr(int32(0)),
+		Position:  "latest",
+	})
+
+	s.Require().NoError(err, "moving to latest must succeed")
+	s.Require().EqualValues(9, s.committed(group, topic),
+		"latest means the end of the partition, so the group reads only new messages")
+	s.Require().EqualValues(7, out.SkippedMessages,
+		"the seven unread messages will never be processed, and the caller must see that before agreeing")
+}
+
+func (s *CommitOffsetSuite) TestRefusesMoreThanOneTarget() {
+	topic, group := s.stuckGroup("commit-two-targets", 5, 2)
+
+	_, err := s.commitOne(s.env.ClusterClient(s.T(), false), false, commitoffset.Item{
+		Topic:     topic,
+		Group:     group,
+		Partition: ptr(int32(0)),
+		Offset:    ptr(int64(3)),
+		Position:  "earliest",
+	})
+
+	s.Require().Error(err,
+		"offset, timestamp and position each name a different place, so giving two leaves the caller's intent ambiguous")
+}
+
+func (s *CommitOffsetSuite) TestRefusesNoTarget() {
+	topic, group := s.stuckGroup("commit-no-target", 5, 2)
+
+	_, err := s.commitOne(s.env.ClusterClient(s.T(), false), false, commitoffset.Item{
+		Topic: topic,
+		Group: group,
+	})
+
+	s.Require().Error(err, "an item that says nowhere to move cannot be guessed at")
+}
+
+func (s *CommitOffsetSuite) TestRefusesAnOffsetWithoutAPartition() {
+	topic, group := s.stuckGroup("commit-offset-no-partition", 5, 2)
+
+	_, err := s.commitOne(s.env.ClusterClient(s.T(), false), false, commitoffset.Item{
+		Topic:  topic,
+		Group:  group,
+		Offset: ptr(int64(3)),
+	})
+
+	s.Require().Error(err,
+		"an exact offset means one place in one partition; applying it to every partition would point most of them at unrelated messages")
+}
+
+func (s *CommitOffsetSuite) TestRefusesAnUnknownPosition() {
+	topic, group := s.stuckGroup("commit-bad-position", 5, 2)
+
+	_, err := s.commitOne(s.env.ClusterClient(s.T(), false), false, commitoffset.Item{
+		Topic:    topic,
+		Group:    group,
+		Position: "beginning",
+	})
+
+	s.Require().Error(err, "only earliest and latest are positions; anything else must be refused rather than guessed")
+}
+
+func (s *CommitOffsetSuite) TestRefusesAWholeTopicItemOverlappingAPartitionItem() {
+	topic, group := s.stuckGroup("commit-overlap", 5, 2)
+
+	_, err := commitoffset.Run(s.T().Context(), s.env.ClusterClient(s.T(), false), commitoffset.Input{
+		Items: []commitoffset.Item{
+			{Topic: topic, Group: group, Position: "earliest"},
+			{Topic: topic, Group: group, Partition: ptr(int32(0)), Offset: ptr(int64(3))},
+		},
+		Confirm: true,
+	})
+
+	s.Require().Error(err,
+		"a whole-topic move and a partition move for the same group both target partition 0, and which one wins would depend on order")
+	s.Require().EqualValues(2, s.committed(group, topic), "a refused batch must change nothing")
 }

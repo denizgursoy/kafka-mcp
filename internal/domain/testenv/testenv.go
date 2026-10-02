@@ -873,3 +873,177 @@ func (e *Environment) CreateNamedTopic(
 
 	return name
 }
+
+// JoinGroup starts a consumer that stays in group as an active member,
+// consuming topic, and returns once the broker reports the group Stable with
+// that member assigned partitions.
+//
+// A group with a live member is a different state from one whose consumers
+// have stopped, and tools that refuse to touch a running group can only be
+// tested against one. The consumer leaves the group when the returned function
+// is called, or when the test ends.
+func (e *Environment) JoinGroup(t *testing.T, topic string, group string, clientID string) func() {
+	t.Helper()
+
+	options := []kgo.Opt{
+		kgo.SeedBrokers(e.seed),
+		kgo.ClientID(clientID),
+		kgo.ConsumerGroup(group),
+		kgo.ConsumeTopics(topic),
+		kgo.ConsumeResetOffset(kgo.NewOffset().AtStart()),
+		kgo.DisableAutoCommit(),
+	}
+
+	client, err := kgo.NewClient(append(options, e.authOptions...)...)
+	if err != nil {
+		t.Fatalf("connect consumer for group %s: %v", group, err)
+	}
+
+	e.mu.Lock()
+	e.groups = append(e.groups, group)
+	e.mu.Unlock()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+
+		for ctx.Err() == nil {
+			client.PollFetches(ctx)
+		}
+	}()
+
+	var once sync.Once
+
+	stop := func() {
+		once.Do(func() {
+			cancel()
+			<-done
+			client.Close()
+		})
+	}
+
+	t.Cleanup(stop)
+
+	deadline := time.Now().Add(30 * time.Second)
+
+	for time.Now().Before(deadline) {
+		described, err := e.admin.DescribeGroups(t.Context(), group)
+		if err == nil {
+			if detail, ok := described[group]; ok && detail.State == "Stable" && len(detail.AssignedPartitions()) > 0 {
+				return stop
+			}
+		}
+
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	stop()
+	t.Fatalf("group %s did not become Stable with an assigned member within 30s", group)
+
+	return stop
+}
+
+// ACL describes one access control entry to create in a test.
+type ACL struct {
+	Principal string
+	Topic     string
+	Prefixed  bool
+	Operation kadm.ACLOperation
+	Deny      bool
+}
+
+// CreateACL stores an ACL on the broker and removes it when the test ends.
+//
+// The broker keeps ACLs whether or not it enforces them, so a test can assert
+// on what a tool reports without the suite running with authorization on.
+func (e *Environment) CreateACL(t *testing.T, acl ACL) {
+	t.Helper()
+
+	pattern := kadm.ACLPatternLiteral
+	if acl.Prefixed {
+		pattern = kadm.ACLPatternPrefixed
+	}
+
+	builder := func() *kadm.ACLBuilder {
+		b := kadm.NewACLs().Topics(acl.Topic).ResourcePatternType(pattern).Operations(acl.Operation)
+		if acl.Deny {
+			return b.Deny(acl.Principal).DenyHosts("*")
+		}
+
+		return b.Allow(acl.Principal).AllowHosts("*")
+	}
+
+	results, err := e.admin.CreateACLs(t.Context(), builder())
+	if err != nil {
+		t.Fatalf("create ACL %+v: %v", acl, err)
+	}
+
+	for _, result := range results {
+		if result.Err != nil {
+			t.Fatalf("create ACL %+v: %v", acl, result.Err)
+		}
+	}
+
+	t.Cleanup(func() {
+		if _, err := e.admin.DeleteACLs(context.Background(), builder()); err != nil {
+			t.Logf("delete ACL %+v: %v", acl, err)
+		}
+	})
+}
+
+// OpenTransaction produces count messages to partition 0 of topic inside a
+// transaction and leaves it open, which is the state a transactional producer
+// is in when it hangs or dies between producing and committing.
+//
+// read_committed consumers cannot read past the first message of the open
+// transaction until it ends. The transaction is aborted and the producer
+// closed when the returned function is called, or when the test ends.
+func (e *Environment) OpenTransaction(t *testing.T, topic string, transactionalID string, count int) func() {
+	t.Helper()
+
+	options := []kgo.Opt{
+		kgo.SeedBrokers(e.seed),
+		kgo.TransactionalID(transactionalID),
+		kgo.TransactionTimeout(5 * time.Minute),
+		kgo.DefaultProduceTopic(topic),
+		kgo.RecordPartitioner(kgo.ManualPartitioner()),
+	}
+
+	client, err := kgo.NewClient(append(options, e.authOptions...)...)
+	if err != nil {
+		t.Fatalf("connect transactional producer %s: %v", transactionalID, err)
+	}
+
+	if err := client.BeginTransaction(); err != nil {
+		client.Close()
+		t.Fatalf("begin transaction %s: %v", transactionalID, err)
+	}
+
+	records := make([]*kgo.Record, 0, count)
+	for range count {
+		records = append(records, &kgo.Record{Value: []byte("uncommitted")})
+	}
+
+	if err := client.ProduceSync(t.Context(), records...).FirstErr(); err != nil {
+		client.Close()
+		t.Fatalf("produce inside transaction %s: %v", transactionalID, err)
+	}
+
+	var once sync.Once
+
+	end := func() {
+		once.Do(func() {
+			if err := client.EndTransaction(context.Background(), kgo.TryAbort); err != nil {
+				t.Logf("abort transaction %s: %v", transactionalID, err)
+			}
+
+			client.Close()
+		})
+	}
+
+	t.Cleanup(end)
+
+	return end
+}
