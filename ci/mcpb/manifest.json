@@ -1,0 +1,51 @@
+{
+  "manifest_version": "0.3",
+  "name": "kafka-mcp",
+  "display_name": "Kafka MCP",
+  "version": "0.0.0",
+  "description": "Debug Kafka from an agent: find messages, measure consumer lag, unblock consumers, compare clusters.",
+  "long_description": "Connects to the Kafka clusters named in your kafka-mcp.yaml and exposes one of its endpoints over stdio. Read-only endpoints hide every tool that writes, and every write previews what it would change before it does anything. See https://denizgursoy.github.io/kafka-mcp/#configure for the configuration file.",
+  "author": {
+    "name": "denizgursoy",
+    "url": "https://github.com/denizgursoy"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/denizgursoy/kafka-mcp"
+  },
+  "homepage": "https://denizgursoy.github.io/kafka-mcp/",
+  "documentation": "https://github.com/denizgursoy/kafka-mcp#readme",
+  "support": "https://github.com/denizgursoy/kafka-mcp/issues",
+  "license": "MIT",
+  "keywords": ["kafka", "redpanda", "consumer-lag", "debugging", "schema-registry"],
+  "server": {
+    "type": "binary",
+    "entry_point": "server/kafka-mcp",
+    "mcp_config": {
+      "command": "${__dirname}/server/kafka-mcp",
+      "args": ["--endpoint=${user_config.endpoint}"],
+      "env": {
+        "CONFIG_FILE": "${user_config.config_file}"
+      }
+    }
+  },
+  "compatibility": {
+    "platforms": []
+  },
+  "user_config": {
+    "config_file": {
+      "type": "file",
+      "title": "Configuration file",
+      "description": "Your kafka-mcp.yaml: the clusters to connect to and the endpoints to expose.",
+      "required": true
+    },
+    "endpoint": {
+      "type": "string",
+      "title": "Endpoint",
+      "description": "Which endpoint of the file to serve. Leave empty when the file defines only one.",
+      "required": false,
+      "default": ""
+    }
+  },
+  "tools": []
+}

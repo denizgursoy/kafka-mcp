@@ -1,0 +1,58 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.denizgursoy/kafka-mcp",
+  "title": "Kafka MCP",
+  "description": "Debug Kafka from an agent: find messages, measure consumer lag, unblock consumers, compare clusters.",
+  "websiteUrl": "https://denizgursoy.github.io/kafka-mcp/",
+  "repository": {
+    "url": "https://github.com/denizgursoy/kafka-mcp",
+    "source": "github",
+    "id": "1367486735"
+  },
+  "version": "0.0.0",
+  "packages": [
+    {
+      "registryType": "oci",
+      "identifier": "ghcr.io/denizgursoy/kafka-mcp:v0.0.0",
+      "transport": {
+        "type": "stdio"
+      },
+      "runtimeHint": "docker",
+      "runtimeArguments": [
+        {
+          "type": "named",
+          "name": "--mount",
+          "description": "Mount your kafka-mcp.yaml into the container, read-only",
+          "value": "type=bind,src={config_file},dst=/config/kafka-mcp.yaml,readonly",
+          "isRequired": true,
+          "variables": {
+            "config_file": {
+              "description": "Path to your kafka-mcp.yaml: the clusters to connect to and the endpoints to expose",
+              "format": "filepath",
+              "isRequired": true
+            }
+          }
+        }
+      ],
+      "packageArguments": [
+        {
+          "type": "positional",
+          "description": "Serve over stdio instead of the image's default HTTP mode",
+          "value": "--server=false"
+        },
+        {
+          "type": "named",
+          "name": "--endpoint",
+          "description": "Endpoint from the file to serve. Required when the file defines more than one"
+        }
+      ],
+      "environmentVariables": [
+        {
+          "name": "CONFIG_FILE",
+          "description": "Where the mounted configuration is read from inside the container",
+          "value": "/config/kafka-mcp.yaml"
+        }
+      ]
+    }
+  ]
+}

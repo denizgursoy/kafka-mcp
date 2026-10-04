@@ -7,15 +7,24 @@ on:
 permissions:
   contents: write
   packages: write
+  # Lets mcp-publisher prove to the MCP Registry that this repository owns the
+  # io.github.denizgursoy namespace, without a stored token.
+  id-token: write
 
 jobs:
   release:
     runs-on: ubuntu-latest
+    env:
+      # At job level so a step's `if` can see whether it is set.
+      SMITHERY_API_KEY: ${{ secrets.SMITHERY_API_KEY }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
 
       - name: Log in to the Container registry
         uses: docker/login-action@v3
@@ -32,3 +41,25 @@ jobs:
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build MCP Bundles and server.json
+        run: ci/mcpb/package.sh "$GITHUB_REF_NAME"
+
+      - name: Attach MCP Bundles to the release
+        run: gh release upload "$GITHUB_REF_NAME" dist/mcpb/*.mcpb dist/mcpb/server.json --clobber
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish to the MCP Registry
+        # A prerelease tag (v1.2.0-rc1) is released on GitHub but not listed.
+        if: ${{ !contains(github.ref_name, '-') }}
+        run: |
+          curl -fsSL "https://github.com/modelcontextprotocol/registry/releases/download/v1.8.1/mcp-publisher_linux_amd64.tar.gz" | tar xz mcp-publisher
+          ./mcp-publisher login github-oidc
+          ./mcp-publisher publish dist/mcpb/server.json
+
+      - name: Publish to Smithery
+        # Smithery holds one bundle per server, up to 25 MB, so it gets the
+        # Apple Silicon one. Skipped until SMITHERY_API_KEY is set.
+        if: ${{ !contains(github.ref_name, '-') && env.SMITHERY_API_KEY != '' }}
+        run: npx -y smithery@1.2.0 mcp publish dist/mcpb/kafka-mcp_*_darwin_arm64.mcpb -n denizgursoy/kafka-mcp

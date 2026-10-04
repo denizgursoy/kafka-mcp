@@ -105,6 +105,7 @@ message</span><span class="caret" aria-hidden="true"></span>
               <div class="tab-bar" role="tablist">
                 <button class="active" data-tab="agent" role="tab">ask your agent</button>
                 <button data-tab="bin" role="tab">binary</button>
+                <button data-tab="mcpb" role="tab">bundle</button>
                 <button data-tab="docker" role="tab">docker</button>
                 <button data-tab="src" role="tab">from source</button>
               </div>
@@ -140,12 +141,25 @@ sudo mv kafka-mcp /usr/local/bin/
 curl -sL https://github.com/denizgursoy/kafka-mcp/archive/refs/heads/main.tar.gz \
   | tar -xz --strip-components=2 -C ~/.claude/skills kafka-mcp-main/skills/kafka-debugging</code></pre>
               </div>
+              <div class="tab-panel" data-panel="mcpb">
+                <pre><code><span class="c"># from https://github.com/denizgursoy/kafka-mcp/releases/latest</span>
+kafka-mcp_&lt;version&gt;_darwin_arm64.mcpb    <span class="c"># macOS, Apple Silicon</span>
+kafka-mcp_&lt;version&gt;_linux_amd64.mcpb
+kafka-mcp_&lt;version&gt;_linux_arm64.mcpb
+kafka-mcp_&lt;version&gt;_windows_amd64.mcpb</code></pre>
+                <p class="hint">
+                  Open it in a client that installs MCP Bundles, such as Claude Desktop. It asks
+                  for your <code>kafka-mcp.yaml</code> and, if the file has several, the endpoint.
+                  Also listed in the <a href="https://registry.modelcontextprotocol.io/v0.1/servers?search=io.github.denizgursoy/kafka-mcp">MCP Registry</a>
+                  as <code>io.github.denizgursoy/kafka-mcp</code>.
+                </p>
+              </div>
               <div class="tab-panel" data-panel="docker">
                 <pre><code>docker run --rm -p 8090:8090 \
   -v $PWD/kafka-mcp.yaml:/kafka-mcp.yaml \
   -e CONFIG_FILE=/kafka-mcp.yaml \
   ghcr.io/denizgursoy/kafka-mcp:latest</code></pre>
-                <p class="hint">The image starts with <code>--server</code>, so it serves HTTP on :8090.</p>
+                <p class="hint">The image starts with <code>--server</code>, so it serves HTTP on :8090. Add <code>-i</code> and end the command with <code>--server=false</code> for stdio.</p>
               </div>
               <div class="tab-panel" data-panel="src">
                 <pre><code>git clone https://github.com/denizgursoy/kafka-mcp

@@ -13,6 +13,36 @@ is selected for the session. In HTTP mode, each endpoint has its own path, so a
 session is bound to one cluster by how it connects rather than by a parameter a
 caller could forget to send.
 
+## Install
+
+Every release ships the same server four ways:
+
+- **Binary**: `kafka-mcp_<Os>_<arch>` archives on the
+  [releases page](https://github.com/denizgursoy/kafka-mcp/releases/latest).
+  Put `kafka-mcp` on your `PATH`.
+- **MCP Bundle**: `kafka-mcp_<version>_<os>_<arch>.mcpb` on the same page,
+  for macOS on Apple Silicon, Linux (amd64, arm64) and Windows (amd64). Open
+  it in a client that installs bundles, such as Claude Desktop. It asks for
+  your configuration file and, when that file has several endpoints, which
+  one to serve. Intel Macs use the binary or the image.
+- **Container image**: `ghcr.io/denizgursoy/kafka-mcp:<tag>`. It starts with
+  `--server`; for stdio, mount the file and pass `--server=false`:
+
+  ```sh
+  docker run -i --rm \
+    --mount type=bind,src=$PWD/kafka-mcp.yaml,dst=/config/kafka-mcp.yaml,readonly \
+    -e CONFIG_FILE=/config/kafka-mcp.yaml \
+    ghcr.io/denizgursoy/kafka-mcp:latest --server=false --endpoint local
+  ```
+
+- **MCP Registry**: listed as `io.github.denizgursoy/kafka-mcp` in the
+  [official registry](https://registry.modelcontextprotocol.io/v0.1/servers?search=io.github.denizgursoy/kafka-mcp),
+  with the image and the bundles, so a client that reads the registry can
+  install it from there.
+
+How releases reach the registry and the other catalogs is in
+[PUBLISHING.md](PUBLISHING.md).
+
 ## Configuration
 
 `kafka-mcp.{toml,yaml,yml,json}` in the working directory, `~/.config/kafka-mcp/` or `/etc` configures the server. The `http` block is used only with `--server`.

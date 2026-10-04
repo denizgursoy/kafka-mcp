@@ -12,7 +12,7 @@
     "kafka-local": {
       "type": "remote",
       "url": "http://localhost:8090/mcp/local",
-      "enabled": true
+      "enabled": false
     }
   }
 }

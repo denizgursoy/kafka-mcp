@@ -94,3 +94,6 @@ dockers:
   - "--label=org.opencontainers.image.revision={{.FullCommit}}"
   - "--label=org.opencontainers.image.version={{.Version}}"
   - "--label=org.opencontainers.image.source={{.GitURL}}"
+  # Proves to the MCP Registry that this image belongs to the server named in
+  # server.json. It must equal that file's "name".
+  - "--label=io.modelcontextprotocol.server.name=io.github.denizgursoy/kafka-mcp"
