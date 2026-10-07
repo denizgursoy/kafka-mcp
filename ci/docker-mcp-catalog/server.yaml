@@ -13,9 +13,9 @@ meta:
     - streaming
     - devops
 about:
-  title: Kafka MCP
+  title: Kafka Debugging
   description: Debug Kafka from an agent. Find a message by key or field, measure consumer lag and when it clears, unblock a stuck consumer, replay since a moment, compare two clusters. Read-only endpoints hide every tool that writes, and every write previews what it would change first.
-  icon: https://avatars.githubusercontent.com/u/47359?s=200&v=4
+  icon: https://avatars.githubusercontent.com/u/57708132?v=4
 source:
   project: https://github.com/denizgursoy/kafka-mcp
   commit: SET-TO-THE-RELEASED-COMMIT
