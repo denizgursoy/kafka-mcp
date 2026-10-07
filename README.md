@@ -3,6 +3,8 @@
 [![License](https://img.shields.io/github/license/denizgursoy/kafka-mcp?color=blue&style=flat-square)](https://raw.githubusercontent.com/denizgursoy/kafka-mcp/main/LICENSE)
 [![Coverage](https://img.shields.io/sonar/coverage/denizgursoy_kafka-mcp?logo=sonarcloud&server=https%3A%2F%2Fsonarcloud.io&style=flat-square)](https://sonarcloud.io/summary/overall?id=denizgursoy_kafka-mcp)
 [![Web](https://img.shields.io/badge/web-document-blueviolet?style=flat-square)](https://denizgursoy.github.io/kafka-mcp/)
+[![Release](https://img.shields.io/github/v/release/denizgursoy/kafka-mcp?style=flat-square)](https://github.com/denizgursoy/kafka-mcp/releases/latest)
+[![Kafka MCP server – quality and maintenance score on Glama](https://glama.ai/mcp/servers/denizgursoy/kafka-mcp/badges/score.svg)](https://glama.ai/mcp/servers/denizgursoy/kafka-mcp)
 
 An MCP server that exposes Kafka debugging as tools an LLM can call. It speaks
 MCP over stdio by default, optionally serves streamable HTTP, and talks to Kafka
