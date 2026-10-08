@@ -20,7 +20,11 @@ Pushing `v1.2.3` runs `.github/workflows/tag.yml`, which:
 3. **mcp-publisher** publishes that `server.json` to the
    [official MCP Registry](https://registry.modelcontextprotocol.io). It
    authenticates with GitHub OIDC, so no secret is involved.
-4. **Smithery** gets the Apple Silicon bundle, if `SMITHERY_API_KEY` is set.
+4. **Smithery** gets the Apple Silicon bundle, if `SMITHERY_API_KEY` is set. It
+   gets a copy without the bundle's tool list: Smithery treats those entries as
+   full tool definitions and rejects them for lacking an `inputSchema`, which a
+   bundle manifest may not carry. Smithery lists the tools by scanning the
+   server instead.
 
 Steps 3 and 4 skip prerelease tags such as `v1.2.3-rc1`, so a candidate can be
 released on GitHub without being listed.

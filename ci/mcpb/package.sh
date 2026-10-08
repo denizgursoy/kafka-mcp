@@ -7,6 +7,7 @@
 # Writes to dist/mcpb/:
 #   kafka-mcp_<version>_<os>_<arch>.mcpb   one bundle per platform
 #   server.json                            server.json with the OCI image and every bundle
+#   smithery.mcpb                          the Apple Silicon bundle without its tool list, for Smithery
 #   tools.json                             the tool list in the Docker MCP Catalog's format
 #
 # Needs jq and npx (for the official mcpb CLI).
@@ -119,6 +120,16 @@ for entry in "${platforms[@]}"; do
 
   echo "$file $sha"
 done
+
+# Smithery reads a bundle's tools as server-card tools and refuses any without
+# an inputSchema, which an MCPB manifest is not allowed to carry. Its copy of
+# the Apple Silicon bundle therefore omits the list; Smithery's page shows the
+# tools it finds by scanning the server instead.
+smithery=$probe/smithery
+mkdir -p "$smithery/server"
+cp "$probe/darwin-arm64/server/kafka-mcp" "$smithery/server/kafka-mcp"
+jq 'del(.tools)' "$probe/darwin-arm64/manifest.json" > "$smithery/manifest.json"
+$mcpb pack "$smithery" "$out/smithery.mcpb" > /dev/null
 
 jq --arg version "$version" --arg tag "$tag" --argjson mcpb "$packages" '
   .version = $version

@@ -46,7 +46,7 @@ jobs:
         run: ci/mcpb/package.sh "$GITHUB_REF_NAME"
 
       - name: Attach MCP Bundles to the release
-        run: gh release upload "$GITHUB_REF_NAME" dist/mcpb/*.mcpb dist/mcpb/server.json --clobber
+        run: gh release upload "$GITHUB_REF_NAME" dist/mcpb/kafka-mcp_*.mcpb dist/mcpb/server.json --clobber
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -62,4 +62,4 @@ jobs:
         # Smithery holds one bundle per server, up to 25 MB, so it gets the
         # Apple Silicon one. Skipped until SMITHERY_API_KEY is set.
         if: ${{ !contains(github.ref_name, '-') && env.SMITHERY_API_KEY != '' }}
-        run: npx -y smithery@1.2.0 mcp publish dist/mcpb/kafka-mcp_*_darwin_arm64.mcpb -n denizgursoy/kafka-mcp
+        run: npx -y smithery@1.2.0 mcp publish dist/mcpb/smithery.mcpb -n denizgursoy/kafka-mcp
