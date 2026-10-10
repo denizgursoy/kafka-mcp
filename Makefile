@@ -1,5 +1,5 @@
 PROJECT    := kafka-mcp
-MAIN_FILE := cmd/server/main.go
+MAIN_PKG := ./cmd/server
 
 BUILD_DATE := $(shell date -u '+%Y-%m-%d_%H:%M:%S')
 BUILD_COMMIT := $(shell git rev-parse --short HEAD)
@@ -49,7 +49,7 @@ build-container: build ## Build the container image with test tag
 .PHONY: run
 run: export CONFIG_FILE ?= kafka-mcp.local.yaml
 run: ## Run the HTTP server
-	go run -ldflags="-X main.date=$(BUILD_DATE) -X main.commit=$(BUILD_COMMIT) -X main.version=$(VERSION)" $(MAIN_FILE) --server
+	go run -ldflags="-X main.date=$(BUILD_DATE) -X main.commit=$(BUILD_COMMIT) -X main.version=$(VERSION)" $(MAIN_PKG) --server
 
 .PHONY: help
 help: ## Display this help screen
