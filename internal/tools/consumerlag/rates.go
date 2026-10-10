@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"sort"
 	"time"
 
 	"github.com/twmb/franz-go/pkg/kadm"
@@ -30,7 +31,19 @@ type ProduceRate struct {
 	LastSecond Window `json:"last_second"`
 	LastMinute Window `json:"last_minute"`
 	LastHour   Window `json:"last_hour"`
-	Note       string `json:"note"`
+
+	// Partitions breaks the counts down by partition, sorted. Uneven counts
+	// mean the keys send traffic unevenly, which more consumers cannot fix.
+	Partitions []PartitionRate `json:"partitions"`
+
+	Note string `json:"note"`
+}
+
+// PartitionRate is how many messages one partition received per window.
+type PartitionRate struct {
+	Partition  int32 `json:"partition"`
+	LastMinute int64 `json:"last_minute"`
+	LastHour   int64 `json:"last_hour"`
 }
 
 // SampledRate is a consume rate obtained by reading committed offsets twice.
@@ -82,25 +95,50 @@ func measureProduceRate(
 	now := time.Now()
 
 	rate := &ProduceRate{
-		Note: "measured from message timestamps, so these are real historical windows",
+		Partitions: []PartitionRate{},
+		Note:       "measured from message timestamps, so these are real historical windows",
 	}
+
+	byPartition := make(map[int32]*PartitionRate)
+	ends.Each(func(end kadm.ListedOffset) {
+		if end.Err == nil {
+			byPartition[end.Partition] = &PartitionRate{Partition: end.Partition}
+		}
+	})
 
 	for _, spec := range []struct {
 		name   string
 		length time.Duration
 		into   *Window
+		count  func(*PartitionRate) *int64
 	}{
-		{"last_second", time.Second, &rate.LastSecond},
-		{"last_minute", time.Minute, &rate.LastMinute},
-		{"last_hour", time.Hour, &rate.LastHour},
+		{"last_second", time.Second, &rate.LastSecond, nil},
+		{"last_minute", time.Minute, &rate.LastMinute, func(p *PartitionRate) *int64 { return &p.LastMinute }},
+		{"last_hour", time.Hour, &rate.LastHour, func(p *PartitionRate) *int64 { return &p.LastHour }},
 	} {
-		window, err := produceWindow(ctx, admin, topic, spec.name, spec.length, ends, now, oldest)
+		window, perPartition, err := produceWindow(ctx, admin, topic, spec.name, spec.length, ends, now, oldest)
 		if err != nil {
 			return nil, err
 		}
 
 		*spec.into = window
+
+		if spec.count == nil {
+			continue
+		}
+		for partition, produced := range perPartition {
+			if entry := byPartition[partition]; entry != nil {
+				*spec.count(entry) = produced
+			}
+		}
 	}
+
+	for _, entry := range byPartition {
+		rate.Partitions = append(rate.Partitions, *entry)
+	}
+	sort.Slice(rate.Partitions, func(i, j int) bool {
+		return rate.Partitions[i].Partition < rate.Partitions[j].Partition
+	})
 
 	return rate, nil
 }
@@ -116,16 +154,17 @@ func produceWindow(
 	ends kadm.ListedOffsets,
 	now time.Time,
 	oldest *time.Time,
-) (Window, error) {
+) (Window, map[int32]int64, error) {
 
 	from := now.Add(-length)
 
 	at, err := admin.ListOffsetsAfterMilli(ctx, from.UnixMilli(), topic)
 	if err != nil {
-		return Window{}, fmt.Errorf("resolve %s window for %q: %w", name, topic, err)
+		return Window{}, nil, fmt.Errorf("resolve %s window for %q: %w", name, topic, err)
 	}
 
 	window := Window{Window: name}
+	perPartition := make(map[int32]int64)
 
 	at.Each(func(offset kadm.ListedOffset) {
 		if offset.Err != nil {
@@ -140,6 +179,7 @@ func produceWindow(
 		produced := end.Offset - offset.Offset
 		if produced > 0 {
 			window.Messages += produced
+			perPartition[offset.Partition] = produced
 		}
 	})
 
@@ -158,7 +198,7 @@ func produceWindow(
 	}
 
 	if seconds <= 0 {
-		return window, nil
+		return window, perPartition, nil
 	}
 
 	perSecond := float64(window.Messages) / seconds
@@ -167,7 +207,7 @@ func produceWindow(
 	window.PerMinute = round(perSecond*60, 3)
 	window.PerHour = round(perSecond*3600, 3)
 
-	return window, nil
+	return window, perPartition, nil
 }
 
 // oldestTimestamp returns the timestamp of the topic's earliest surviving

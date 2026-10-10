@@ -1,7 +1,10 @@
 package listtopics_test
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/suite"
 	"github.com/twmb/franz-go/pkg/kadm"
@@ -97,6 +100,23 @@ func (s *ListTopicsSuite) TestReportsTheShapeOfEachTopic() {
 		s.Require().False(reported.Internal,
 			"a topic created by a caller is not internal, and saying otherwise would hide it from default listings")
 	})
+}
+
+func (s *ListTopicsSuite) TestReportsAndFiltersBySize() {
+	big := s.env.CreateTopic(s.T(), "size-big")
+	small := s.env.CreateTopic(s.T(), "size-small")
+	s.env.Produce(s.T(), big, testenv.Message{Value: incompressible(20000)})
+
+	var out listtopics.Output
+	s.Require().Eventually(func() bool {
+		out = s.list(listtopics.Input{Script: `return topic.indexOf("size-") >= 0 && size_bytes >= 20000`})
+		return len(out.Topics) == 1
+	}, 15*time.Second, 250*time.Millisecond,
+		"size_bytes must be in the script's scope, so 'which topics are biggest' is one call")
+
+	s.Require().Equal(big, out.Topics[0].Topic, "only the topic holding 20 KB passes the size filter")
+	s.Require().GreaterOrEqual(out.Topics[0].SizeBytes, int64(20000), "the size is reported beside the name")
+	s.Require().NotContains(names(out), small, "an empty topic is far below the threshold")
 }
 
 func (s *ListTopicsSuite) TestFiltersByNameWithAScript() {
@@ -205,6 +225,17 @@ func (s *ListTopicsSuite) TestRejectsAScriptThatDoesNotCompile() {
 		"a malformed script must be refused before any topic is read, rather than failing once per topic")
 }
 
+func (s *ListTopicsSuite) TestRejectsAnUnboundedTimeout() {
+	_, err := listtopics.Run(
+		s.T().Context(),
+		s.env.Admin(),
+		listtopics.Input{Script: `return true`, TimeoutSecond: 1 << 30},
+	)
+
+	s.Require().ErrorContains(err, "timeout_seconds",
+		"a timeout of years is no timeout, so a runaway predicate would hold the call that long")
+}
+
 func (s *ListTopicsSuite) TestCountsTopicsTheScriptThrowsOn() {
 	s.env.CreateTopic(s.T(), "throwing-script")
 
@@ -252,4 +283,13 @@ func (s *ListTopicsSuite) TestReturnsErrorWhenBrokerUnreachable() {
 
 	s.Require().Error(err,
 		"an unreachable broker must surface as an error, not as an empty topic list")
+}
+
+// incompressible returns n bytes of random hex, so the size the brokers report
+// is not shrunk by compression.
+func incompressible(n int) string {
+	raw := make([]byte, n/2)
+	_, _ = rand.Read(raw)
+
+	return hex.EncodeToString(raw)
 }

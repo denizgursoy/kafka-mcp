@@ -1047,3 +1047,21 @@ func (e *Environment) OpenTransaction(t *testing.T, topic string, transactionalI
 
 	return end
 }
+
+// TruncateBefore deletes every record below offset in one partition, the way
+// retention would, so a test can put a group's commit below the log start.
+func (e *Environment) TruncateBefore(t *testing.T, topic string, partition int32, offset int64) {
+	t.Helper()
+
+	offsets := kadm.Offsets{}
+	offsets.Add(kadm.Offset{Topic: topic, Partition: partition, At: offset})
+
+	responses, err := e.admin.DeleteRecords(t.Context(), offsets)
+	if err != nil {
+		t.Fatalf("delete records in %s/%d before %d: %v", topic, partition, offset, err)
+	}
+
+	if err := responses.Error(); err != nil {
+		t.Fatalf("delete records in %s/%d before %d: %v", topic, partition, offset, err)
+	}
+}

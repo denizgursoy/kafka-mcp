@@ -281,6 +281,17 @@ func (s *ProduceMessageSuite) TestDryRunWritesNothing() {
 	})
 }
 
+func (s *ProduceMessageSuite) TestPreviewShowsTheChosenPartition() {
+	topic := s.env.CreateTopicWithPartitions(s.T(), "produce-preview-partition", 4)
+	partition := int32(3)
+
+	out, err := s.produceOne(s.client(false), "here", false, producemessage.Item{Topic: topic, Value: "v", Partition: &partition})
+
+	s.Require().NoError(err, "a preview with an explicit partition must succeed")
+	s.Require().Equal(int32(3), out.Message.Partition,
+		"the preview must show the partition the caller chose, or it misdescribes where the message will land")
+}
+
 func (s *ProduceMessageSuite) TestProducesBase64Value() {
 	topic := s.env.CreateTopic(s.T(), "produce-base64")
 

@@ -11,7 +11,7 @@ service write to orders", or "what is this user allowed to do".
 
 | Tool            | Use it for                                                    |
 | --------------- | ------------------------------------------------------------- |
-| `server_config` | The principal **this server** connects as, which is not the client's |
+| `server_config` | The identity **this server** connects as (`sasl_user`, `sasl_options`), which is not the client's |
 | `list_acls`     | The ACLs for a principal, a resource, or both                 |
 
 ## Steps
@@ -75,7 +75,10 @@ cluster's administrators, and the precise request from step 3 is what they need.
 - `SECURITY_DISABLED` means the broker has no authorizer, so ACLs are not
   enforced at all. Then an authorization error is not coming from ACLs; check
   whether a proxy or a managed service's own IAM layer is refusing the client.
-- `server_config` reports the principal **this server** uses. Listing ACLs needs
+- `server_config` reports the SASL identity **this server** uses, in
+  `sasl_user` and `sasl_options`; with SASL/SCRAM or PLAIN the principal is
+  `User:<sasl_user>`. An mTLS certificate identity is not reported, and neither
+  is an OAuth token's subject; ask the operator for those. Listing ACLs needs
   `describe` on the cluster for that principal; a refusal there is about this
   server's rights, not the client's.
 - `read_only` on an endpoint is this server's own policy and never shows up in

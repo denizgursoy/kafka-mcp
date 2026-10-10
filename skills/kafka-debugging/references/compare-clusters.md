@@ -12,11 +12,10 @@ is missing.
 
 | Tool               | Use it for                                              |
 | ------------------ | -------------------------------------------------------- |
-| `list_clusters`    | Which cluster names are valid, and which accept writes   |
+| `list_clusters`    | Which cluster names are valid, and which this session may write to |
 | `compare_clusters` | The difference itself: missing topics and config drift   |
 | `describe_topic`   | The full configuration of one topic, when drift needs detail |
 | `server_config`    | Checking this endpoint may create anything, before promising it |
-| `create_topic`     | Creating the topics the user chose                        |
 | `alter_topic_config` | Bringing a drifted config in line, once the user chose a side |
 | `create_topic`     | Creating the topics that are missing                     |
 
@@ -77,7 +76,10 @@ A missing topic is obvious. Drift is the thing that wastes an afternoon:
 Only configs a topic sets for itself are compared. Two clusters may carry
 different broker defaults, and comparing inherited values would report every
 topic as different. If the user suspects a default differs, call
-`describe_topic` on both sides and compare `is_default` entries directly.
+`describe_topic` here and compare its `is_default` entries with the same call
+made on an endpoint bound to the other cluster. `describe_topic` only reads the
+cluster of the endpoint it is called on, so the other side needs a session on
+that cluster's endpoint.
 
 ### 5. Do not assume a difference is a mistake
 

@@ -62,7 +62,11 @@ type SASL struct {
 
 // TLS controls transport encryption to the brokers.
 type TLS struct {
-	Enabled  bool   `cfg:"enabled"`
+	Enabled bool `cfg:"enabled"`
+	// InsecureSkipVerify disables server certificate and hostname
+	// verification. Unsafe outside a test environment.
+	InsecureSkipVerify bool `cfg:"insecure_skip_verify"`
+
 	CAFile   string `cfg:"ca_file"`
 	CertFile string `cfg:"cert_file"`
 	KeyFile  string `cfg:"key_file"`
@@ -103,6 +107,12 @@ type HTTP struct {
 	Address  string `cfg:"address" default:":8090"`
 	BasePath string `cfg:"base_path"`
 
+	// AuthToken, when set, is required as "Authorization: Bearer <token>" on
+	// every MCP request. Accepts {env:VAR}. Empty means no inbound
+	// authentication, which is only safe where nothing untrusted can reach
+	// the listener.
+	AuthToken string `cfg:"auth_token" log:"false"`
+
 	// CORS is ada's own CORS configuration, filled straight from the config
 	// file. Its `cfg` tags are the config keys, so the middleware gains an
 	// option and this server gains it with it, without a mapping in between
@@ -120,12 +130,11 @@ type HTTP struct {
 // talk to this server at all.
 func DefaultCORS() mcors.Cors {
 	return mcors.Cors{
-		// Every origin, because the endpoints are otherwise unreachable from
-		// a browser and this is a debugging tool. It is also the widest the
-		// policy ever gets: an allowed origin can drive every tool with the
-		// server's Kafka credentials, so a deployment that can reach a
-		// cluster worth protecting should narrow it.
-		AllowOrigins: []string{"*"},
+		// No origin. An allowed origin can drive every tool with the server's
+		// Kafka credentials, so a page the user merely visits must not be able
+		// to. Command-line clients send no Origin and are unaffected; a
+		// browser client is enabled by naming its origin.
+		AllowOrigins: []string{},
 
 		// The streamable HTTP transport posts requests, opens the event
 		// stream with GET, and ends the session with DELETE.
@@ -180,11 +189,12 @@ type cluster struct {
 // Connection details deliberately stay in cluster so several endpoints can
 // reuse one Kafka client without repeating credentials.
 type endpoint struct {
-	Cluster     string          `cfg:"cluster"`
-	Path        string          `cfg:"path"`
-	Description string          `cfg:"description"`
-	ReadOnly    bool            `cfg:"read_only"`
-	Tools       map[string]bool `cfg:"tools"`
+	Cluster      string          `cfg:"cluster"`
+	Path         string          `cfg:"path"`
+	Description  string          `cfg:"description"`
+	ReadOnly     bool            `cfg:"read_only"`
+	Tools        map[string]bool `cfg:"tools"`
+	Destinations []string        `cfg:"destinations"`
 }
 
 // file mirrors the whole config file.
@@ -247,6 +257,12 @@ type Endpoint struct {
 	Description string
 	ReadOnly    bool
 	Tools       map[string]bool
+
+	// Destinations are the other clusters this endpoint's cross-cluster tools
+	// may write to, sorted. Empty means none: a session can only write to its
+	// own cluster, and only when ReadOnly is false. A listed cluster that is
+	// itself read_only still refuses.
+	Destinations []string
 }
 
 // ToolEnabled reports whether this endpoint should expose a tool.
@@ -372,6 +388,12 @@ func Load(ctx context.Context) (*Config, error) {
 		Endpoints: make(map[string]*Endpoint),
 	}
 
+	token, err := interpolate(cfg.HTTP.AuthToken, "http")
+	if err != nil {
+		return nil, fmt.Errorf("http.auth_token: %w", err)
+	}
+	cfg.HTTP.AuthToken = token
+
 	basePath, err := normalizeBasePath(cfg.HTTP.BasePath)
 	if err != nil {
 		return nil, err
@@ -394,17 +416,7 @@ func Load(ctx context.Context) (*Config, error) {
 	}
 
 	if len(parsed.Endpoints) == 0 {
-		// Compatibility with the original format, where each cluster was also
-		// its endpoint and was reached at /mcp/<cluster>.
-		for name, cluster := range cfg.Clusters {
-			cfg.Endpoints[name] = &Endpoint{
-				Name:     name,
-				Cluster:  name,
-				Path:     "/mcp/" + name,
-				ReadOnly: cluster.ReadOnly,
-				Tools:    copyToolPolicy(cluster.Tools),
-			}
-		}
+		cfg.Endpoints = LegacyEndpoints(cfg.Clusters)
 	} else {
 		paths := make(map[string]string, len(parsed.Endpoints))
 		for name, parsedEndpoint := range parsed.Endpoints {
@@ -422,6 +434,61 @@ func Load(ctx context.Context) (*Config, error) {
 	}
 
 	return cfg, nil
+}
+
+// LegacyEndpoints builds the endpoints of the original format, where each
+// cluster was also its endpoint and was reached at /mcp/<cluster>. Cross-
+// cluster writes then reached every other cluster, so each endpoint lists
+// all of them as destinations; a read_only cluster still refuses.
+func LegacyEndpoints(clusters map[string]*Cluster) map[string]*Endpoint {
+	endpoints := make(map[string]*Endpoint, len(clusters))
+
+	for name, cluster := range clusters {
+		destinations := make([]string, 0, len(clusters)-1)
+		for other := range clusters {
+			if other != name {
+				destinations = append(destinations, other)
+			}
+		}
+		sort.Strings(destinations)
+
+		endpoints[name] = &Endpoint{
+			Name:         name,
+			Cluster:      name,
+			Path:         "/mcp/" + name,
+			ReadOnly:     cluster.ReadOnly,
+			Tools:        copyToolPolicy(cluster.Tools),
+			Destinations: destinations,
+		}
+	}
+
+	return endpoints
+}
+
+func resolveDestinations(name string, parsed *endpoint, clusters map[string]*Cluster) ([]string, error) {
+	seen := make(map[string]struct{}, len(parsed.Destinations))
+	destinations := make([]string, 0, len(parsed.Destinations))
+
+	for _, destination := range parsed.Destinations {
+		destination = strings.TrimSpace(destination)
+		if destination == parsed.Cluster {
+			return nil, fmt.Errorf(
+				"endpoint %q lists its own cluster %q in destinations; writing to it is governed by read_only",
+				name, destination)
+		}
+		if clusters[destination] == nil {
+			return nil, fmt.Errorf("endpoint %q destinations names unknown cluster %q", name, destination)
+		}
+		if _, dup := seen[destination]; dup {
+			continue
+		}
+		seen[destination] = struct{}{}
+		destinations = append(destinations, destination)
+	}
+
+	sort.Strings(destinations)
+
+	return destinations, nil
 }
 
 func resolveEndpoint(name string, parsed *endpoint, clusters map[string]*Cluster) (*Endpoint, error) {
@@ -455,13 +522,19 @@ func resolveEndpoint(name string, parsed *endpoint, clusters map[string]*Cluster
 		tools[tool] = enabled
 	}
 
+	destinations, err := resolveDestinations(name, parsed, clusters)
+	if err != nil {
+		return nil, err
+	}
+
 	return &Endpoint{
-		Name:        name,
-		Cluster:     parsed.Cluster,
-		Path:        endpointPath,
-		Description: strings.TrimSpace(parsed.Description),
-		ReadOnly:    cluster.ReadOnly || parsed.ReadOnly,
-		Tools:       tools,
+		Name:         name,
+		Cluster:      parsed.Cluster,
+		Path:         endpointPath,
+		Description:  strings.TrimSpace(parsed.Description),
+		ReadOnly:     cluster.ReadOnly || parsed.ReadOnly,
+		Tools:        tools,
+		Destinations: destinations,
 	}, nil
 }
 

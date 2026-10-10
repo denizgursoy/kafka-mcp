@@ -3,6 +3,7 @@ package consumerlag_test
 import (
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/suite"
 	"github.com/twmb/franz-go/pkg/kadm"
@@ -48,7 +49,7 @@ func (s *ConsumerLagSuite) lagOn(
 	s.T().Helper()
 
 	out, err := consumerlag.Run(
-		s.T().Context(), admin,
+		s.T().Context(), admin, s.env.Reader(),
 		consumerlag.Input{Items: []consumerlag.Item{item}},
 	)
 	if err != nil {
@@ -294,11 +295,130 @@ func (s *ConsumerLagSuite) TestMeasuresEveryGroupWhenNoneIsNamed() {
 		"the group that committed four of six messages is two behind")
 }
 
+func (s *ConsumerLagSuite) TestFlagsACommitThatRetentionDeleted() {
+	topic := s.env.CreateTopic(s.T(), "lag-expired")
+	s.env.Produce(s.T(), topic, s.messages(10)...)
+
+	group := s.env.UniqueName("lag-expired-group")
+	s.env.ConsumeAndCommit(s.T(), topic, group, 2)
+	s.env.TruncateBefore(s.T(), topic, 0, 6)
+
+	out, err := s.lag(consumerlag.Item{Topic: topic, Group: group, SkipConsumeRate: true})
+	s.Require().NoError(err, "measuring a group whose commit was deleted must succeed")
+
+	partition := out.Groups[0].Partitions[0]
+
+	s.Run("the log start is reported", func() {
+		s.Require().EqualValues(6, partition.StartOffset,
+			"without the start offset a caller cannot tell a large lag from a position that no longer exists")
+	})
+	s.Run("the expired commit is flagged", func() {
+		s.Require().True(partition.OffsetExpired,
+			"a commit below the log start means the consumer will hit OFFSET_OUT_OF_RANGE and reset, which is a different problem from being slow")
+	})
+	s.Run("the group carries a warning", func() {
+		s.Require().NotEmpty(out.Groups[0].Warnings,
+			"an expired position decides what happens on the next restart, so it must not hide in a per-partition flag")
+	})
+}
+
+func (s *ConsumerLagSuite) TestALiveCommitIsNotFlagged() {
+	topic := s.env.CreateTopic(s.T(), "lag-not-expired")
+	s.env.Produce(s.T(), topic, s.messages(5)...)
+
+	group := s.env.UniqueName("lag-not-expired-group")
+	s.env.ConsumeAndCommit(s.T(), topic, group, 2)
+
+	out, err := s.lag(consumerlag.Item{Topic: topic, Group: group, SkipConsumeRate: true})
+	s.Require().NoError(err, "measuring lag must succeed")
+
+	s.Require().False(out.Groups[0].Partitions[0].OffsetExpired,
+		"a commit inside the retained log must not be reported as lost")
+}
+
+func (s *ConsumerLagSuite) TestMeasuresBacklogAge() {
+	old := time.Now().Add(-2 * time.Hour).Truncate(time.Millisecond)
+	topic := s.env.CreateTopicWithConfig(s.T(), "lag-age", map[string]string{"retention.ms": "10800000"})
+	s.env.Produce(s.T(), topic,
+		testenv.Message{Value: "consumed", Timestamp: old.Add(-time.Minute)},
+		testenv.Message{Value: "oldest unconsumed", Timestamp: old},
+		testenv.Message{Value: "newer", Timestamp: time.Now()},
+	)
+
+	group := s.env.UniqueName("lag-age-group")
+	s.env.ConsumeAndCommit(s.T(), topic, group, 1)
+
+	out, err := s.lag(consumerlag.Item{Topic: topic, Group: group, SkipConsumeRate: true, MeasureBacklogAge: true})
+	s.Require().NoError(err, "measuring backlog age must succeed")
+
+	measured := out.Groups[0]
+	partition := measured.Partitions[0]
+
+	s.Run("the next unconsumed message's time is reported", func() {
+		s.Require().NotNil(partition.CommittedTimestamp, "the age is read from the message at the committed offset")
+		s.Require().True(old.Equal(*partition.CommittedTimestamp),
+			"the committed offset points at the next message to consume, whose timestamp is the backlog's start")
+	})
+	s.Run("the age is in seconds", func() {
+		s.Require().NotNil(partition.LagSeconds, "a lag in messages says nothing about time; the age is what retention compares against")
+		s.Require().InDelta(7200, *partition.LagSeconds, 120, "the oldest unconsumed message is two hours old")
+	})
+	s.Run("the group reports its oldest unconsumed message", func() {
+		s.Require().NotNil(measured.OldestUnconsumedAt, "the group's age is its oldest partition")
+		s.Require().True(old.Equal(*measured.OldestUnconsumedAt), "the oldest partition decides")
+	})
+	s.Run("retention risk compares age with retention", func() {
+		s.Require().NotNil(out.RetentionMs, "the topic's retention must be reported beside the age")
+		s.Require().EqualValues(10800000, *out.RetentionMs, "the topic sets three hours")
+		s.Require().True(measured.RetentionRisk,
+			"two hours of a three-hour retention is past the warning threshold: the backlog will be deleted before it is consumed if nothing changes")
+	})
+}
+
+func (s *ConsumerLagSuite) TestBacklogAgeIsOptional() {
+	topic := s.env.CreateTopic(s.T(), "lag-age-off")
+	s.env.Produce(s.T(), topic, s.messages(3)...)
+	group := s.env.UniqueName("lag-age-off-group")
+	s.env.ConsumeAndCommit(s.T(), topic, group, 1)
+
+	out, err := s.lag(consumerlag.Item{Topic: topic, Group: group, SkipConsumeRate: true})
+	s.Require().NoError(err, "measuring lag must succeed")
+
+	s.Require().Nil(out.Groups[0].Partitions[0].LagSeconds,
+		"reading a message per lagging partition costs a fetch each, so it happens only when asked for")
+}
+
+func (s *ConsumerLagSuite) TestReportsProduceRatePerPartition() {
+	topic := s.env.CreateTopicWithPartitions(s.T(), "lag-partition-rate", 2)
+	s.env.Produce(s.T(), topic,
+		testenv.Message{Value: "a", Partition: 0},
+		testenv.Message{Value: "b", Partition: 0},
+		testenv.Message{Value: "c", Partition: 0},
+		testenv.Message{Value: "d", Partition: 1},
+	)
+
+	out, err := s.lag(consumerlag.Item{Topic: topic, SkipConsumeRate: true})
+	s.Require().NoError(err, "measuring produce rate must succeed")
+
+	s.Require().Len(out.ProduceRate.Partitions, 2, "every partition must be reported, sorted")
+	s.Require().EqualValues(0, out.ProduceRate.Partitions[0].Partition, "partitions must be sorted")
+	s.Require().EqualValues(3, out.ProduceRate.Partitions[0].LastHour,
+		"a per-partition count is what tells key skew (one partition gets the traffic) from a slow consumer")
+	s.Require().EqualValues(1, out.ProduceRate.Partitions[1].LastHour, "the other partition's count must be its own")
+}
+
 func (s *ConsumerLagSuite) TestErrorsOnUnknownTopic() {
 	_, err := s.lag(consumerlag.Item{Topic: s.env.UniqueName("missing"), SkipConsumeRate: true})
 
 	s.Require().Error(err,
 		"a topic that does not exist must fail rather than report a topic nobody is behind on")
+}
+
+func (s *ConsumerLagSuite) TestRejectsAnUnboundedSampleWindow() {
+	_, err := s.lag(consumerlag.Item{Topic: "t", SampleSeconds: 1 << 30})
+
+	s.Require().ErrorContains(err, "sample_seconds",
+		"the call blocks for the whole window, so an unbounded one holds the request open indefinitely")
 }
 
 func (s *ConsumerLagSuite) TestErrorsOnUnknownGroup() {
@@ -341,7 +461,7 @@ func (s *ConsumerLagSuite) TestBatchMeasuresSeveralTopics() {
 	s.env.ConsumeAndCommit(s.T(), first, firstGroup, 1)
 	s.env.ConsumeAndCommit(s.T(), second, secondGroup, 2)
 
-	out, err := consumerlag.Run(s.T().Context(), s.env.Admin(), consumerlag.Input{
+	out, err := consumerlag.Run(s.T().Context(), s.env.Admin(), s.env.Reader(), consumerlag.Input{
 		Items: []consumerlag.Item{
 			{Topic: first, Group: firstGroup, SkipConsumeRate: true},
 			{Topic: second, Group: secondGroup, SkipConsumeRate: true},

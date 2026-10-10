@@ -47,6 +47,14 @@ type Problem struct {
 	Offline   []int32  `json:"offline_replicas,omitempty"`
 	MinISR    *int     `json:"min_insync_replicas,omitempty"`
 	Error     string   `json:"error,omitempty"`
+
+	// Reassigning is true when the partition is being moved between brokers.
+	// A replica being added is out of sync until it catches up, so
+	// under_replicated during a reassignment is expected rather than an
+	// outage.
+	Reassigning      bool    `json:"reassigning,omitempty"`
+	AddingReplicas   []int32 `json:"adding_replicas,omitempty"`
+	RemovingReplicas []int32 `json:"removing_replicas,omitempty"`
 }
 
 // Summary counts the checked partitions by condition. A partition with
@@ -58,6 +66,8 @@ type Summary struct {
 	UnderReplicated int `json:"under_replicated"`
 	UnderMinISR     int `json:"under_min_isr"`
 	Errored         int `json:"errored"`
+	// Reassigning counts problem partitions that are mid-reassignment.
+	Reassigning int `json:"reassigning"`
 }
 
 // Output is the result returned by the cluster_health tool.
@@ -96,6 +106,10 @@ A problem partition lists its issues:
 - under_min_isr: fewer in-sync replicas than the topic's min.insync.replicas,
   so producers using acks=all fail with NOT_ENOUGH_REPLICAS.
 - error: the broker returned an error for the partition.
+
+A problem partition with reassigning true is being moved between brokers;
+adding_replicas catch up before joining the ISR, so under_replicated there is
+expected while the move runs, not an outage.
 
 healthy is true only when there are no problems. Use search to limit the check
 to topics whose name contains a substring (case-insensitive); internal topics
@@ -215,6 +229,21 @@ func Run(ctx context.Context, admin *kadm.Client, input Input) (Output, error) {
 			}
 
 			out.Problems = append(out.Problems, problem)
+		}
+	}
+
+	if len(out.Problems) > 0 {
+		reassignments, err := admin.ListPartitionReassignments(ctx, problemSet(out.Problems))
+		if err != nil {
+			out.Warnings = append(out.Warnings, fmt.Sprintf(
+				"could not list partition reassignments, so a moving partition may look like an outage: %v", err))
+		} else {
+			out.Problems = MarkReassigning(out.Problems, reassignments)
+			for _, problem := range out.Problems {
+				if problem.Reassigning {
+					out.Summary.Reassigning++
+				}
+			}
 		}
 	}
 
@@ -369,4 +398,33 @@ func sortedCopy(values []int32) []int32 {
 	slices.Sort(out)
 
 	return out
+}
+
+// MarkReassigning labels the problems whose partition is being reassigned.
+func MarkReassigning(problems []Problem, reassignments kadm.ListPartitionReassignmentsResponses) []Problem {
+	for i := range problems {
+		moving, ok := reassignments[problems[i].Topic][problems[i].Partition]
+		if !ok || (len(moving.AddingReplicas) == 0 && len(moving.RemovingReplicas) == 0) {
+			continue
+		}
+
+		problems[i].Reassigning = true
+		problems[i].AddingReplicas = sortedCopy(moving.AddingReplicas)
+		problems[i].RemovingReplicas = sortedCopy(moving.RemovingReplicas)
+	}
+
+	return problems
+}
+
+// problemSet names the partitions to ask about, so the request stays as small
+// as the problem list rather than covering the whole cluster.
+func problemSet(problems []Problem) kadm.TopicsSet {
+	set := make(kadm.TopicsSet)
+	for _, problem := range problems {
+		if problem.Partition >= 0 {
+			set.Add(problem.Topic, problem.Partition)
+		}
+	}
+
+	return set
 }

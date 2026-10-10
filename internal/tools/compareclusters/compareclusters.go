@@ -188,7 +188,7 @@ func compare(
 			"cluster is required: use list_clusters to see which clusters this server serves")
 	}
 
-	there := clusters.Get(item.Cluster)
+	there := clusters.Exposed(item.Cluster)
 	if there == nil {
 		return Output{}, fmt.Errorf(
 			"unknown cluster %q: use list_clusters to see which clusters this server serves",

@@ -190,18 +190,27 @@ func newHTTPServer(cfg *config.Config, servers map[string]*mcp.Server) *ada.Serv
 	)
 
 	server := ada.New()
-	server.Use(
+	middlewares := []func(http.Handler) http.Handler{
 		mrecover.Middleware(),
-		mserver.Middleware("kafka-mcp/"+version),
-		mcors.Middleware(mcors.WithConfig(cfg.HTTP.CORS)),
+		mserver.Middleware("kafka-mcp/" + version),
+	}
+	// ada reads an empty origin list as "*", so with no origin configured the
+	// CORS middleware is left out rather than advertising every origin; guard
+	// then refuses browser requests outright.
+	if len(cfg.HTTP.CORS.AllowOrigins) > 0 {
+		middlewares = append(middlewares, mcors.Middleware(mcors.WithConfig(cfg.HTTP.CORS)))
+	}
+	middlewares = append(middlewares,
 		mrequestid.Middleware(),
 		mlog.Middleware(),
 		mtelemetry.Middleware(),
 	)
+	server.Use(middlewares...)
 	// Routes are exact. In particular /mcp and /mcp/rw may safely describe
 	// different permissions without the shorter path capturing the longer one.
+	protected := guard(cfg.HTTP, handler)
 	for endpointPath := range byPath {
-		server.Handle(endpointPath, handler)
+		server.Handle(endpointPath, protected)
 	}
 
 	// A liveness endpoint that needs no MCP session, so a container

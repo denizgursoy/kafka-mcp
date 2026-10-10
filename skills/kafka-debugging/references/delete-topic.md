@@ -123,7 +123,7 @@ Deletion does not end at the broker. Tell the user what still needs doing:
   a topic that gained messages since the caller looked is still caught by the
   acknowledgement.
 - If the broker refuses with an authorization error, the fix is a Kafka ACL:
-  deleting needs `DELETE` on the topic for the principal this server connects
+  deleting needs `delete` on the topic for the principal this server connects
   as. That is a request to whoever administers the cluster, not something to
   work around.
 - A topic deleted to "fix" a problem usually does not fix it. A poison message

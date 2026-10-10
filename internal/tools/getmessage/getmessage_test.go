@@ -185,6 +185,19 @@ func (s *GetMessageSuite) TestErrorsOnOffsetPastEnd() {
 		"an offset beyond the end of the partition must fail rather than hang or return nothing")
 }
 
+func (s *GetMessageSuite) TestRejectsUnboundedInputs() {
+	s.Run("context beyond the limit", func() {
+		_, err := s.get(getmessage.Item{Topic: "t", Offset: 5, Context: 1 << 62})
+		s.Require().ErrorContains(err, "context",
+			"an unbounded context sizes an allocation from caller input, which can crash the server or read a whole partition into memory")
+	})
+	s.Run("max_value_bytes beyond the limit", func() {
+		_, err := s.get(getmessage.Item{Topic: "t", Offset: 5, MaxValueBytes: 1 << 40})
+		s.Require().ErrorContains(err, "max_value_bytes",
+			"a response is held in memory and sent to a model, so it must stay bounded")
+	})
+}
+
 func (s *GetMessageSuite) TestErrorsOnUnknownPartition() {
 	topic := s.env.CreateTopic(s.T(), "get-bad-partition")
 

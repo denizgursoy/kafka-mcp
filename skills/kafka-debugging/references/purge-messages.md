@@ -35,24 +35,31 @@ or configuration, [delete-topic.md](delete-topic.md) is simpler.
 
 ### 2. Establish the cut, per partition
 
-Every item is one partition and one `before_offset`: every message below it is
+An item cuts one partition at `before_offset`: every message below it is
 deleted, the message at it is kept and becomes the first readable one.
 
 - **Emptying a partition** — use its end offset from `describe_topic`.
-- **Up to a moment** — find the first offset at or after that time with
-  `search_messages` (`from_timestamp`, `direction: oldest_first`,
-  `max_matches: 1`) on each partition.
+- **Up to a moment** — give `before_timestamp` instead of an offset. The tool
+  resolves it per partition to the first offset written at or after that time.
+  With `all_partitions: true` one item covers every partition of the topic:
+  the preview lists each partition's resolved cut in `partitions`, and skips
+  partitions holding nothing older. Do not look the offsets up by hand.
 - **Up to a bad run of messages** — find the first good message's offset and
   cut there.
 
+A `before_offset` at or below a partition's current start is refused for that
+item: those messages are already gone, so there is nothing to cut.
+
 Partitions are independent. Offset 812 in partition 0 and offset 812 in
 partition 1 are unrelated messages, so never reuse one partition's cut for
-another.
+another. This is why `all_partitions` takes only a timestamp: an offset means
+nothing across partitions.
 
 ### 3. Preview
 
 Call `delete_records` with **`confirm` omitted**. Each item reports
-`messages_deleted` and `affected_groups`: every consumer group whose committed
+`messages_deleted` and `affected_groups` (per partition under `partitions` for
+an `all_partitions` item): every consumer group whose committed
 offset is below the cut, with `unprocessed_lost` — messages it will never
 process. Those groups resume from the new start offset.
 
@@ -104,5 +111,5 @@ the group left off. Say so.
 - Deleting records does not reclaim disk at once: whole segments below the new
   start offset are removed, and the rest become unreadable but stay on disk
   until their segment rolls.
-- An authorization error means the principal needs `DELETE` on the topic or the
+- An authorization error means the principal needs `delete` on the topic or the
   group; see [authorization-error.md](authorization-error.md).

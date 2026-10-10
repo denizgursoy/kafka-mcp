@@ -29,21 +29,22 @@ export const tools = [
       sasl_user: 'kafka-mcp-readonly',
       tls: true,
       read_only: true,
+      destinations: ['preprod'],
       tools: ['compare_clusters', 'consumer_lag', 'copy_message', 'describe_topic', '…'],
     },
   },
   {
     name: 'list_clusters',
     group: 'discover',
-    summary: 'Every cluster this server serves, whether it is reachable now, and whether it accepts writes.',
+    summary: 'Every cluster this server serves, whether it is reachable now, and whether this session may write to it.',
     detail:
-      'Reachability is checked at call time. Only names are reported, never brokers or credentials, because every endpoint can call it.',
+      'Reachability is checked at call time. writable is the answer for this endpoint: its own cluster unless it is read_only, another only when listed in its destinations. Only names are reported, never brokers or credentials, because every endpoint can call it.',
     params: [],
     call: {},
     result: {
       clusters: [
-        { name: 'prod', connected: true, read_only: true },
-        { name: 'preprod', connected: true, read_only: false },
+        { name: 'prod', connected: true, read_only: true, writable: false },
+        { name: 'preprod', connected: true, read_only: false, writable: true },
       ],
       count: 2,
     },
@@ -51,16 +52,16 @@ export const tools = [
   {
     name: 'list_topics',
     group: 'discover',
-    summary: 'Topics with partition count, replication factor and the configs each sets for itself.',
+    summary: 'Topics with partition count, replication factor, the configs each sets for itself, and size on disk.',
     detail:
-      'The script is a JavaScript predicate over topic, partitions, replication_factor, internal and configs. A topic whose script throws is counted in script_errors, so a broken filter never looks like an empty cluster.',
+      'The script is a JavaScript predicate over topic, partitions, replication_factor, internal, configs and size_bytes, so "which topics fill the disk" is one call. A topic whose script throws is counted in script_errors, so a broken filter never looks like an empty cluster.',
     params: [
       ['script', 'string', false, 'Predicate deciding whether a topic is listed'],
-      ['timeout_seconds', 'int', false, 'Limit for evaluating the script. Default 30'],
+      ['timeout_seconds', 'int', false, 'Limit for evaluating the script. Default 30, at most 3600'],
     ],
     call: { script: "return partitions > 6 && configs['cleanup.policy'] === 'compact'" },
     result: {
-      topics: [{ topic: 'orders', partitions: 12, replication_factor: 3, configs: { 'cleanup.policy': 'compact' } }],
+      topics: [{ topic: 'orders', partitions: 12, replication_factor: 3, configs: { 'cleanup.policy': 'compact' }, size_bytes: 48318382080 }],
       count: 1,
     },
   },
@@ -68,13 +69,13 @@ export const tools = [
     name: 'describe_topic',
     group: 'discover',
     batch: 20,
-    summary: 'Offset ranges, message count, time span and full configuration.',
+    summary: 'Offset ranges, message count, size on disk, time span and full configuration.',
     detail:
       'Use it before a search to see how much it would read, and how far back the topic can hold data at all: retention.ms and cleanup.policy decide whether a message can still exist.',
     params: [['topic', 'string', true, 'Topic to describe']],
     call: { items: [{ topic: 'orders' }, { topic: 'payments' }] },
     result: {
-      results: [{ index: 0, result: { topic: 'orders', partition_count: 1, message_count: 3, partitions: [{ partition: 0, start_offset: 0, end_offset: 3 }] } }],
+      results: [{ index: 0, result: { topic: 'orders', partition_count: 1, message_count: 3, size_bytes: 2048, replicated_size_bytes: 6144, partitions: [{ partition: 0, start_offset: 0, end_offset: 3, size_bytes: 2048 }] } }],
       succeeded: 2, failed: 0, applied: 0, atomic: false,
     },
   },
@@ -108,9 +109,9 @@ export const tools = [
       'Avro, Protobuf and JSON Schema values are decoded first, so their fields are listed like JSON. When key_in_value names a field, the key is that identifier, and searching the key is the exact, cheap lookup.',
     params: [
       ['topic', 'string', true, 'Topic to sample'],
-      ['sample_size', 'int', false, 'Messages to read in total. Default 20'],
+      ['sample_size', 'int', false, 'Messages to read in total. Default 20, at most 1000'],
       ['partitions', 'int[]', false, 'Restrict to these partitions'],
-      ['max_value_bytes', 'int', false, 'Value bytes per message. Default 512'],
+      ['max_value_bytes', 'int', false, 'Value bytes per message. Default 512, at most 1 MiB'],
     ],
     call: { items: [{ topic: 'orders', sample_size: 20 }] },
     result: {
@@ -119,6 +120,7 @@ export const tools = [
         json_fields: [{ path: 'payload.amount', types: ['number'], present: 20 }],
         key_in_value: ['payload.orderId'],
         schemas: [{ format: 'avro', schema_id: 7, message_type: 'shop.Order', count: 20 }],
+        value_bytes: { min: 180, p50: 412, max: 9020 },
       } }],
       succeeded: 1, failed: 0, applied: 0, atomic: false,
     },
@@ -128,7 +130,7 @@ export const tools = [
     group: 'read',
     summary: 'A bounded scan filtered by JavaScript, reporting exactly what it covered.',
     detail:
-      'The script sees value, key, headers, partition, offset and timestamp. An empty result means "not there" only when complete is true; otherwise read stopped_reason and narrow the search.',
+      'The script sees value, key, headers, partition, offset, timestamp, value_bytes, key_bytes, format, schema_id and decode_error. group_by counts matches per bucket instead of listing them: a DLQ by error header, a partition by key. An empty result means "not there" only when complete is true; otherwise read stopped_reason and narrow the search.',
     params: [
       ['topic', 'string', true, 'Topic to search'],
       ['script', 'string', false, 'Filter. Omit to match every message'],
@@ -136,12 +138,14 @@ export const tools = [
       ['from_offset / to_offset', 'int', false, 'Offset window, end exclusive'],
       ['from_timestamp / to_timestamp', 'string', false, 'RFC3339 time window'],
       ['direction', 'string', false, 'newest_first (default) or oldest_first'],
-      ['max_matches', 'int', false, 'Stop after this many. Default 10'],
-      ['max_messages_scanned', 'int', false, 'Read at most this many. Default 10000'],
+      ['max_matches', 'int', false, 'Stop after this many. Default 10, at most 1000'],
+      ['max_messages_scanned', 'int', false, 'Read at most this many. Default 10000, at most 100000000'],
       ['parallelism', 'int', false, 'Readers for one partition, 1 to 16. Default 1'],
       ['count_only', 'bool', false, 'Counts only, no bodies'],
-      ['output_file', 'string', false, 'Write every match to this file as JSONL'],
-      ['timeout_seconds', 'int', false, 'Wall-clock limit. Default 30'],
+      ['output_file', 'string', false, 'Write every match to this new file as JSONL. An existing name is refused'],
+      ['timeout_seconds', 'int', false, 'Wall-clock limit. Default 30, at most 3600'],
+      ['group_by', 'string', false, 'Expression returning a bucket per match. Counts per bucket, no bodies'],
+      ['max_groups', 'int', false, 'Largest buckets returned with group_by. Default 20, at most 1000'],
     ],
     call: { topic: 'orders', script: "return key === 'ORD-12345'", max_matches: 5 },
     result: {
@@ -161,8 +165,8 @@ export const tools = [
       ['topic', 'string', true, 'Topic to read from'],
       ['partition', 'int', true, 'Partition to read from'],
       ['offset', 'int', true, 'Exact offset'],
-      ['context', 'int', false, 'Also return this many messages either side'],
-      ['max_value_bytes', 'int', false, 'Value bytes to return. Default 4096'],
+      ['context', 'int', false, 'Also return this many messages either side, at most 100'],
+      ['max_value_bytes', 'int', false, 'Value bytes to return. Default 4096, at most 1 MiB'],
     ],
     call: { items: [{ topic: 'orders', partition: 3, offset: 48211, context: 1 }] },
     result: {
@@ -176,17 +180,19 @@ export const tools = [
     batch: 100,
     summary: 'A Schema Registry schema, by subject or by the schema id a message carries.',
     detail:
-      'Read it before producing to a schema-encoded topic: it names every field a value needs. For Protobuf, message_types are the names produce_message accepts. Looking up an id lists the subjects that use it.',
+      'Read it before producing to a schema-encoded topic: it names every field a value needs. For Protobuf, message_types are the names produce_message accepts. Looking up an id lists the subjects that use it. A subject reports its compatibility level, and check_schema tests a candidate against it without registering anything.',
     params: [
       ['subject', 'string', false, 'Usually <topic>-value. Give subject or id'],
       ['version', 'int', false, 'Defaults to the latest'],
       ['id', 'int', false, 'Schema id, e.g. from get_message'],
+      ['check_schema', 'object', false, '{schema, type}: is this candidate compatible? Needs subject'],
     ],
     call: { items: [{ subject: 'orders-value' }] },
     result: {
       results: [{ index: 0, result: {
         schema_id: 7, subject: 'orders-value', version: 3, versions: [1, 2, 3],
         type: 'avro', schema: '{"type":"record","name":"Order",…}', references: [],
+        compatibility: 'BACKWARD',
       } }],
       succeeded: 1, failed: 0, applied: 0, atomic: false,
     },
@@ -209,12 +215,13 @@ export const tools = [
     batch: 100,
     summary: 'Lag, produce and consume rates, and when the backlog clears, or that it never will.',
     detail:
-      'status decides what the numbers mean: caught_up, draining, growing, stalled, no_active_consumers or not_measured. An ETA is only given when lag is really shrinking. The call blocks for sample_seconds.',
+      'status decides what the numbers mean: caught_up, draining, growing, stalled, no_active_consumers or not_measured. An ETA is only given when lag is really shrinking. offset_expired flags a commit retention already deleted; measure_backlog_age reports how old the backlog is against retention. The call blocks for sample_seconds.',
     params: [
       ['topic', 'string', true, 'Topic to measure'],
       ['group', 'string', false, 'Defaults to every group consuming the topic'],
-      ['sample_seconds', 'int', false, 'Consume-rate sample window. Default 5'],
+      ['sample_seconds', 'int', false, 'Consume-rate sample window. Default 5, at most 300. Up to 4 windows run at a time'],
       ['skip_consume_rate', 'bool', false, 'Return at once, without rate or ETA'],
+      ['measure_backlog_age', 'bool', false, 'Report lag_seconds and retention_risk. One fetch per lagging partition'],
     ],
     call: { items: [{ topic: 'orders', group: 'payments' }] },
     result: {
@@ -231,8 +238,11 @@ export const tools = [
     batch: 100,
     summary: 'Members, who owns which partition, and the group\u2019s position and lag on each.',
     detail:
-      'Turns a stuck partition into a pod: every partition names its member, client id and host. has_commit false means the group owns a partition it never committed on, so auto.offset.reset decides where it starts.',
-    params: [['group', 'string', true, 'Consumer group to describe']],
+      'Turns a stuck partition into a pod: every partition names its member, client id and host. has_commit false means the group owns a partition it never committed on, so auto.offset.reset decides where it starts. sample_seconds watches the group first and reports the states it went through and the members that joined or left.',
+    params: [
+      ['group', 'string', true, 'Consumer group to describe'],
+      ['sample_seconds', 'int', false, 'Watch the group this long first, at most 60. The call blocks'],
+    ],
     call: { items: [{ group: 'payments' }] },
     result: {
       results: [{ index: 0, result: {
@@ -266,7 +276,7 @@ export const tools = [
     group: 'measure',
     summary: 'Brokers, controller, and every offline, under-replicated or under-min-ISR partition.',
     detail:
-      'under_min_isr is what makes acks=all producers fail with NOT_ENOUGH_REPLICAS. Brokers that do not report min.insync.replicas are listed in min_isr_unknown instead of being guessed at.',
+      'under_min_isr is what makes acks=all producers fail with NOT_ENOUGH_REPLICAS. A partition being reassigned is marked reassigning, so a move is not mistaken for an outage. Brokers that do not report min.insync.replicas are listed in min_isr_unknown instead of being guessed at.',
     params: [
       ['search', 'string', false, 'Only topics containing this. Case-insensitive'],
       ['include_internal', 'bool', false, 'Also check __consumer_offsets and friends'],
@@ -417,11 +427,13 @@ export const tools = [
     write: 'own',
     summary: 'Deletes a partition\u2019s oldest messages, keeping the topic and its groups.',
     detail:
-      'Everything below before_offset goes. Needs confirm and acknowledge_data_loss. The preview names every group committed below the cut and how many messages it would lose unread.',
+      'Everything below before_offset goes, or everything written before before_timestamp, resolved per partition. all_partitions cuts the whole topic at that moment in one item. Needs confirm and acknowledge_data_loss. The preview names every group committed below the cut and how many messages it would lose unread.',
     params: [
       ['topic', 'string', true, 'Topic to delete from'],
-      ['partition', 'int', true, 'Partition'],
-      ['before_offset', 'int', true, 'This offset becomes the first readable one'],
+      ['partition', 'int', false, 'Partition. Not used with all_partitions'],
+      ['before_offset', 'int', false, 'This offset becomes the first readable one. Or before_timestamp'],
+      ['before_timestamp', 'string', false, 'RFC3339: delete everything written before it'],
+      ['all_partitions', 'bool', false, 'With before_timestamp, cut every partition'],
       ['acknowledge_data_loss', 'bool', false, 'Required to apply'],
     ],
     call: { items: [{ topic: 'orders', partition: 0, before_offset: 812 }], confirm: false },
@@ -463,7 +475,7 @@ export const tools = [
       ['source_partition', 'int', true, ''],
       ['source_offset', 'int', true, ''],
       ['destination_topic', 'string', true, 'Must already exist'],
-      ['destination_cluster', 'string', false, 'Defaults to this endpoint\u2019s cluster'],
+      ['destination_cluster', 'string', false, 'Defaults to this endpoint\u2019s cluster. Another must be in this endpoint\u2019s destinations'],
       ['translate_schema', 'bool', false, 'Re-register a schema id in the destination registry'],
       ['max_value_bytes', 'int', false, 'Preview limit. The whole value is always copied'],
     ],
@@ -496,7 +508,7 @@ export const tools = [
       ['encoding', 'string', false, 'utf8 (default) or base64'],
       ['value_schema', 'object', false, 'Encode value to a registry schema. {} = latest <topic>-value'],
       ['key_schema', 'object', false, 'Encode key to a registry schema. {} = latest <topic>-key'],
-      ['destination_cluster', 'string', false, 'Defaults to this endpoint\u2019s cluster'],
+      ['destination_cluster', 'string', false, 'Defaults to this endpoint\u2019s cluster. Another must be in this endpoint\u2019s destinations'],
     ],
     call: { items: [{ topic: 'orders', key: 'ORD-12345', value: '{"status":"NEW"}', value_schema: {} }], confirm: false },
     result: {
@@ -521,7 +533,7 @@ export const scenarios = [
     guide: 'check-lag',
     ask: 'how far behind is payments?',
     flow: ['consumer_lag'],
-    note: 'Drain rate is consume minus produce. An ETA appears only when lag is shrinking.',
+    note: 'Drain rate is consume minus produce. An ETA appears only when lag is shrinking, and a backlog close to retention is flagged.',
   },
   {
     guide: 'skip-poison-message',
@@ -568,8 +580,8 @@ export const scenarios = [
   {
     guide: 'tune-topic-config',
     ask: 'the disk is filling up, cut retention on orders',
-    flow: ['server_config', 'describe_topic', 'alter_topic_config'],
-    note: 'Shows how many messages the new retention makes deletable before anything changes.',
+    flow: ['server_config', 'list_topics', 'describe_topic', 'consumer_lag', 'alter_topic_config'],
+    note: 'Finds the topic actually holding the bytes first, and checks no backlog is older than the new retention.',
   },
   {
     guide: 'cluster-health',
@@ -581,12 +593,30 @@ export const scenarios = [
     guide: 'purge-messages',
     ask: 'delete the test data but keep the topic',
     flow: ['server_config', 'describe_topic', 'delete_records', 'delete_consumer_group'],
-    note: 'Truncates partitions and cleans up abandoned groups, naming every group that would lose unread messages.',
+    note: 'Truncates partitions, by offset or by a moment across the whole topic, and names every group that would lose unread messages.',
   },
   {
     guide: 'authorization-error',
     ask: 'payments gets TOPIC_AUTHORIZATION_FAILED',
     flow: ['server_config', 'list_acls'],
     note: 'Lists every ACL applied to the principal and resource, including prefixed and deny entries.',
+  },
+  {
+    guide: 'unstable-consumer-group',
+    ask: 'the consumer keeps rebalancing',
+    flow: ['consumer_lag', 'describe_consumer_group'],
+    note: 'Watches the group, then names the client and host that keep leaving.',
+  },
+  {
+    guide: 'partition-skew',
+    ask: 'one partition always lags',
+    flow: ['consumer_lag', 'search_messages', 'describe_consumer_group'],
+    note: 'Separates hot keys from a slow consumer, and finds the keys by grouping.',
+  },
+  {
+    guide: 'schema-error',
+    ask: 'is this schema change safe?',
+    flow: ['get_schema', 'sample_messages', 'search_messages'],
+    note: 'Tests the candidate against the subject without registering it, and dates when a new schema appeared.',
   },
 ]

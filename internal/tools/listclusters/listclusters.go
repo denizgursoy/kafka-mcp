@@ -26,6 +26,12 @@ type Cluster struct {
 	Name      string `json:"name"`
 	Connected bool   `json:"connected"`
 	ReadOnly  bool   `json:"read_only"`
+
+	// Writable is whether this session may write to the cluster: its own
+	// cluster unless the endpoint is read_only, another only when the
+	// endpoint lists it in destinations. This, not read_only, is what decides
+	// whether a copy_message or produce_message there will be accepted.
+	Writable bool `json:"writable"`
 }
 
 // Output is the result returned by the list_clusters tool.
@@ -35,17 +41,18 @@ type Output struct {
 }
 
 const description = `
-List the Kafka clusters this server serves, with whether each is reachable and
-whether it accepts writes. Connectivity is checked at call time. Use returned
-names as copy_message destination_cluster values. Broker and credential details
-are not exposed.
+List the Kafka clusters this server serves, with whether each is reachable,
+whether it is configured read_only, and whether this session may write to it
+(writable). Connectivity is checked at call time. A cluster is a valid
+copy_message or produce_message destination_cluster only when writable is true.
+Broker and credential details are not exposed.
 `
 
 // Register adds the list_clusters tool to the MCP server.
 //
 // It is registered on every cluster's server, since a caller on one endpoint
 // needs the whole roster to compose a cross-cluster copy.
-func Register(server *mcp.Server, clusters *kafkaclient.Registry) {
+func Register(server *mcp.Server, clusters *kafkaclient.Registry, endpoint string) {
 	mcp.AddTool(
 		server,
 		&mcp.Tool{
@@ -58,7 +65,7 @@ func Register(server *mcp.Server, clusters *kafkaclient.Registry) {
 			input Input,
 		) (*mcp.CallToolResult, Output, error) {
 
-			out, err := Run(ctx, clusters)
+			out, err := Run(ctx, clusters, endpoint)
 			if err != nil {
 				return nil, Output{}, fmt.Errorf("list clusters: %w", err)
 			}
@@ -68,9 +75,10 @@ func Register(server *mcp.Server, clusters *kafkaclient.Registry) {
 	)
 }
 
-// Run reports every configured cluster.
-func Run(ctx context.Context, clusters *kafkaclient.Registry) (Output, error) {
-	names := clusters.Names()
+// Run reports every cluster an endpoint serves, with whether endpoint may
+// write to it.
+func Run(ctx context.Context, clusters *kafkaclient.Registry, endpoint string) (Output, error) {
+	names := clusters.ExposedNames()
 
 	out := Output{
 		Clusters: make([]Cluster, len(names)),
@@ -90,7 +98,8 @@ func Run(ctx context.Context, clusters *kafkaclient.Registry) (Output, error) {
 
 		out.Clusters[i] = Cluster{
 			Name:     name,
-			ReadOnly: clusters.ReadOnly(name),
+			ReadOnly: client.Config().ReadOnly,
+			Writable: clusters.Writable(endpoint, name),
 		}
 
 		wait.Add(1)

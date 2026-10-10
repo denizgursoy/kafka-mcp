@@ -137,6 +137,56 @@ func (s *GetSchemaSuite) TestReportsReferences() {
 		"protobuf message names are what produce_message takes as message_type")
 }
 
+func (s *GetSchemaSuite) TestReportsTheCompatibilityLevel() {
+	subject := s.env.UniqueName("orders") + "-value"
+	s.env.RegisterSchema(s.T(), subject, sr.Schema{Schema: orderV1})
+
+	out, err := s.get(getschema.Item{Subject: subject})
+
+	s.Require().NoError(err, "the subject must be returned")
+	s.Require().Equal("BACKWARD", out.Compatibility,
+		"the level in force decides which changes the registry refuses, including the inherited global level")
+}
+
+func (s *GetSchemaSuite) TestChecksACompatibleCandidate() {
+	subject := s.env.UniqueName("orders") + "-value"
+	s.env.RegisterSchema(s.T(), subject, sr.Schema{Schema: orderV1})
+
+	out, err := s.get(getschema.Item{Subject: subject, CheckSchema: &getschema.Candidate{Schema: orderV2}})
+
+	s.Require().NoError(err, "checking a candidate must succeed")
+	s.Require().NotNil(out.Check, "the check result is reported only when a candidate was given")
+	s.Require().True(out.Check.Compatible, "adding an optional field with a default is backward compatible")
+	s.Require().Empty(out.Check.Messages, "a compatible schema has nothing to explain")
+}
+
+func (s *GetSchemaSuite) TestChecksAnIncompatibleCandidate() {
+	subject := s.env.UniqueName("orders") + "-value"
+	s.env.RegisterSchema(s.T(), subject, sr.Schema{Schema: orderV1})
+
+	changed := `{"type":"record","name":"Order","namespace":"shop","fields":[{"name":"id","type":"int"}]}`
+	out, err := s.get(getschema.Item{Subject: subject, CheckSchema: &getschema.Candidate{Schema: changed}})
+
+	s.Require().NoError(err, "an incompatible candidate is an answer, not an error")
+	s.Require().False(out.Check.Compatible, "changing a field's type from string to int breaks existing data")
+	s.Require().NotEmpty(out.Check.Messages,
+		"the registry's reason is what tells the developer which field to fix before their producer gets a 409")
+
+	versions, err := s.get(getschema.Item{Subject: subject})
+	s.Require().NoError(err, "the subject must still be readable")
+	s.Require().Equal([]int{1}, versions.Versions, "checking must never register the candidate")
+}
+
+func (s *GetSchemaSuite) TestCheckNeedsASubject() {
+	subject := s.env.UniqueName("orders") + "-value"
+	id := s.env.RegisterSchema(s.T(), subject, sr.Schema{Schema: orderV1})
+
+	_, err := s.get(getschema.Item{ID: id, CheckSchema: &getschema.Candidate{Schema: orderV2}})
+
+	s.Require().ErrorContains(err, "subject",
+		"compatibility is judged against a subject's history, and an id may belong to several subjects")
+}
+
 func (s *GetSchemaSuite) TestBatchKeepsPartialErrors() {
 	subject := s.env.UniqueName("orders") + "-value"
 	s.env.RegisterSchema(s.T(), subject, sr.Schema{Schema: orderV1})

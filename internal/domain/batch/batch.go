@@ -5,6 +5,8 @@ package batch
 import (
 	"context"
 	"fmt"
+	"log/slog"
+	"runtime/debug"
 	"sync"
 )
 
@@ -77,7 +79,7 @@ func Run[I, O any](
 		go func() {
 			defer wait.Done()
 			for index := range jobs {
-				value, err := fn(ctx, items[index])
+				value, err := call(ctx, fn, items[index])
 				out.Results[index].Index = index
 				if err != nil {
 					out.Results[index].Error = err.Error()
@@ -109,4 +111,29 @@ func Run[I, O any](
 	}
 
 	return out, nil
+}
+
+// call runs one item and turns a panic into that item's error. Workers run in
+// goroutines of their own, where nothing above recovers, so a panic left alone
+// would exit the whole server rather than fail one item.
+func call[I, O any](ctx context.Context, fn func(context.Context, I) (O, error), item I) (value O, err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			slog.Error("batch item panicked", "panic", recovered, "stack", string(debug.Stack()))
+			err = fmt.Errorf("internal error: %v", recovered)
+		}
+	}()
+
+	return fn(ctx, item)
+}
+
+// Bounded checks an optional numeric parameter: zero means its default, and
+// anything negative or above maximum is refused. Parameters that size an
+// allocation or a wait must never be taken from a caller unchecked.
+func Bounded(name string, value int, maximum int) error {
+	if value < 0 || value > maximum {
+		return fmt.Errorf("%s must be between 1 and %d, got %d", name, maximum, value)
+	}
+
+	return nil
 }

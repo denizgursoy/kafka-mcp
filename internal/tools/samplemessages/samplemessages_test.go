@@ -66,6 +66,23 @@ func (s *SampleMessagesSuite) sampleWith(
 	return *out.Results[0].Result, nil
 }
 
+func (s *SampleMessagesSuite) TestReportsValueSizes() {
+	topic := s.env.CreateTopic(s.T(), "sample-sizes")
+	s.env.Produce(s.T(), topic,
+		testenv.Message{Value: "aa"},
+		testenv.Message{Value: "bbbbbb"},
+		testenv.Message{Value: "cccccccccc"},
+	)
+
+	out, err := s.sample(samplemessages.Item{Topic: topic})
+	s.Require().NoError(err, "sampling must succeed")
+
+	s.Require().Equal(2, out.ValueBytes.Min, "the smallest value is two bytes")
+	s.Require().Equal(6, out.ValueBytes.P50, "the median of 2, 6 and 10 is 6")
+	s.Require().Equal(10, out.ValueBytes.Max,
+		"the largest value is what decides whether a topic is near max.message.bytes")
+}
+
 func (s *SampleMessagesSuite) TestReportsJSONFieldsAndTypes() {
 	topic := s.env.CreateTopic(s.T(), "sample-fields")
 
@@ -298,6 +315,19 @@ func (s *SampleMessagesSuite) TestErrorsOnUnknownTopic() {
 
 	s.Require().Error(err,
 		"sampling a topic that does not exist must fail rather than look like an empty topic")
+}
+
+func (s *SampleMessagesSuite) TestRejectsUnboundedInputs() {
+	s.Run("sample_size beyond the limit", func() {
+		_, err := s.sample(samplemessages.Item{Topic: "t", SampleSize: 1 << 40})
+		s.Require().ErrorContains(err, "sample_size",
+			"sample_size sizes an allocation from caller input, so an unbounded value can crash the server")
+	})
+	s.Run("max_value_bytes beyond the limit", func() {
+		_, err := s.sample(samplemessages.Item{Topic: "t", MaxValueBytes: 1 << 40})
+		s.Require().ErrorContains(err, "max_value_bytes",
+			"a response is held in memory and sent to a model, so it must stay bounded")
+	})
 }
 
 func (s *SampleMessagesSuite) TestErrorsWhenBrokerUnreachable() {

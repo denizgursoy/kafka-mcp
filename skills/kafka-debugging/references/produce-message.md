@@ -16,7 +16,7 @@ indistinguishable to a consumer from a real one, and it will be processed.
 | Tool              | Use it for                                            |
 | ----------------- | ----------------------------------------------------- |
 | `server_config`   | Checking the endpoint may write at all                |
-| `list_clusters`   | Which cluster names are valid, and which are writable |
+| `list_clusters`   | Which cluster names are valid, and which this session may write to |
 | `list_topics`     | Confirming the destination exists and is the right one |
 | `describe_topic`  | The partition count, and whether the topic is compacted |
 | `get_message`     | Reading the original a repaired message is based on   |
@@ -24,6 +24,7 @@ indistinguishable to a consumer from a real one, and it will be processed.
 | `search_messages` | Finding the original when its offset is not known     |
 | `produce_message` | Previewing and writing                                |
 | `create_topic`    | Creating the destination when it does not exist yet   |
+| `list_consumer_groups` | Who consumes the destination, before writing into it |
 
 ## Steps
 
@@ -39,9 +40,11 @@ session can legitimately write into a different, writable cluster — that is ho
 production data reaches preprod. What it cannot do is write to its own cluster,
 and it refuses outright rather than offering a preview.
 
-So the question is not only "is this endpoint writable" but "is the cluster I
-am about to write to writable". Use `list_clusters` when a `destination_cluster`
-is involved; it reports the effective writability of each.
+So the question is not only "is this endpoint writable" but "may this endpoint
+write to the cluster I am about to write to". Another cluster is a valid
+destination only when this endpoint lists it in its `destinations`, reported by
+`server_config`. Use `list_clusters` when a `destination_cluster` is involved;
+its `writable` field gives the effective answer for this session.
 
 ### 1. Establish which of the three cases this is
 
@@ -199,6 +202,6 @@ show it processing again rather than stalled.
 - Producing into a compacted topic with an existing key replaces the value for
   that key once compaction runs. `describe_topic` reports `cleanup.policy`.
 - If the broker refuses with an authorization error, the fix is a Kafka ACL:
-  producing needs `WRITE` on the topic for the principal this server connects
+  producing needs `write` on the topic for the principal this server connects
   as. That is a request to whoever administers the cluster, not something to
   work around.

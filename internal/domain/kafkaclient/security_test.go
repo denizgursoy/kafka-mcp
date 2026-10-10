@@ -70,6 +70,13 @@ func (s *SecuritySuite) TestMutualTLSHandshake() {
 	s.Require().Len(server.ConnectionState().VerifiedChains, 1, "mTLS must produce a verified client identity")
 }
 
+func (s *SecuritySuite) TestInsecureSkipVerify() {
+	settings, err := tlsConfig(&config.TLS{Enabled: true, InsecureSkipVerify: true})
+	s.Require().NoError(err, "insecure_skip_verify must not need certificate files")
+	s.Require().True(settings.InsecureSkipVerify, "insecure_skip_verify must reach the broker TLS configuration")
+	s.Require().Equal(uint16(tls.VersionTLS12), settings.MinVersion, "skipping verification must not weaken the protocol minimum")
+}
+
 func (s *SecuritySuite) TestRejectsBadTLSSettings() {
 	s.Run("certificate without key", func() {
 		_, err := tlsConfig(&config.TLS{CertFile: "client.pem"})

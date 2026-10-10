@@ -12,6 +12,7 @@ import (
 	"github.com/twmb/franz-go/pkg/kadm"
 	"github.com/twmb/franz-go/pkg/kgo"
 
+	"github.com/denizgursoy/kafka-mcp/internal/domain/batch"
 	"github.com/denizgursoy/kafka-mcp/internal/domain/records"
 	"github.com/denizgursoy/kafka-mcp/internal/domain/serde"
 )
@@ -19,7 +20,7 @@ import (
 // Input is the argument set accepted by the search_messages tool.
 type Input struct {
 	Topic         string     `json:"topic" jsonschema:"Topic to search. Matched exactly and case-sensitively."`
-	Script        string     `json:"script,omitempty" jsonschema:"Optional JavaScript that decides whether a message matches. Return true to keep it. In scope: value (the parsed document for JSON, and the decoded record for Avro, Protobuf, JSON Schema or a configured format; the raw text otherwise), key (string, decoded document when the key has a schema, or null), headers (object of header name to string), partition, offset and timestamp (a Date). Examples: return key === 'order-123'; return value.eventType === 'NEW' && value.payload.amount >= 500; return value.payload.cancelledAt === null. Omit to match every message."`
+	Script        string     `json:"script,omitempty" jsonschema:"Optional JavaScript that decides whether a message matches. Return true to keep it. In scope: value (the parsed document for JSON, and the decoded record for Avro, Protobuf, JSON Schema or a configured format; the raw text otherwise), key (string, decoded document when the key has a schema, or null), headers (object of header name to string), partition, offset, timestamp (a Date), value_bytes and key_bytes (raw sizes, before decoding), format (json, avro, protobuf, json_schema, msgpack, text, binary or null), schema_id (number or null) and decode_error (string or null). Examples: return key === 'order-123'; return value.eventType === 'NEW' && value.payload.amount >= 500; return value.payload.cancelledAt === null. Omit to match every message."`
 	Parallelism   int        `json:"parallelism,omitempty" jsonschema:"Optional number of concurrent readers, from 1 to 16. Defaults to 1. It splits a single-partition topic's offsets between readers, which makes a full scan of one large partition faster. A multi-partition topic is already read across its partitions together, so this does not apply there. Worth using for count_only, output_file or a full scan of one partition."`
 	Partitions    []int32    `json:"partitions,omitempty" jsonschema:"Optional partitions to restrict the search to. Defaults to every partition. Do not guess a partition from a message key: producers may set the partition explicitly, so the key does not determine it."`
 	FromOffset    *int64     `json:"from_offset,omitempty" jsonschema:"Optional inclusive offset to start scanning from, applied to every searched partition."`
@@ -27,12 +28,14 @@ type Input struct {
 	FromTimestamp *time.Time `json:"from_timestamp,omitempty" jsonschema:"Optional inclusive start time (RFC3339). Resolved to the first offset at or after this time."`
 	ToTimestamp   *time.Time `json:"to_timestamp,omitempty" jsonschema:"Optional exclusive end time (RFC3339). Resolved to the first offset at or after this time."`
 	Direction     string     `json:"direction,omitempty" jsonschema:"Optional scan direction: newest_first (default) or oldest_first. Decides which matches are kept when max_matches cuts the search short. Every partition is read together, so newest_first means newest in the topic, ordered by timestamp, rather than newest in one partition."`
-	MaxMatches    int        `json:"max_matches,omitempty" jsonschema:"Optional maximum number of matches to return. Defaults to 10."`
-	MaxScanned    int        `json:"max_messages_scanned,omitempty" jsonschema:"Optional maximum number of messages to read before giving up. Defaults to 10000."`
-	MaxValueBytes int        `json:"max_value_bytes,omitempty" jsonschema:"Optional maximum value bytes to return per match. Defaults to 512. Longer values are cut and flagged with truncated=true."`
-	TimeoutSecond int        `json:"timeout_seconds,omitempty" jsonschema:"Optional wall-clock limit for the scan in seconds. Defaults to 30."`
+	MaxMatches    int        `json:"max_matches,omitempty" jsonschema:"Optional maximum number of matches to return. Defaults to 10, at most 1000. Use output_file to export more."`
+	MaxScanned    int        `json:"max_messages_scanned,omitempty" jsonschema:"Optional maximum number of messages to read before giving up. Defaults to 10000, at most 100000000."`
+	MaxValueBytes int        `json:"max_value_bytes,omitempty" jsonschema:"Optional maximum value bytes to return per match. Defaults to 512, at most 1048576. Longer values are cut and flagged with truncated=true."`
+	TimeoutSecond int        `json:"timeout_seconds,omitempty" jsonschema:"Optional wall-clock limit for the scan in seconds. Defaults to 30, at most 3600."`
 	CountOnly     bool       `json:"count_only,omitempty" jsonschema:"Optional. When true, scan the whole range and return only how many messages matched, with a per-partition breakdown and no message bodies. Use this first when a query may match a great many messages, then ask the user how they want them before fetching any."`
-	OutputFile    string     `json:"output_file,omitempty" jsonschema:"Optional file name to write every match to, as one JSON message per line. Use this instead of returning thousands of messages. A name only, not a path: the server chooses the directory. The response reports the path, the number written and a short preview."`
+	GroupBy       string     `json:"group_by,omitempty" jsonschema:"Optional JavaScript expression, with the same variables as script, that returns a bucket name for each matching message, e.g. return headers['error-reason'] or return key or return schema_id. Every match in the range is counted per bucket, like count_only, and no message bodies are returned. null and undefined form the bucket null. Cannot be combined with output_file."`
+	MaxGroups     int        `json:"max_groups,omitempty" jsonschema:"Optional number of largest buckets to return with group_by. Defaults to 20, at most 1000. groups_truncated says whether more existed."`
+	OutputFile    string     `json:"output_file,omitempty" jsonschema:"Optional file name to write every match to, as one JSON message per line. Use this instead of returning thousands of messages. A new name only, not a path: the server chooses the directory and refuses a name that already exists. The response reports the path, the number written and a short preview."`
 }
 
 // ScannedRange reports the offsets actually covered in one partition.
@@ -48,6 +51,19 @@ type PartitionCount struct {
 	Matches   int   `json:"matches"`
 }
 
+// Group is one group_by bucket: how many matches it holds and where one is.
+type Group struct {
+	Key     string  `json:"key"`
+	Count   int     `json:"count"`
+	Example Address `json:"example"`
+}
+
+// Address locates one message, enough to open it with get_message.
+type Address struct {
+	Partition int32 `json:"partition"`
+	Offset    int64 `json:"offset"`
+}
+
 // Output is the result returned by the search_messages tool.
 type Output struct {
 	Topic           string            `json:"topic"`
@@ -61,6 +77,8 @@ type Output struct {
 	ScriptErrors    int               `json:"script_errors,omitempty"`
 	OutputFile      string            `json:"output_file,omitempty"`
 	WrittenMessages int               `json:"written_messages,omitempty"`
+	Groups          []Group           `json:"groups,omitempty"`
+	GroupsTruncated bool              `json:"groups_truncated,omitempty"`
 }
 
 // Stop reasons reported back to the caller.
@@ -82,14 +100,31 @@ const (
 	// chunkSize bounds one backward scan window. Kafka only reads forward, so
 	// a newest-first search walks backwards in chunks of this many offsets.
 	chunkSize = 500
+
+	// Limits on caller input. max_matches and max_value_bytes size what is
+	// held in memory; max_messages_scanned and timeout_seconds bound how long
+	// one call may hold its readers.
+	maxMaxMatches    = 1000
+	maxMaxScanned    = 100_000_000
+	maxValueBytesCap = 1 << 20
+	maxTimeout       = 3600
+
+	defaultMaxGroups = 20
+	maxMaxGroups     = 1000
 )
 
 const description = `
 Search message key, value, headers or metadata with a JavaScript predicate.
 The script returns true for a match and receives value (parsed JSON, a decoded
-Avro/Protobuf/JSON Schema record, or text), key, headers, partition, offset and
-timestamp. Omit it to match all messages. Schema-encoded values are searched by
+Avro/Protobuf/JSON Schema record, or text), key, headers, partition, offset,
+timestamp, value_bytes, key_bytes, format, schema_id and decode_error. Omit it
+to match all messages. Schema-encoded values are searched by
 field exactly like JSON.
+
+group_by summarises instead of listing: an expression over the same variables
+returns a bucket name, and every match in the range is counted per bucket with
+one example address each. Use it to break a DLQ down by error header, find hot
+keys on a partition, or count messages per schema_id.
 
 Every partition is read together, one chunk deep at a time, so a limited
 newest-first search returns the newest matches in the topic rather than the
@@ -209,7 +244,8 @@ func Run(
 		out.WrittenMessages = export.written
 	}
 
-	finish(&out, state.scanned, state.matches, options)
+	finish(&out, state.scanned, state.split, state.matches, options)
+	finishGroups(&out, state.groups, options.maxGroups)
 
 	return out, nil
 }
@@ -231,6 +267,12 @@ type scanState struct {
 	mu      sync.Mutex
 	scanned map[int32]*ScannedRange
 	matches map[int32]int
+	// groups counts matches per group_by bucket.
+	groups map[string]*Group
+
+	// split holds the covered runs of a partition read by parallel readers,
+	// which need not be contiguous, in place of its entry in scanned.
+	split []ScannedRange
 }
 
 // scan reads every partition together, one chunk deep at a time.
@@ -249,7 +291,14 @@ func (s *scanState) scan(
 	windows []records.Range,
 ) error {
 
-	rounds := rounds(windows, s.options.newestFirst, s.options.parallelism)
+	// One partition split between readers runs them concurrently. Several
+	// partitions are already read together by one session, so parallelism
+	// does not apply there.
+	if len(windows) == 1 && worthSplitting(windows[0], s.options.parallelism) {
+		return s.scanParallel(ctx, reader, topic, windows[0])
+	}
+
+	rounds := rounds(windows, s.options.newestFirst)
 	if len(rounds) == 0 {
 		return nil
 	}
@@ -258,21 +307,18 @@ func (s *scanState) scan(
 	// what lets an oldest-first search stop at the match that satisfies it.
 	s.setOrdered(len(rounds[0]) == 1)
 
-	filter, err := s.options.newScript()
+	compiled, err := s.options.newScripts()
 	if err != nil {
 		return err
 	}
 
-	if filter != nil {
-		// The guard is what makes the timeout real. goja does not yield, so a
-		// predicate that never returns is never preempted and the context is
-		// not observed until the call comes back. Interrupting the runtime from
-		// outside is the only thing that can stop it.
-		stop := filter.guard(ctx)
-		defer stop()
-
-		defer filter.Close()
-	}
+	// The guard is what makes the timeout real. goja does not yield, so a
+	// predicate that never returns is never preempted and the context is not
+	// observed until the call comes back. Interrupting the runtime from
+	// outside is the only thing that can stop it.
+	stop := compiled.guard(ctx)
+	defer stop()
+	defer compiled.close()
 
 	session, err := reader.Session(topic)
 	if err != nil {
@@ -297,7 +343,7 @@ func (s *scanState) scan(
 		var scanErr error
 
 		err := session.Scan(ctx, round, func(record *kgo.Record) bool {
-			matched, err := s.visit(ctx, reader, record, filter, &found)
+			matched, err := s.visit(ctx, reader, record, compiled, &found)
 			if err != nil {
 				scanErr = err
 
@@ -337,7 +383,7 @@ func (s *scanState) visit(
 	ctx context.Context,
 	reader *records.Reader,
 	record *kgo.Record,
-	filter *filter,
+	compiled *scripts,
 	found *[]records.Message,
 ) (bool, error) {
 
@@ -353,16 +399,26 @@ func (s *scanState) visit(
 
 	matched := true
 
-	if filter != nil {
+	if compiled.filter != nil {
 		var err error
 
-		matched, err = filter.match(record, value, key)
+		matched, err = compiled.filter.match(record, value, key)
 		if err != nil {
 			// A script that throws on one message says nothing about the
 			// others, so the message is counted and the scan continues.
 			s.out.ScriptErrors++
 
 			matched = false
+		}
+	}
+
+	if matched && compiled.group != nil {
+		bucket, err := compiled.group.group(record, value, key)
+		if err != nil {
+			s.out.ScriptErrors++
+			matched = false
+		} else {
+			s.bucket(bucket, record)
 		}
 	}
 
@@ -458,38 +514,12 @@ func (s *scanState) stopped() bool {
 	return s.out.StoppedReason != reasonExhausted
 }
 
-// splitRange divides one partition's offsets between readers.
-//
-// A range too small to be worth dividing is left whole: opening several
+// worthSplitting reports whether one partition's range is large enough to
+// read with several readers. A small range is left to one: opening several
 // connections to read a handful of messages costs more in setup than the
 // concurrency saves.
-func splitRange(window records.Range, parallelism int) []records.Range {
-	size := window.End - window.Start
-
-	if parallelism <= 1 || size < int64(parallelism)*chunkSize {
-		return []records.Range{window}
-	}
-
-	slices := make([]records.Range, 0, parallelism)
-	per := size / int64(parallelism)
-
-	for i := 0; i < parallelism; i++ {
-		start := window.Start + int64(i)*per
-		end := start + per
-
-		// The last slice takes the remainder, so no offset is left unread.
-		if i == parallelism-1 {
-			end = window.End
-		}
-
-		slices = append(slices, records.Range{
-			Partition: window.Partition,
-			Start:     start,
-			End:       end,
-		})
-	}
-
-	return slices
+func worthSplitting(window records.Range, parallelism int) bool {
+	return parallelism > 1 && window.End-window.Start >= int64(parallelism)*chunkSize
 }
 
 // keep reduces a round's matches to the ones worth returning: the newest when
@@ -568,6 +598,7 @@ func track(scanned map[int32]*ScannedRange, record *kgo.Record) {
 func finish(
 	out *Output,
 	scanned map[int32]*ScannedRange,
+	split []ScannedRange,
 	byPartition map[int32]int,
 	options *options,
 ) {
@@ -575,9 +606,15 @@ func finish(
 		out.ScannedRanges = append(out.ScannedRanges, *rng)
 	}
 
+	out.ScannedRanges = append(out.ScannedRanges, split...)
+
 	// Map order is random, so sort for a stable report.
 	sort.Slice(out.ScannedRanges, func(i, j int) bool {
-		return out.ScannedRanges[i].Partition < out.ScannedRanges[j].Partition
+		left, right := out.ScannedRanges[i], out.ScannedRanges[j]
+		if left.Partition != right.Partition {
+			return left.Partition < right.Partition
+		}
+		return left.Start < right.Start
 	})
 
 	for partition, count := range byPartition {
@@ -620,6 +657,10 @@ type options struct {
 
 	// source is the user script, empty when every message matches.
 	source string
+
+	// groupBy is the bucket expression, empty when not grouping.
+	groupBy   string
+	maxGroups int
 }
 
 // maxParallelism bounds how many readers one search may open. Each reader is
@@ -637,6 +678,26 @@ func newOptions(input Input) (*options, error) {
 			"parallelism must be between 1 and %d, got %d", maxParallelism, input.Parallelism)
 	}
 
+	for _, limit := range []struct {
+		name           string
+		value, maximum int
+	}{
+		{"max_matches", input.MaxMatches, maxMaxMatches},
+		{"max_messages_scanned", input.MaxScanned, maxMaxScanned},
+		{"max_value_bytes", input.MaxValueBytes, maxValueBytesCap},
+		{"timeout_seconds", input.TimeoutSecond, maxTimeout},
+		{"max_groups", input.MaxGroups, maxMaxGroups},
+	} {
+		if err := batch.Bounded(limit.name, limit.value, limit.maximum); err != nil {
+			return nil, err
+		}
+	}
+
+	if input.GroupBy != "" && input.OutputFile != "" {
+		return nil, fmt.Errorf(
+			"group_by and output_file cannot be combined: grouping returns counts, not messages to write")
+	}
+
 	if input.CountOnly && input.OutputFile != "" {
 		return nil, fmt.Errorf(
 			"count_only and output_file cannot be combined: counting returns no messages to write")
@@ -644,7 +705,9 @@ func newOptions(input Input) (*options, error) {
 
 	o := &options{
 		source:        input.Script,
-		countOnly:     input.CountOnly,
+		groupBy:       input.GroupBy,
+		maxGroups:     input.MaxGroups,
+		countOnly:     input.CountOnly || input.GroupBy != "",
 		outputFile:    input.OutputFile,
 		maxMatches:    input.MaxMatches,
 		maxScanned:    input.MaxScanned,
@@ -673,6 +736,10 @@ func newOptions(input Input) (*options, error) {
 		o.parallelism = 1
 	}
 
+	if o.maxGroups <= 0 {
+		o.maxGroups = defaultMaxGroups
+	}
+
 	switch input.Direction {
 	case "", "newest_first":
 		o.newestFirst = true
@@ -685,26 +752,65 @@ func newOptions(input Input) (*options, error) {
 
 	// Compiling here reports a malformed script before a single message is
 	// read, rather than after a scan that could not have matched anything.
-	if o.source != "" {
-		compiled, err := compileScript(o.source)
-		if err != nil {
-			return nil, err
-		}
-
-		compiled.Close()
+	compiled, err := o.newScripts()
+	if err != nil {
+		return nil, err
 	}
+	compiled.close()
 
 	return o, nil
 }
 
-// newScript builds a script for one reader. Each reader needs its own,
+// scripts are the compiled scripts one reader evaluates. Either may be nil.
+type scripts struct {
+	filter *filter
+	group  *filter
+}
+
+// newScripts compiles the scripts for one reader. Each reader needs its own,
 // because a goja runtime cannot be used from two goroutines at once.
-func (o *options) newScript() (*filter, error) {
-	if o.source == "" {
-		return nil, nil
+func (o *options) newScripts() (*scripts, error) {
+	compiled := &scripts{}
+
+	if o.source != "" {
+		filter, err := compileScript(o.source)
+		if err != nil {
+			return nil, err
+		}
+		compiled.filter = filter
 	}
 
-	return compileScript(o.source)
+	if o.groupBy != "" {
+		group, err := compileScript(o.groupBy)
+		if err != nil {
+			compiled.close()
+			return nil, fmt.Errorf("group_by: %w", err)
+		}
+		compiled.group = group
+	}
+
+	return compiled, nil
+}
+
+// guard interrupts both scripts once ctx is done; the returned function stops
+// the watchers.
+func (c *scripts) guard(ctx context.Context) func() {
+	stopFilter := c.filter.guard(ctx)
+	stopGroup := c.group.guard(ctx)
+
+	return func() {
+		stopFilter()
+		stopGroup()
+	}
+}
+
+func (c *scripts) close() {
+	if c.filter != nil {
+		c.filter.Close()
+	}
+	if c.group != nil {
+		c.group.Close()
+	}
 }
 
 // resolveWindows turns the requested partitions, offsets and timestamps into
@@ -853,15 +959,13 @@ func offsetsAt(
 // Partitions run out at different depths, because they rarely hold the same
 // number of records. A round simply contains fewer partitions once the short
 // ones are exhausted.
-func rounds(windows []records.Range, newestFirst bool, parallelism int) [][]records.Range {
+func rounds(windows []records.Range, newestFirst bool) [][]records.Range {
 	// One partition needs no merging: its chunks are already in the order the
-	// caller asked for, and splitting it between readers is what keeps a full
-	// scan of a wide partition fast. Each chunk is its own round, because a
-	// Scan consumes at most one range per partition — it keys its bookkeeping
-	// by partition number, so two slices of the same partition in one round
-	// would silently collide and half the range would go unread.
+	// caller asked for. Each chunk is its own round, because a Scan consumes
+	// at most one range per partition — it keys its bookkeeping by partition
+	// number, so two chunks of one partition in a round would collide.
 	if len(windows) == 1 {
-		sliced := chunks(splitRange(windows[0], parallelism), newestFirst)
+		sliced := chunks(windows, newestFirst)
 
 		grouped := make([][]records.Range, 0, len(sliced))
 
@@ -946,4 +1050,51 @@ func chunks(windows []records.Range, newestFirst bool) []records.Range {
 	}
 
 	return out
+}
+
+// bucket counts a match in its group_by bucket. The caller holds s.mu.
+func (s *scanState) bucket(key string, record *kgo.Record) {
+	if s.groups == nil {
+		s.groups = make(map[string]*Group)
+	}
+
+	group, ok := s.groups[key]
+	if !ok {
+		group = &Group{Key: key, Example: Address{Partition: record.Partition, Offset: record.Offset}}
+		s.groups[key] = group
+	}
+
+	group.Count++
+
+	// The example is the newest message of the bucket: the one most likely to
+	// reflect what is happening now. Within one partition the higher offset
+	// is newer; across partitions offsets are not comparable, so the first
+	// partition seen keeps the example.
+	if record.Partition == group.Example.Partition && record.Offset > group.Example.Offset {
+		group.Example.Offset = record.Offset
+	}
+}
+
+// finishGroups reports the largest buckets, largest first.
+func finishGroups(out *Output, groups map[string]*Group, maxGroups int) {
+	if groups == nil {
+		return
+	}
+
+	out.Groups = make([]Group, 0, len(groups))
+	for _, group := range groups {
+		out.Groups = append(out.Groups, *group)
+	}
+
+	sort.Slice(out.Groups, func(i, j int) bool {
+		if out.Groups[i].Count != out.Groups[j].Count {
+			return out.Groups[i].Count > out.Groups[j].Count
+		}
+		return out.Groups[i].Key < out.Groups[j].Key
+	})
+
+	if len(out.Groups) > maxGroups {
+		out.Groups = out.Groups[:maxGroups]
+		out.GroupsTruncated = true
+	}
 }

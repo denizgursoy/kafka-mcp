@@ -394,6 +394,34 @@ func (s *HighVolumeSuite) TestRejectsWritingOutsideTheOutputDirectory() {
 		"a file name that escapes the output directory must be refused, because the server must not write wherever a caller asks")
 }
 
+func (s *HighVolumeSuite) TestRefusesToWriteThroughASymlink() {
+	dir := s.T().TempDir()
+	outside := filepath.Join(s.T().TempDir(), "victim.txt")
+	s.Require().NoError(os.WriteFile(outside, []byte("precious"), 0o600), "the file outside the output directory must exist")
+	s.Require().NoError(os.Symlink(outside, filepath.Join(dir, "planted.jsonl")), "the planted symlink must exist")
+
+	_, err := searchmessages.Run(s.T().Context(), s.env.Admin(), s.env.Reader(), dir, searchmessages.Input{
+		Topic: s.topic, Script: `return value.eventType === "NEW"`, OutputFile: "planted.jsonl",
+	})
+
+	s.Require().Error(err, "a symlink in the output directory must not redirect the export elsewhere")
+	content, readErr := os.ReadFile(outside)
+	s.Require().NoError(readErr, "the target must still be readable")
+	s.Require().Equal("precious", string(content), "the file the link pointed at must be untouched")
+}
+
+func (s *HighVolumeSuite) TestRefusesToOverwriteAnExport() {
+	dir := s.T().TempDir()
+	s.Require().NoError(os.WriteFile(filepath.Join(dir, "earlier.jsonl"), []byte("earlier"), 0o600), "the earlier export must exist")
+
+	_, err := searchmessages.Run(s.T().Context(), s.env.Admin(), s.env.Reader(), dir, searchmessages.Input{
+		Topic: s.topic, Script: `return value.eventType === "NEW"`, OutputFile: "earlier.jsonl",
+	})
+
+	s.Require().ErrorContains(err, "already exists",
+		"silently replacing an earlier export loses the evidence a previous search produced")
+}
+
 func (s *HighVolumeSuite) TestParallelScanFindsTheSameMatches() {
 	out, err := searchmessages.Run(
 		s.T().Context(),
@@ -416,6 +444,45 @@ func (s *HighVolumeSuite) TestParallelScanFindsTheSameMatches() {
 	)
 	s.Require().EqualValues(totalMessages, out.ScannedMessages,
 		"every message must still be read exactly once: a slice boundary that overlapped or left a gap would show up here")
+}
+
+func (s *HighVolumeSuite) TestParallelNewestFirstReturnsTheNewestMatches() {
+	out, err := searchmessages.Run(
+		s.T().Context(),
+		s.env.Admin(),
+		s.env.Reader(),
+		"",
+		searchmessages.Input{
+			Topic:       s.topic,
+			Script:      `return value.eventType === "NEW"`,
+			MaxMatches:  2,
+			Parallelism: 2,
+		},
+	)
+
+	s.Require().NoError(err, "a limited parallel search must succeed")
+	s.Require().Equal([]int64{987, 500}, s.offsets(out.Matches),
+		"parallelism must not change which matches count as newest: reading an older slice first and stopping at max_matches returns old matches labelled as the newest")
+}
+
+func (s *HighVolumeSuite) TestParallelOldestFirstReturnsTheOldestMatches() {
+	out, err := searchmessages.Run(
+		s.T().Context(),
+		s.env.Admin(),
+		s.env.Reader(),
+		"",
+		searchmessages.Input{
+			Topic:       s.topic,
+			Script:      `return value.eventType === "NEW"`,
+			Direction:   "oldest_first",
+			MaxMatches:  2,
+			Parallelism: 2,
+		},
+	)
+
+	s.Require().NoError(err, "a limited parallel search must succeed")
+	s.Require().Equal([]int64{7, 493}, s.offsets(out.Matches),
+		"parallelism must not change which matches count as oldest")
 }
 
 func (s *HighVolumeSuite) TestParallelScanSplitsASinglePartition() {

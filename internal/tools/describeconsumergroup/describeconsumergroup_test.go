@@ -3,6 +3,7 @@ package describeconsumergroup_test
 import (
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/suite"
 
@@ -104,6 +105,68 @@ func (s *DescribeConsumerGroupSuite) TestActiveGroupShowsWhoOwnsEachPartition() 
 			"lag is end offset minus committed offset summed over partitions; six messages arrived after the last commit")
 		s.Require().EqualValues(total, out.TotalLag, "the total must match the partitions it summarises")
 	})
+}
+
+func (s *DescribeConsumerGroupSuite) observe(group string, seconds int) (describeconsumergroup.Output, error) {
+	s.T().Helper()
+
+	out, err := describeconsumergroup.Run(s.T().Context(), s.env.Admin(), describeconsumergroup.Input{
+		Items: []describeconsumergroup.Item{{Group: group, SampleSeconds: seconds}},
+	})
+	if err != nil {
+		return describeconsumergroup.Output{}, err
+	}
+	if out.Results[0].Error != "" {
+		return describeconsumergroup.Output{}, errors.New(out.Results[0].Error)
+	}
+
+	return *out.Results[0].Result, nil
+}
+
+func (s *DescribeConsumerGroupSuite) TestObservingAStableGroupReportsNoChurn() {
+	topic := s.env.CreateTopic(s.T(), "describe-group-stable")
+	group := s.env.UniqueName("describe-group-stable")
+	s.env.JoinGroup(s.T(), topic, group, "steady-worker")
+
+	out, err := s.observe(group, 2)
+	s.Require().NoError(err, "observing a group must succeed")
+
+	s.Require().NotNil(out.Observation, "the observation is reported only when sample_seconds was set")
+	s.Require().GreaterOrEqual(out.Observation.Samples, 2, "the group must be read more than once to see change")
+	s.Require().Empty(out.Observation.Joined, "no member joined")
+	s.Require().Empty(out.Observation.Left, "no member left")
+	s.Require().Equal([]string{"Stable"}, out.Observation.States,
+		"a group that never left Stable is the answer that rules out a rebalance storm")
+	s.Require().False(out.Observation.Unstable, "nothing changed, so the group is not unstable")
+}
+
+func (s *DescribeConsumerGroupSuite) TestObservingReportsMembersThatJoinAndLeave() {
+	topic := s.env.CreateTopicWithPartitions(s.T(), "describe-group-churn", 2)
+	group := s.env.UniqueName("describe-group-churn")
+	leave := s.env.JoinGroup(s.T(), topic, group, "worker-a")
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		time.Sleep(time.Second)
+		leave()
+	}()
+
+	out, err := s.observe(group, 4)
+	<-done
+	s.Require().NoError(err, "observing a changing group must succeed")
+
+	s.Require().NotEmpty(out.Observation.Left, "the member that stopped must be reported as having left")
+	s.Require().Equal("worker-a", out.Observation.Left[0].ClientID,
+		"the client id and host of a departed member are how an operator finds the crash-looping pod")
+	s.Require().True(out.Observation.Unstable, "membership changed during the window")
+	s.Require().GreaterOrEqual(len(out.Observation.States), 2,
+		"the state moved away from Stable when the member left, and the sequence must show it")
+}
+
+func (s *DescribeConsumerGroupSuite) TestRejectsAnUnboundedObservation() {
+	_, err := s.observe("anything", 3600)
+	s.Require().ErrorContains(err, "sample_seconds", "the call blocks for the window, so it must be bounded")
 }
 
 func (s *DescribeConsumerGroupSuite) TestEmptyGroupStillReportsCommittedOffsets() {

@@ -5,9 +5,11 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+	mcors "github.com/rakunlabs/ada/middleware/cors"
 	"github.com/stretchr/testify/suite"
 
 	"github.com/denizgursoy/kafka-mcp/internal/domain/config"
@@ -195,4 +197,126 @@ func (s *HTTPRoutesSuite) TestConfiguredEndpointPathsAreExact() {
 
 	s.Require().Equal(http.StatusNotFound, response.Code,
 		"custom endpoint routing must use exact paths so a read endpoint cannot accidentally catch a nearby path")
+}
+
+// initialize posts an MCP initialize request to path with the given headers
+// and returns the status code.
+func (s *HTTPRoutesSuite) initialize(server http.Handler, path string, headers map[string]string) int {
+	body := `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}`
+	request := httptest.NewRequestWithContext(s.T().Context(), http.MethodPost, path, strings.NewReader(body))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Accept", "application/json, text/event-stream")
+	for name, value := range headers {
+		request.Header.Set(name, value)
+	}
+	response := httptest.NewRecorder()
+	server.ServeHTTP(response, request)
+
+	return response.Code
+}
+
+func (s *HTTPRoutesSuite) secured(cfg config.HTTP) http.Handler {
+	if cfg.CORS.AllowMethods == nil {
+		origins := cfg.CORS.AllowOrigins
+		cfg.CORS = config.DefaultCORS()
+		cfg.CORS.AllowOrigins = origins
+	}
+
+	return newHTTPServer(
+		&config.Config{
+			HTTP:      cfg,
+			Endpoints: map[string]*config.Endpoint{"local": {Name: "local", Cluster: "local", Path: "/mcp/local"}},
+		},
+		map[string]*mcp.Server{"local": mcp.NewServer(&mcp.Implementation{Name: "local", Version: "test"}, nil)},
+	)
+}
+
+func (s *HTTPRoutesSuite) TestRefusesBrowserOriginsNotAllowed() {
+	server := s.secured(config.HTTP{CORS: mcors.Cors{AllowOrigins: []string{"https://allowed.example"}}})
+
+	s.Run("a request without an origin is served", func() {
+		s.Require().Equal(http.StatusOK, s.initialize(server, "/mcp/local", nil),
+			"command-line MCP clients send no Origin header and must keep working")
+	})
+	s.Run("an unlisted origin is refused before reaching the handler", func() {
+		s.Require().Equal(http.StatusForbidden, s.initialize(server, "/mcp/local", map[string]string{"Origin": "https://evil.example"}),
+			"CORS only hides the response from the page; the request itself would still run a tool, so it must be refused outright")
+	})
+	s.Run("a listed origin is served", func() {
+		s.Require().Equal(http.StatusOK, s.initialize(server, "/mcp/local", map[string]string{"Origin": "https://allowed.example"}),
+			"an origin the operator named is a browser client they chose to trust")
+	})
+	s.Run("health stays reachable from any origin", func() {
+		request := httptest.NewRequestWithContext(s.T().Context(), http.MethodGet, "/healthz", nil)
+		request.Header.Set("Origin", "https://evil.example")
+		response := httptest.NewRecorder()
+		server.ServeHTTP(response, request)
+		s.Require().Equal(http.StatusOK, response.Code, "the liveness probe runs no tool, so there is nothing to protect")
+	})
+}
+
+func (s *HTTPRoutesSuite) TestDefaultPolicyRefusesEveryOrigin() {
+	server := s.secured(config.HTTP{CORS: config.DefaultCORS()})
+
+	s.Require().Equal(http.StatusForbidden, s.initialize(server, "/mcp/local", map[string]string{"Origin": "http://localhost:3000"}),
+		"with no origin configured, no page may drive the tools, including one on localhost")
+	s.Require().Equal(http.StatusOK, s.initialize(server, "/mcp/local", nil),
+		"the default must not break clients that send no Origin")
+
+	request := httptest.NewRequestWithContext(s.T().Context(), http.MethodOptions, "/mcp/local", nil)
+	request.Header.Set("Origin", "https://evil.example")
+	request.Header.Set("Access-Control-Request-Method", http.MethodPost)
+	response := httptest.NewRecorder()
+	server.ServeHTTP(response, request)
+	s.Require().Empty(response.Header().Get("Access-Control-Allow-Origin"),
+		"a preflight must not advertise an origin the server will refuse")
+}
+
+func (s *HTTPRoutesSuite) TestWildcardOriginIsHonoured() {
+	server := s.secured(config.HTTP{CORS: mcors.Cors{AllowOrigins: []string{"*"}}})
+
+	s.Require().Equal(http.StatusOK, s.initialize(server, "/mcp/local", map[string]string{"Origin": "https://any.example"}),
+		"an operator who explicitly allows every origin gets the old behaviour")
+}
+
+func (s *HTTPRoutesSuite) TestAuthToken() {
+	server := s.secured(config.HTTP{AuthToken: "inbound-secret"})
+
+	s.Run("a request without the token is refused", func() {
+		s.Require().Equal(http.StatusUnauthorized, s.initialize(server, "/mcp/local", nil),
+			"with a token configured, an unauthenticated caller must reach no tool")
+	})
+	s.Run("a wrong token is refused", func() {
+		s.Require().Equal(http.StatusUnauthorized, s.initialize(server, "/mcp/local", map[string]string{"Authorization": "Bearer wrong"}),
+			"a token that does not match must be refused")
+	})
+	s.Run("a token in another scheme is refused", func() {
+		s.Require().Equal(http.StatusUnauthorized, s.initialize(server, "/mcp/local", map[string]string{"Authorization": "Basic inbound-secret"}),
+			"only the bearer scheme carries the token")
+	})
+	s.Run("the right token is served", func() {
+		s.Require().Equal(http.StatusOK, s.initialize(server, "/mcp/local", map[string]string{"Authorization": "Bearer inbound-secret"}),
+			"the configured token must authenticate the caller")
+	})
+	s.Run("health needs no token", func() {
+		request := httptest.NewRequestWithContext(s.T().Context(), http.MethodGet, "/healthz", nil)
+		response := httptest.NewRecorder()
+		server.ServeHTTP(response, request)
+		s.Require().Equal(http.StatusOK, response.Code, "an orchestrator's liveness probe must not need the MCP token")
+	})
+	s.Run("an allowed origin's preflight needs no token", func() {
+		cors := config.DefaultCORS()
+		cors.AllowOrigins = []string{"https://allowed.example"}
+		server := s.secured(config.HTTP{AuthToken: "inbound-secret", CORS: cors})
+		request := httptest.NewRequestWithContext(s.T().Context(), http.MethodOptions, "/mcp/local", nil)
+		request.Header.Set("Origin", "https://allowed.example")
+		request.Header.Set("Access-Control-Request-Method", http.MethodPost)
+		request.Header.Set("Access-Control-Request-Headers", "authorization,content-type")
+		response := httptest.NewRecorder()
+		server.ServeHTTP(response, request)
+		s.Require().Equal(http.StatusNoContent, response.Code,
+			"browsers never send credentials on a preflight, so requiring the token there would block every browser client")
+		s.Require().Equal("https://allowed.example", response.Header().Get("Access-Control-Allow-Origin"),
+			"the preflight must be answered, or the browser never sends the authenticated request")
+	})
 }

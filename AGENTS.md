@@ -49,7 +49,7 @@ internal/domain/          Everything shared by more than one tool
   testenv/                Test container environment (broker + Console)
 skills/kafka-debugging/   One umbrella skill; scenario guides in references/
 _docs/                    Documentation site (Vite, pnpm), published to GitHub Pages
-docker-compose.yml        Local Redpanda + Redpanda Console
+env/docker-compose.yaml   Local Redpanda + Redpanda Console
 Makefile                  Build, run and compose targets
 ```
 
@@ -359,7 +359,7 @@ Building is not verification. Confirm the tool works over the real MCP protocol,
 against a running server:
 
 ```sh
-make up
+make env-up
 make run &                    # serves kafka-mcp.local.yaml on :8090
 
 curl http://localhost:8090/healthz
@@ -398,15 +398,15 @@ curl -s -o /dev/null -w '%{http_code}\n' -X POST http://localhost:8090/mcp/nope 
 
 | Command             | Purpose                                     |
 | ------------------- | ------------------------------------------- |
-| `make up`           | Start Redpanda and Console                  |
-| `make down`         | Stop containers                             |
+| `make env-up`       | Start Redpanda and Console                  |
+| `make env-down`     | Stop containers                             |
 | `make build`        | Build the server binary                     |
 | `make run`          | Run the server on :8090                     |
 | `go test ./...`     | Run all tests, including container tests    |
 | `go test -short ./...` | Run tests without containers             |
 | `go vet ./...`      | Vet all packages                            |
 
-Local endpoints from `docker-compose.yml`:
+Local endpoints from `env/docker-compose.yaml`:
 
 - Kafka broker (host): `localhost:19092`
 - Schema Registry: `localhost:18081`

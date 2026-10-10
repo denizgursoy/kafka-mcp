@@ -32,6 +32,7 @@ type Output struct {
 	SASLOptions    []config.SASLIdentity `json:"sasl_options,omitempty"`
 	TLS            bool                  `json:"tls"`
 	ReadOnly       bool                  `json:"read_only"`
+	Destinations   []string              `json:"destinations"`
 	OutputDir      string                `json:"output_dir"`
 	ConfigFile     string                `json:"config_file,omitempty"`
 	HTTPAddress    string                `json:"http_address,omitempty"`
@@ -51,7 +52,7 @@ type TopicFormat struct {
 
 const description = `
 Report this endpoint's name, path, purpose, cluster, brokers, authentication,
-TLS, read-only policy, Schema Registry, configured topic formats and exposed
+TLS, read-only policy, the other clusters it may write to (destinations), Schema Registry, configured topic formats and exposed
 tools. Use it to confirm the target and permissions before acting; several
 endpoints may target one cluster with different policies. Passwords are never
 returned.
@@ -120,6 +121,7 @@ func Run(kafka *kafkaclient.Client, server *config.Config, endpoint *config.Endp
 		Authentication: "none",
 		TLS:            cfg.TLS != nil && cfg.TLS.Enabled,
 		ReadOnly:       endpoint.ReadOnly,
+		Destinations:   append([]string{}, endpoint.Destinations...),
 		Tools:          append([]string{}, tools...),
 		Note: "read_only protects a cluster without ACLs and can be turned off by " +
 			"anyone who can edit the configuration. Real authorisation comes from " +

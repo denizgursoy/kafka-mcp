@@ -1,6 +1,6 @@
 ---
 name: kafka-debugging
-description: Use when debugging a Kafka cluster through the kafka-mcp server — finding a message by id, key or field; measuring consumer lag and when a backlog clears; unblocking a stuck consumer; replaying messages since a moment; adding partitions; creating, reconfiguring or deleting a topic; producing a message; purging old messages or abandoned consumer groups; comparing two clusters; checking cluster health; or explaining an authorization error. Use for requests like "find the message for order 12345", "is there lag on orders", "the consumer is stuck", "which pod owns this partition", "reprocess everything since 9 this morning", "add partitions", "we need a dead letter topic", "cut retention on orders", "send a corrected message", "reproduce this in preprod", "delete this topic", "delete the test data but keep the topic", "remove the old consumer groups", "are these two environments the same", "producers fail with NOT_ENOUGH_REPLICAS", "is the cluster healthy", or "TOPIC_AUTHORIZATION_FAILED". Routes to the guide for the scenario, so read this before calling the tools.
+description: Use when debugging a Kafka cluster through the kafka-mcp server — finding a message by id, key or field; measuring consumer lag and when a backlog clears; unblocking a stuck consumer; replaying messages since a moment; adding partitions; creating, reconfiguring or deleting a topic; producing a message; purging old messages or abandoned consumer groups; comparing two clusters; checking cluster health; finding why a group keeps rebalancing or one partition lags; diagnosing a schema change; or explaining an authorization error. Use for requests like "find the message for order 12345", "is there lag on orders", "the consumer is stuck", "which pod owns this partition", "reprocess everything since 9 this morning", "add partitions", "we need a dead letter topic", "cut retention on orders", "send a corrected message", "reproduce this in preprod", "delete this topic", "delete the test data but keep the topic", "remove the old consumer groups", "are these two environments the same", "producers fail with NOT_ENOUGH_REPLICAS", "is the cluster healthy", "the consumer keeps rebalancing", "one partition always lags", "producer gets 409 incompatible schema", "is this schema change safe", "the disk is filling up", or "TOPIC_AUTHORIZATION_FAILED". Routes to the guide for the scenario, so read this before calling the tools.
 ---
 
 # Kafka debugging
@@ -26,6 +26,9 @@ wrong in a specific way.
 | Whether brokers and partitions are healthy, or why producers get NOT_ENOUGH_REPLICAS | [cluster-health](references/cluster-health.md) |
 | To delete old messages but keep the topic, or remove abandoned groups | [purge-messages](references/purge-messages.md) |
 | Why a client is refused with an authorization error | [authorization-error](references/authorization-error.md) |
+| Why a group keeps rebalancing, or members keep leaving | [unstable-consumer-group](references/unstable-consumer-group.md) |
+| Why one partition lags while the others keep up | [partition-skew](references/partition-skew.md) |
+| Whether a schema change is safe, or why producers or consumers broke on one | [schema-error](references/schema-error.md) |
 
 ## When "the consumer is behind" is ambiguous
 
@@ -40,6 +43,14 @@ them by wording is guesswork. Call `consumer_lag` first and let `status` decide:
 | `stalled` | Members present, consuming nothing | [skip-poison-message](references/skip-poison-message.md), which checks `open_transactions` first |
 | `no_active_consumers` | Nobody is running | Say so: starting a consumer is the fix |
 
+Before reading `status`, check three things that override it:
+
+- any partition with **`offset_expired`**: retention deleted the group's
+  position, and the fix is where it resumes → [replay-messages](references/replay-messages.md)
+- lag concentrated on **one partition** → [partition-skew](references/partition-skew.md)
+- a **state other than `Stable`** that keeps returning →
+  [unstable-consumer-group](references/unstable-consumer-group.md)
+
 Adding partitions to a `stalled` group, or skipping a message from a `growing`
 one, is the common way this goes wrong. One destroys data for a capacity
 problem; the other adds capacity to a consumer that is not consuming.
@@ -51,7 +62,9 @@ cluster with different paths, purposes and permissions. Every tool is bound to
 the cluster and policy of the endpoint it was called on. No tool takes a cluster
 parameter, except `copy_message` and `produce_message`, which choose a
 destination, `compare_clusters`, which names the cluster to compare against, and
-`list_clusters`, which reports the roster.
+`list_clusters`, which reports the roster. A destination must be one this
+endpoint lists in its `destinations` (reported by `server_config`); a cluster
+another endpoint may write to is not thereby writable from this one.
 
 **Check `server_config` before promising a change.** A read-only endpoint does
 not expose `add_partitions`, `alter_topic_config`, `commit_offset`,
@@ -75,10 +88,14 @@ messages are shown decoded to JSON, with `schema_id` saying which schema; a
 the message's real content. Never write JSON back into a schema-encoded topic
 without `value_schema` — see [produce-message](references/produce-message.md).
 
-**Every target is an `items` array.** The tools that name a topic, partition,
-offset or group take it only inside `items` — there is no single-target form, so
-one operation is an array of length one and several are the same call with more
-entries. Never make one call per topic when one call can carry them all.
+**Every target is an `items` array.** The tools that operate on a named topic,
+partition, offset or group take it only inside `items` — there is no
+single-target form, so one operation is an array of length one and several are
+the same call with more entries. Never make one call per topic when one call
+can carry them all. The exceptions are tools whose one call is already a scan
+or a filter: `search_messages` takes `topic` at the top level, and
+`list_consumer_groups` takes an optional `topic` filter. Check a tool's schema
+rather than assuming.
 
 Responses match: results stay in input order, each with `index` and either
 `result` or `error`, so one item failing never hides the rest. Read the item's

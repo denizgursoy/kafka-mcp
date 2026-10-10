@@ -2,7 +2,9 @@ package searchmessages
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -58,7 +60,13 @@ func newExporter(dir string, name string) (*exporter, error) {
 		return nil, err
 	}
 
-	file, err := os.Create(path)
+	// O_EXCL refuses an existing name, which also refuses a planted symlink:
+	// with O_CREAT it fails on any existing entry, link or not, instead of
+	// following it. An earlier export is never silently replaced.
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if errors.Is(err, fs.ErrExist) {
+		return nil, fmt.Errorf("output_file %q already exists in %s: choose a new name", name, filepath.Dir(path))
+	}
 	if err != nil {
 		return nil, fmt.Errorf("create output file %s: %w", path, err)
 	}

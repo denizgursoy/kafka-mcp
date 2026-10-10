@@ -11,28 +11,42 @@ import (
 	"github.com/twmb/franz-go/pkg/kadm"
 
 	"github.com/denizgursoy/kafka-mcp/internal/domain/batch"
+	"github.com/denizgursoy/kafka-mcp/internal/domain/records"
 )
 
 // Item is one topic/group measurement.
 type Item struct {
-	Topic           string `json:"topic" jsonschema:"Topic to measure lag on. Matched exactly and case-sensitively."`
-	Group           string `json:"group,omitempty" jsonschema:"Optional consumer group. Defaults to every group that consumes or holds committed offsets for the topic."`
-	SampleSeconds   int    `json:"sample_seconds,omitempty" jsonschema:"Optional number of seconds to sample the consume rate over. Defaults to 5. The call blocks for this long, because Kafka stores no history of past commits and the rate can only be measured by comparing two readings."`
-	SkipConsumeRate bool   `json:"skip_consume_rate,omitempty" jsonschema:"Optional. When true, return immediately without sampling the consume rate. No completion estimate can be produced, because there is no rate to divide the lag by."`
+	Topic             string `json:"topic" jsonschema:"Topic to measure lag on. Matched exactly and case-sensitively."`
+	Group             string `json:"group,omitempty" jsonschema:"Optional consumer group. Defaults to every group that consumes or holds committed offsets for the topic."`
+	SampleSeconds     int    `json:"sample_seconds,omitempty" jsonschema:"Optional number of seconds to sample the consume rate over. Defaults to 5, at most 300. The call blocks for this long, because Kafka stores no history of past commits and the rate can only be measured by comparing two readings."`
+	MeasureBacklogAge bool   `json:"measure_backlog_age,omitempty" jsonschema:"Optional. When true, read the next unconsumed message of every lagging partition to report how old the backlog is (committed_timestamp, lag_seconds, oldest_unconsumed_at) and whether it is at risk of being deleted by retention before it is consumed (retention_risk). Costs one fetch per lagging partition."`
+	SkipConsumeRate   bool   `json:"skip_consume_rate,omitempty" jsonschema:"Optional. When true, return immediately without sampling the consume rate. No completion estimate can be produced, because there is no rate to divide the lag by."`
 }
 
 // Input is the argument set accepted by the consumer_lag tool.
 type Input struct {
-	Items []Item `json:"items" jsonschema:"The measurements to take, 1 to 100 of them. Measuring one topic is an array of length one. Sampling windows run concurrently, so several measurements do not add their wait times together."`
+	Items []Item `json:"items" jsonschema:"The measurements to take, 1 to 100 of them. Measuring one topic is an array of length one. Up to 4 sampling windows run at a time, so the call takes about sample_seconds for every 4 measurements."`
 }
 
 // PartitionLag is the lag of one partition within a group.
 type PartitionLag struct {
-	Partition       int32  `json:"partition"`
-	CommittedOffset int64  `json:"committed_offset"`
-	EndOffset       int64  `json:"end_offset"`
-	Lag             int64  `json:"lag"`
-	Error           string `json:"error,omitempty"`
+	Partition       int32 `json:"partition"`
+	CommittedOffset int64 `json:"committed_offset"`
+	StartOffset     int64 `json:"start_offset"`
+	EndOffset       int64 `json:"end_offset"`
+	Lag             int64 `json:"lag"`
+
+	// OffsetExpired is true when the committed offset is below the log start:
+	// retention deleted the group's position, so the consumer will reset by
+	// auto.offset.reset on its next fetch instead of resuming.
+	OffsetExpired bool `json:"offset_expired,omitempty"`
+
+	// CommittedTimestamp is the timestamp of the next message to consume, and
+	// LagSeconds its age. Reported only with measure_backlog_age.
+	CommittedTimestamp *time.Time `json:"committed_timestamp,omitempty"`
+	LagSeconds         *float64   `json:"lag_seconds,omitempty"`
+
+	Error string `json:"error,omitempty"`
 }
 
 // GroupLag is everything measured about one consumer group.
@@ -50,6 +64,14 @@ type GroupLag struct {
 	DrainPerSecond *float64 `json:"drain_per_second,omitempty"`
 	GrowingPerMin  *float64 `json:"growing_by_per_minute,omitempty"`
 
+	// OldestUnconsumedAt is the oldest committed_timestamp across the group's
+	// partitions, and RetentionRisk whether that message has used up most of
+	// the topic's retention. Reported only with measure_backlog_age.
+	OldestUnconsumedAt *time.Time `json:"oldest_unconsumed_at,omitempty"`
+	RetentionRisk      bool       `json:"retention_risk,omitempty"`
+
+	Warnings []string `json:"warnings,omitempty"`
+
 	ETASeconds *float64   `json:"eta_seconds,omitempty"`
 	ETAHuman   string     `json:"eta_human,omitempty"`
 	ETAAt      *time.Time `json:"eta_at,omitempty"`
@@ -61,8 +83,11 @@ type GroupLag struct {
 
 // Output is the result returned by the consumer_lag tool.
 type Output struct {
-	Topic       string       `json:"topic"`
-	TotalLag    int64        `json:"total_lag"`
+	Topic    string `json:"topic"`
+	TotalLag int64  `json:"total_lag"`
+	// RetentionMs is the topic's retention.ms, -1 for unlimited. Reported only
+	// with measure_backlog_age.
+	RetentionMs *int64       `json:"retention_ms,omitempty"`
 	ProduceRate *ProduceRate `json:"produce_rate,omitempty"`
 	Groups      []GroupLag   `json:"groups"`
 }
@@ -79,7 +104,11 @@ const (
 	statusNotMeasured = "not_measured"
 )
 
-const defaultSampleSeconds = 5
+const (
+	defaultSampleSeconds = 5
+	// maxSampleSeconds bounds how long one measurement holds the request open.
+	maxSampleSeconds = 300
+)
 
 const description = `
 Measure consumer lag for 1 to 100 topics in one call through items: production
@@ -91,12 +120,12 @@ Results follow items order, each carrying index with result or error. Measuring
 one topic is an items array of length one.
 
 Consumption rate is sampled for sample_seconds, so the call waits that long.
-Windows run concurrently, so several measurements do not add their waits
-together. Set skip_consume_rate for an immediate result without an ETA.
+Up to 4 windows run at a time, so the call takes about sample_seconds per 4
+items. Set skip_consume_rate for an immediate result without an ETA.
 `
 
 // Register adds the consumer_lag tool to the MCP server.
-func Register(server *mcp.Server, admin *kadm.Client) {
+func Register(server *mcp.Server, admin *kadm.Client, reader *records.Reader) {
 	mcp.AddTool(
 		server,
 		&mcp.Tool{
@@ -109,7 +138,7 @@ func Register(server *mcp.Server, admin *kadm.Client) {
 			input Input,
 		) (*mcp.CallToolResult, BatchOutput, error) {
 
-			out, err := Run(ctx, admin, input)
+			out, err := Run(ctx, admin, reader, input)
 			if err != nil {
 				return nil, BatchOutput{}, fmt.Errorf("consumer lag: %w", err)
 			}
@@ -121,9 +150,9 @@ func Register(server *mcp.Server, admin *kadm.Client) {
 
 // Run measures every requested topic with bounded concurrency, so several
 // sampling windows do not add their wait times together.
-func Run(ctx context.Context, admin *kadm.Client, input Input) (BatchOutput, error) {
+func Run(ctx context.Context, admin *kadm.Client, reader *records.Reader, input Input) (BatchOutput, error) {
 	return batch.Run(ctx, input.Items, batch.MaxItems, func(ctx context.Context, item Item) (Output, error) {
-		return measure(ctx, admin, item)
+		return measure(ctx, admin, reader, item)
 	})
 }
 
@@ -131,6 +160,7 @@ func Run(ctx context.Context, admin *kadm.Client, input Input) (BatchOutput, err
 func measure(
 	ctx context.Context,
 	admin *kadm.Client,
+	reader *records.Reader,
 	input Item,
 ) (Output, error) {
 
@@ -138,9 +168,8 @@ func measure(
 		return Output{}, fmt.Errorf("topic is required")
 	}
 
-	if input.SampleSeconds < 0 {
-		return Output{}, fmt.Errorf(
-			"sample_seconds must not be negative, got %d", input.SampleSeconds)
+	if err := batch.Bounded("sample_seconds", input.SampleSeconds, maxSampleSeconds); err != nil {
+		return Output{}, err
 	}
 
 	details, err := admin.ListTopics(ctx, input.Topic)
@@ -203,6 +232,11 @@ func measure(
 		}
 	}
 
+	starts, err := admin.ListStartOffsets(ctx, input.Topic)
+	if err != nil {
+		return Output{}, fmt.Errorf("list start offsets for %q: %w", input.Topic, err)
+	}
+
 	for _, group := range groups {
 		measured, err := measureGroup(
 			input.Topic, group, before, after, produce, sampleSeconds, input.SkipConsumeRate)
@@ -210,8 +244,16 @@ func measure(
 			return Output{}, err
 		}
 
+		markExpired(&measured, input.Topic, starts)
+
 		out.Groups = append(out.Groups, measured)
 		out.TotalLag += measured.Lag
+	}
+
+	if input.MeasureBacklogAge {
+		if err := measureAge(ctx, admin, reader, &out); err != nil {
+			return Output{}, err
+		}
 	}
 
 	sort.Slice(out.Groups, func(i, j int) bool {

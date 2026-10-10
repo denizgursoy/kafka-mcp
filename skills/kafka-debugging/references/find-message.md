@@ -35,7 +35,7 @@ Ask them to choose when several are plausible. Do not guess.
 Call `sample_messages` **before** searching. This is the step that decides how
 to search, and skipping it usually produces a slow, imprecise query.
 
-Read three things from the result:
+Read these from the result:
 
 - **`key_in_value`** — if it names a field such as `payload.orderId`, then the
   key *is* that identifier. This is the single most useful fact in the whole
@@ -60,8 +60,10 @@ finds nothing.
 
 Filtering is a JavaScript expression. In scope are `value` (the parsed JSON
 document, the decoded record for Avro, Protobuf or JSON Schema, or the raw text
-otherwise), `key`, `headers`,
-`partition`, `offset` and `timestamp`. Return true to keep a message.
+otherwise), `key`, `headers`, `partition`, `offset`, `timestamp`, and the
+message's shape: `value_bytes` and `key_bytes` (raw sizes), `format`,
+`schema_id` and `decode_error` (null when absent). Return true to keep a
+message.
 
 **If the identifier is the key**, compare it exactly:
 
@@ -87,6 +89,9 @@ return value.payload.items.some(function (i) { return i.qty > 100 })
 return value.payload.amount > value.payload.refunded
 return timestamp.getUTCHours() < 6
 return /ORD-\d{4}/.test(value.payload.orderId)
+return schema_id === 57                 // written with one schema version
+return decode_error !== null            // the ones that could not be decoded
+return value_bytes > 900000             // near max.message.bytes
 ```
 
 Two traps worth respecting:
@@ -138,10 +143,11 @@ investigation goes wrong.
 
 ### 6. Consider parallelism for large scans
 
-`parallelism` splits a **single-partition** topic's offsets between that many
-readers, which is what makes a full scan of one large partition fast. It is
-worth setting for `count_only`, `output_file` or a full-range search on such a
-topic.
+`parallelism` reads a **single-partition** topic with that many concurrent
+readers, which is what makes a full scan of one large partition fast. The
+matches returned are the same as a sequential search would return. It is worth
+setting for `count_only`, `group_by`, `output_file` or a full-range search on
+such a topic.
 
 A multi-partition topic is already read across its partitions together, so the
 setting does not apply there. Every partition's newest chunk is read before any
@@ -152,8 +158,10 @@ first. Matches are merged by timestamp.
 ### 7. Handle large result sets deliberately
 
 If the query may match many messages, do not fetch bodies first. Call
-`search_messages` with `count_only: true` to learn how many there are, then
-**ask the user how they want them**:
+`search_messages` with `count_only: true` to learn how many there are, or with
+`group_by` to learn what they consist of. `return headers['error-reason']`,
+`return value.eventType` or `return schema_id` give a count per bucket with one
+example address each, largest first. Then **ask the user how they want them**:
 
 - the newest few (`direction: "newest_first"`, small `max_matches`)
 - the oldest few (`direction: "oldest_first"`)

@@ -130,6 +130,39 @@ func (s *ConfigSuite) TestLoadsSeveralEndpointsForOneCluster() {
 		"tool switches belong to the endpoint because two views of one cluster may expose different capabilities")
 }
 
+func (s *ConfigSuite) TestEndpointDestinations() {
+	s.Run("loaded and sorted", func() {
+		loaded, err := s.load(s.write(`{
+			"clusters": {"prod": {"brokers": "kafka:9093"}, "preprod": {"brokers": "kafka:9094"}, "dev": {"brokers": "kafka:9095"}},
+			"endpoints": {"prod-read": {"cluster": "prod", "read_only": true, "destinations": ["preprod", "dev"]}}
+		}`))
+		s.Require().NoError(err, "destinations naming configured clusters must load")
+		s.Require().Equal([]string{"dev", "preprod"}, loaded.Endpoints["prod-read"].Destinations,
+			"destinations are reported by server_config, so their order must not depend on the file")
+	})
+	s.Run("an unknown cluster stops the server", func() {
+		_, err := s.load(s.write(`{
+			"clusters": {"prod": {"brokers": "kafka:9093"}},
+			"endpoints": {"prod-read": {"cluster": "prod", "destinations": ["prepord"]}}
+		}`))
+		s.Require().ErrorContains(err, "prepord", "a typo would silently grant nothing, so it must be reported at startup")
+	})
+	s.Run("the endpoint's own cluster is refused", func() {
+		_, err := s.load(s.write(`{
+			"clusters": {"prod": {"brokers": "kafka:9093"}},
+			"endpoints": {"prod-read": {"cluster": "prod", "read_only": true, "destinations": ["prod"]}}
+		}`))
+		s.Require().ErrorContains(err, "read_only",
+			"writing to an endpoint's own cluster is governed by read_only, and a listing that looked like it overrides it would mislead")
+	})
+	s.Run("legacy clusters may write to every other cluster", func() {
+		loaded, err := s.load(s.write(`{"clusters": {"prod": {"brokers": "kafka:9093", "read_only": true}, "preprod": {"brokers": "kafka:9094"}}}`))
+		s.Require().NoError(err, "the legacy format must load")
+		s.Require().Equal([]string{"preprod"}, loaded.Endpoints["prod"].Destinations,
+			"the legacy format had cross-cluster copies to any cluster, and migrating must not silently break them")
+	})
+}
+
 func (s *ConfigSuite) TestLegacyClustersBecomeEndpoints() {
 	loaded, err := s.load(s.write(`{
 		"clusters": {
@@ -342,6 +375,36 @@ func (s *ConfigSuite) TestDefaultsTheListenAddress() {
 // browser reports almost nothing when a preflight is refused, so a key
 // silently lost between the file and the middleware would surface as "the
 // client cannot reach the server" and nothing more.
+func (s *ConfigSuite) TestAuthToken() {
+	s.Run("absent by default", func() {
+		loaded, err := s.load(s.write(`{"clusters": {"local": {"brokers": "localhost:19092"}}}`))
+		s.Require().NoError(err, "a config without a token must load")
+		s.Require().Empty(loaded.HTTP.AuthToken, "no token means no inbound authentication, as before")
+	})
+	s.Run("resolved from the environment", func() {
+		s.T().Setenv("MCP_TOKEN", "inbound-secret")
+		loaded, err := s.load(s.write(`{"http": {"auth_token": "{env:MCP_TOKEN}"}, "clusters": {"local": {"brokers": "localhost:19092"}}}`))
+		s.Require().NoError(err, "a token placeholder must resolve")
+		s.Require().Equal("inbound-secret", loaded.HTTP.AuthToken,
+			"the token must support {env:VAR} like every other secret, so a config file can be committed")
+	})
+	s.Run("set entirely from the environment", func() {
+		s.T().Setenv("KAFKA_MCP_HTTP_AUTH_TOKEN", "token-from-env")
+		s.T().Setenv("KAFKA_MCP_HTTP_CORS_ALLOW_ORIGINS", "https://a.example,https://b.example")
+		loaded, err := s.load(s.write(`{"clusters": {"local": {"brokers": "localhost:19092"}}}`))
+		s.Require().NoError(err, "a container deployment must be able to set the token without touching the file")
+		s.Require().Equal("token-from-env", loaded.HTTP.AuthToken,
+			"the README documents KAFKA_MCP_HTTP_AUTH_TOKEN, so the prefixed variable must reach the field")
+		s.Require().Equal([]string{"https://a.example", "https://b.example"}, loaded.HTTP.CORS.AllowOrigins,
+			"a comma-separated variable must become the origin list the README shows")
+	})
+	s.Run("a missing variable stops the server", func() {
+		_, err := s.load(s.write(`{"http": {"auth_token": "{env:MCP_TOKEN_UNSET}"}, "clusters": {"local": {"brokers": "localhost:19092"}}}`))
+		s.Require().ErrorContains(err, "MCP_TOKEN_UNSET",
+			"starting without the token the operator asked for would leave every endpoint open")
+	})
+}
+
 func (s *ConfigSuite) TestCORSDefaults() {
 	s.Run("an absent cors block keeps every default", func() {
 		loaded, err := s.load(s.write(`{"clusters": {"local": {"brokers": "localhost:19092"}}}`))
@@ -379,8 +442,15 @@ func (s *ConfigSuite) TestCORSDefaults() {
 			"an explicit false must be distinguishable from an absent key, or the setting cannot be turned off at all")
 	})
 
-	s.Run("the defaults answer the preflight an MCP client sends", func() {
-		handler := mcors.Middleware(mcors.WithConfig(config.DefaultCORS()))(
+	s.Run("no origin is allowed by default", func() {
+		s.Require().Empty(config.DefaultCORS().AllowOrigins,
+			"an allowed origin can drive every tool with the server's Kafka credentials, so no website may do so until the operator names it")
+	})
+
+	s.Run("an allowed origin gets the preflight an MCP client sends", func() {
+		policy := config.DefaultCORS()
+		policy.AllowOrigins = []string{"https://mcp-client.example"}
+		handler := mcors.Middleware(mcors.WithConfig(policy))(
 			http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 				w.WriteHeader(http.StatusOK)
 			}))
@@ -396,7 +466,7 @@ func (s *ConfigSuite) TestCORSDefaults() {
 		recorder := httptest.NewRecorder()
 		handler.ServeHTTP(recorder, request)
 
-		s.Require().Equal("*", recorder.Header().Get("Access-Control-Allow-Origin"),
+		s.Require().Equal("https://mcp-client.example", recorder.Header().Get("Access-Control-Allow-Origin"),
 			"without an allow-origin the browser discards the response, so the client never sees the server at all")
 		s.Require().Contains(recorder.Header().Get("Access-Control-Allow-Headers"), "mcp-session-id",
 			"every request after initialize carries the session id, so refusing it limits the client to one call")
@@ -409,7 +479,9 @@ func (s *ConfigSuite) TestCORSDefaults() {
 	})
 
 	s.Run("the session id is readable by the page", func() {
-		handler := mcors.Middleware(mcors.WithConfig(config.DefaultCORS()))(
+		policy := config.DefaultCORS()
+		policy.AllowOrigins = []string{"https://mcp-client.example"}
+		handler := mcors.Middleware(mcors.WithConfig(policy))(
 			http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 				w.WriteHeader(http.StatusOK)
 			}))
@@ -853,5 +925,76 @@ func (s *ConfigSuite) TestOAuthConfiguration() {
 	s.Run("OAuth and SCRAM in one entry", func() {
 		_, err := s.load(s.write(`{"clusters":{"prod":{"brokers":"kafka:9093","security":{"sasl":[{"oauth":{"enabled":true,"token":"token"},"scram":{"enabled":true}}]}}}}`))
 		s.Require().ErrorContains(err, "only one", "OAuth must participate in the per-entry exclusivity check")
+	})
+	s.Run("client certificate replaces the client secret", func() {
+		s.T().Setenv("OAUTH_KEY", "-----BEGIN PRIVATE KEY-----")
+		loaded, err := s.load(s.write(`{"clusters":{"prod":{"brokers":"kafka:9093","security":{"sasl":[{"oauth":{"enabled":true,"token_url":"https://idp/token","client_id":"client","proxy":"http://proxy:3128","tls":{"cert_file":"/etc/oauth/cert.pem","key":"{env:OAUTH_KEY}","ca_file":"/etc/oauth/ca.pem","insecure_skip_verify":true}}}]}}}}`))
+		s.Require().NoError(err, "RFC 8705 tls_client_auth authenticates with the certificate, so no client_secret is needed")
+		oauth := loaded.Clusters["prod"].SASL[0].OAuth
+		s.Require().Equal("/etc/oauth/cert.pem", oauth.TLS.CertFile, "the token endpoint certificate must reach the client")
+		s.Require().Equal("-----BEGIN PRIVATE KEY-----", oauth.TLS.Key, "inline keys must support environment substitution like other secrets")
+		s.Require().True(oauth.TLS.InsecureSkipVerify, "insecure_skip_verify must load for the token endpoint")
+		s.Require().Equal("http://proxy:3128", oauth.Proxy, "the token endpoint proxy must load")
+	})
+	s.Run("TLS alone does not replace the client secret", func() {
+		_, err := s.load(s.write(`{"clusters":{"prod":{"brokers":"kafka:9093","security":{"sasl":[{"oauth":{"enabled":true,"token_url":"https://idp/token","client_id":"client","tls":{"ca_file":"/etc/oauth/ca.pem"}}}]}}}}`))
+		s.Require().ErrorContains(err, "client certificate", "a CA authenticates the server, not the client, so the client still needs a secret")
+	})
+	s.Run("inline and file forms conflict", func() {
+		_, err := s.load(s.write(`{"clusters":{"prod":{"brokers":"kafka:9093","security":{"sasl":[{"oauth":{"enabled":true,"token_url":"https://idp/token","client_id":"client","tls":{"cert":"x","cert_file":"/x","key":"y"}}}]}}}}`))
+		s.Require().ErrorContains(err, "cert_file", "two sources for one certificate would leave which one is used to chance")
+	})
+	s.Run("certificate without key", func() {
+		_, err := s.load(s.write(`{"clusters":{"prod":{"brokers":"kafka:9093","security":{"sasl":[{"oauth":{"enabled":true,"token_url":"https://idp/token","client_id":"client","client_secret":"s","tls":{"cert_file":"/x"}}}]}}}}`))
+		s.Require().ErrorContains(err, "together", "a certificate without its key cannot authenticate and must fail at startup")
+	})
+	s.Run("invalid proxy", func() {
+		_, err := s.load(s.write(`{"clusters":{"prod":{"brokers":"kafka:9093","security":{"sasl":[{"oauth":{"enabled":true,"token_url":"https://idp/token","client_id":"client","client_secret":"s","proxy":"ftp://proxy:21"}}]}}}}`))
+		s.Require().ErrorContains(err, "proxy", "a proxy scheme the transport cannot use must fail at startup, not on first authentication")
+	})
+	s.Run("GCP workload identity", func() {
+		s.T().Setenv("GCP_CREDENTIALS", `{"type":"external_account","audience":"//iam.googleapis.com/test"}`)
+		loaded, err := s.load(s.write(`{"clusters":{"prod":{"brokers":"kafka:9093","security":{"sasl":[{"oauth":{"enabled":true,"gcp":{"enabled":true,"credentials":"{env:GCP_CREDENTIALS}","cert_file":"/c.pem","key_file":"/k.pem","format":"managed_kafka","lifetime":"30m","refresh_before":"2m","insecure_skip_verify":true}}}]}}}}`))
+		s.Require().NoError(err, "GCP must be a token source of its own, needing no token_url or client credentials")
+		gcp := loaded.Clusters["prod"].SASL[0].OAuth.GCP
+		s.Require().Contains(gcp.Credentials, "external_account", "inline credentials must support environment substitution")
+		s.Require().Equal(config.GCPFormatManagedKafka, gcp.Format, "the token format decides what Managed Kafka accepts")
+		s.Require().Equal(30*time.Minute, gcp.Lifetime, "duration strings must set the impersonated token lifetime")
+		s.Require().Equal(2*time.Minute, gcp.RefreshBefore, "duration strings must set the refresh margin")
+		s.Require().True(gcp.InsecureSkipVerify, "insecure_skip_verify must load for the Google endpoints")
+	})
+	s.Run("GCP needs a certificate", func() {
+		_, err := s.load(s.write(`{"clusters":{"prod":{"brokers":"kafka:9093","security":{"sasl":[{"oauth":{"enabled":true,"gcp":{"enabled":true,"audience":"a"}}}]}}}}`))
+		s.Require().ErrorContains(err, "cert and key are required", "the X.509 certificate is the identity GCP federates, so there is nothing to exchange without it")
+	})
+	s.Run("GCP needs an audience", func() {
+		_, err := s.load(s.write(`{"clusters":{"prod":{"brokers":"kafka:9093","security":{"sasl":[{"oauth":{"enabled":true,"gcp":{"enabled":true,"cert_file":"/c","key_file":"/k"}}}]}}}}`))
+		s.Require().ErrorContains(err, "audience", "STS cannot exchange a certificate without knowing the workload identity provider")
+	})
+	s.Run("GCP rejects an unknown format", func() {
+		_, err := s.load(s.write(`{"clusters":{"prod":{"brokers":"kafka:9093","security":{"sasl":[{"oauth":{"enabled":true,"gcp":{"enabled":true,"audience":"a","cert_file":"/c","key_file":"/k","format":"jwt"}}}]}}}}`))
+		s.Require().ErrorContains(err, "unknown format", "a mistyped format would send a token the broker rejects on every connection")
+	})
+	s.Run("GCP and a static token conflict", func() {
+		_, err := s.load(s.write(`{"clusters":{"prod":{"brokers":"kafka:9093","security":{"sasl":[{"oauth":{"enabled":true,"token":"t","gcp":{"enabled":true,"audience":"a","cert_file":"/c","key_file":"/k"}}}]}}}}`))
+		s.Require().ErrorContains(err, "exactly one", "two token sources would leave which identity is used to chance")
+	})
+}
+
+func (s *ConfigSuite) TestTLSInsecureSkipVerify() {
+	s.Run("broker TLS", func() {
+		loaded, err := s.load(s.write(`{"clusters":{"prod":{"brokers":"kafka:9093","security":{"tls":{"enabled":true,"insecure_skip_verify":true}}}}}`))
+		s.Require().NoError(err, "insecure_skip_verify must be accepted under security.tls")
+		s.Require().True(loaded.Clusters["prod"].TLS.InsecureSkipVerify, "the flag must reach the broker connection settings")
+	})
+	s.Run("defaults to verifying", func() {
+		loaded, err := s.load(s.write(`{"clusters":{"prod":{"brokers":"kafka:9093","security":{"tls":{"enabled":true}}}}}`))
+		s.Require().NoError(err, "plain TLS must load")
+		s.Require().False(loaded.Clusters["prod"].TLS.InsecureSkipVerify, "verification must stay on unless explicitly disabled")
+	})
+	s.Run("schema registry TLS", func() {
+		loaded, err := s.load(s.write(`{"clusters":{"prod":{"brokers":"kafka:9093","schema_registry":{"urls":["https://sr:8081"],"tls":{"enabled":true,"insecure_skip_verify":true}}}}}`))
+		s.Require().NoError(err, "insecure_skip_verify must be accepted under schema_registry.tls")
+		s.Require().True(loaded.Clusters["prod"].SchemaRegistry.TLS.InsecureSkipVerify, "the flag must reach the registry client settings")
 	})
 }

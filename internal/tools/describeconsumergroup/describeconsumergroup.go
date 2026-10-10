@@ -14,7 +14,8 @@ import (
 
 // Item is one group to describe.
 type Item struct {
-	Group string `json:"group" jsonschema:"Consumer group to describe. Matched exactly and case-sensitively."`
+	Group         string `json:"group" jsonschema:"Consumer group to describe. Matched exactly and case-sensitively."`
+	SampleSeconds int    `json:"sample_seconds,omitempty" jsonschema:"Optional number of seconds, at most 60, to watch the group before describing it. The group is read every second; observation then reports every state it passed through, and the members that joined or left. Use it when a group seems to keep rebalancing. The call blocks this long. Defaults to 0, no observation."`
 }
 
 // Input is the argument set accepted by the describe_consumer_group tool.
@@ -55,6 +56,21 @@ type Partition struct {
 	Error           string `json:"error,omitempty"`
 }
 
+// Observation is what changed while the group was watched.
+type Observation struct {
+	Seconds int `json:"seconds"`
+	Samples int `json:"samples"`
+	// States is every state the group was seen in, in order, with
+	// consecutive repeats collapsed: Stable, PreparingRebalance, Stable.
+	States []string `json:"states"`
+	// Joined and Left are members that appeared or disappeared by member id.
+	// A member that restarts gets a new id, so it shows in both.
+	Joined []Member `json:"joined"`
+	Left   []Member `json:"left"`
+	// Unstable is true when the state left Stable or membership changed.
+	Unstable bool `json:"unstable"`
+}
+
 // Output is the description of one group.
 type Output struct {
 	Group        string      `json:"group"`
@@ -65,6 +81,8 @@ type Output struct {
 	Members      []Member    `json:"members"`
 	Partitions   []Partition `json:"partitions"`
 	TotalLag     int64       `json:"total_lag"`
+
+	Observation *Observation `json:"observation,omitempty"`
 }
 
 type BatchOutput = batch.Output[Output]
@@ -81,6 +99,12 @@ the operator knows which pod or host to inspect. has_commit false means the
 group owns the partition but never committed there, so its starting point is
 decided by the consumer's auto.offset.reset rather than by an offset. An Empty
 group has no members but keeps its commits.
+
+sample_seconds watches the group for that long first and reports observation:
+the states it passed through and the members that joined or left. A group that
+keeps cycling through PreparingRebalance, or whose members keep changing, is
+rebalancing; the departing members' client_id and host point at the consumer
+that keeps leaving.
 
 Results follow items order, each carrying index with result or error.
 `
@@ -112,7 +136,26 @@ func Register(server *mcp.Server, admin *kadm.Client) {
 // Run describes every requested group with bounded concurrency.
 func Run(ctx context.Context, admin *kadm.Client, input Input) (BatchOutput, error) {
 	return batch.Run(ctx, input.Items, batch.MaxItems, func(ctx context.Context, item Item) (Output, error) {
-		return describe(ctx, admin, item.Group)
+		if err := batch.Bounded("sample_seconds", item.SampleSeconds, maxSampleSeconds); err != nil {
+			return Output{}, err
+		}
+
+		var observation *Observation
+		if item.SampleSeconds > 0 {
+			watched, err := observe(ctx, admin, item.Group, item.SampleSeconds)
+			if err != nil {
+				return Output{}, err
+			}
+			observation = watched
+		}
+
+		out, err := describe(ctx, admin, item.Group)
+		if err != nil {
+			return Output{}, err
+		}
+		out.Observation = observation
+
+		return out, nil
 	})
 }
 

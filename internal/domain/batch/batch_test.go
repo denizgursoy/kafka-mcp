@@ -33,6 +33,23 @@ func (s *BatchSuite) TestPreservesOrderAndIsolatesItemErrors() {
 	s.Require().Equal(1, out.Failed, "only failed items must be counted")
 }
 
+func (s *BatchSuite) TestTurnsAPanicIntoAnItemError() {
+	out, err := batch.Run(s.T().Context(), []int{1, 2}, 3,
+		func(_ context.Context, value int) (int, error) {
+			if value == 2 {
+				var empty []int
+				return empty[value], nil
+			}
+			return value, nil
+		})
+
+	s.Require().NoError(err, "a panic in one item must not fail the call, let alone the process")
+	s.Require().Equal(1, *out.Results[0].Result, "the item that worked must still be reported")
+	s.Require().Contains(out.Results[1].Error, "internal error",
+		"workers run in their own goroutines, where nothing else recovers, so an unrecovered panic would exit the server")
+	s.Require().Equal(1, out.Failed, "the panicking item must be counted as failed")
+}
+
 func (s *BatchSuite) TestRejectsAnEmptyBatch() {
 	_, err := batch.Run(s.T().Context(), []int{}, 3,
 		func(_ context.Context, value int) (int, error) { return value, nil })

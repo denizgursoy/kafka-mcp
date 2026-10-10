@@ -122,6 +122,25 @@ endpoints:
       commit_offset: false
 ```
 
+Cross-cluster writes are granted per endpoint. `copy_message` and
+`produce_message` may name a `destination_cluster`, and that cluster must be
+listed in the calling endpoint's `destinations`:
+
+```yaml
+endpoints:
+  prod-read:
+    cluster: prod
+    read_only: true
+    destinations: [preprod]   # this session may copy into preprod, nowhere else
+```
+
+An endpoint with no `destinations` writes to no other cluster. A listed cluster
+configured `read_only` still refuses, and listing the endpoint's own cluster is
+an error, because that is governed by `read_only`. Names are checked at
+startup. A file with no `endpoints` block keeps its old behaviour: each
+cluster's endpoint lists every other cluster. Clusters that no endpoint serves
+are invisible to `list_clusters`, `compare_clusters` and `destination_cluster`.
+
 A tool the map does not mention stays exposed, so the file states only what it
 withholds rather than relisting every tool and silently losing whatever is added
 later. Names are exact and lowercase, as listed by `server_config`. They are
@@ -162,7 +181,8 @@ file, HTTP, then environment; environment overrides use the `KAFKA_MCP_` prefix 
 At least one cluster with a broker is required. `http.address` defaults to
 `:8090`, `http.base_path` defaults to the HTTP root, and `output_dir` defaults
 to the system temp directory. Exports are confined to that directory:
-`output_file` takes a file name, never a path.
+`output_file` takes a new file name, never a path; an existing name is refused
+rather than overwritten.
 
 `brokers` accepts either one address as a scalar or several addresses as a YAML
 list. Each address is passed to Kafka as a separate seed broker.
@@ -204,13 +224,70 @@ security:
 ```
 
 Alternatively, use `oauth: {enabled: true, token: "{env:KAFKA_TOKEN}"}` for a
-static token. Configure exactly one mode. Client-credentials tokens are fetched
+static token. Configure exactly one mode: static `token`, client credentials, or
+`gcp`. Client-credentials tokens are fetched
 on authentication, cached per cluster across admin and reading connections,
 and renewed near expiry using `expires_in`. Token requests use the current
 authentication context and a timeout (default 10 seconds). Static tokens are
 not renewed. The broker must support OAUTHBEARER and trust the identity provider.
-Broker `security.tls` settings apply to Kafka connections; HTTPS token endpoints
-use the HTTP client's system trust store.
+Token endpoint error bodies are never reported, only their HTTP status, because
+they can echo secrets.
+
+`oauth.proxy` sends token requests through an `http`, `https`, `socks5` or
+`socks5h` proxy; when unset, `HTTPS_PROXY`, `HTTP_PROXY` and `NO_PROXY` apply.
+
+Broker `security.tls` settings apply to Kafka connections only. The token
+endpoint uses `oauth.tls`, which can also present a client certificate (RFC
+8705). With a certificate, `client_secret` is optional: when empty, `client_id`
+goes in the request body and the certificate authenticates the client.
+
+```yaml
+    - oauth:
+        enabled: true
+        token_url: https://identity.example.com/token
+        client_id: kafka-mcp
+        scopes: [kafka]
+        tls:
+          cert_file: /etc/certs/oauth/client-cert.pem
+          key_file: /etc/certs/oauth/client-key.pem
+          ca_file: /etc/certs/oauth/ca.pem # optional; system roots otherwise
+```
+
+`oauth.gcp` gets Google Cloud access tokens with an X.509 client certificate
+(workload identity federation over mTLS), optionally impersonating a service
+account. Use Google's `external_account` credential file; its
+`credential_source` is ignored, because the certificate below is used instead.
+
+```yaml
+    - oauth:
+        enabled: true
+        gcp:
+          enabled: true
+          credentials_file: /etc/certs/gcp/wif-credentials.json
+          cert_file: /etc/certs/kafka/client-cert.pem
+          key_file: /etc/certs/kafka/client-key.pem
+          format: managed_kafka # Google Managed Service for Apache Kafka; default raw
+          # proxy: http://proxy:3128 # default: oauth.proxy, then the environment
+          # lifetime: 1h             # impersonated token lifetime
+          # refresh_before: 5m       # refresh this long before expiry
+          # scopes: [https://www.googleapis.com/auth/cloud-platform]
+```
+
+`audience`, `token_url` and `service_account_impersonation_url` may be set
+directly and override the credential file. `managed_kafka` requires a service
+account to impersonate. A failed refresh keeps using the cached token until it
+actually expires.
+
+In `oauth.tls` and `oauth.gcp`, `cert`, `key`, `ca` (and `credentials` for
+`gcp`) may be given inline instead of as `_file`, not both; inline keys and
+credentials accept `{env:VAR}`. Files are re-read on each token refresh, so a
+rotated certificate applies without a restart.
+
+`insecure_skip_verify: true` disables server certificate and hostname
+verification. It is accepted under `security.tls` (brokers),
+`schema_registry.tls`, `oauth.tls` (token endpoint) and `oauth.gcp` (Google STS
+and impersonation), and defaults to `false`. It exposes the connection to
+man-in-the-middle attacks: prefer `ca_file`, and do not use it in production.
 
 A cluster that cannot be reached at startup is still served, and
 `list_clusters` reports it as disconnected. One cluster being down must not
@@ -267,11 +344,71 @@ configured identities in preference order, not the mechanism negotiated by an
 individual broker connection. It also reports `schema_registry` URLs and
 `topic_formats`.
 
-### Browser clients (CORS)
+### Authentication and browser clients
 
-A command-line client sends no `Origin` header and needs none of this. A client
-running in a browser does: the browser discards the response unless the server
-allows the origin, so the defaults already cover the MCP transport.
+`http.auth_token` makes every MCP request carry `Authorization: Bearer <token>`;
+requests without it get 401. It accepts `{env:VAR}`. `/healthz` and CORS
+preflights need no token. Without it, the endpoints have no authentication of
+their own, which is safe only where nothing untrusted can reach the listener.
+
+Set it with an environment variable, which keeps the secret out of the
+config file entirely:
+
+```sh
+export KAFKA_MCP_HTTP_AUTH_TOKEN="$(openssl rand -hex 32)"
+CONFIG_FILE=kafka-mcp.yaml kafka-mcp --server
+```
+
+Every config key can be overridden this way: `KAFKA_MCP_` followed by the key
+path in upper case with `_` between levels, so `http.auth_token` is
+`KAFKA_MCP_HTTP_AUTH_TOKEN`. To keep the token in the file but the value in the
+environment under a name of your choice, reference it instead:
+
+```yaml
+http:
+  auth_token: "{env:MY_MCP_TOKEN}"   # the server refuses to start if MY_MCP_TOKEN is unset
+```
+
+Clients then send the token on every request:
+
+```sh
+curl -X POST http://localhost:8090/mcp/local \
+  -H "Authorization: Bearer $KAFKA_MCP_HTTP_AUTH_TOKEN" \
+  -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}'
+```
+
+In the client configuration used under [Connecting a client](#connecting-a-client),
+add the header to each remote entry. `{env:...}` is the client's own
+substitution, so the token stays out of that file too:
+
+```jsonc
+{
+  "mcp": {
+    "kafka-local": {
+      "type": "remote",
+      "url": "http://localhost:8090/mcp/local",
+      "headers": { "Authorization": "Bearer {env:KAFKA_MCP_HTTP_AUTH_TOKEN}" }
+    }
+  }
+}
+```
+
+In a container, pass it like any other secret:
+
+```sh
+docker run -e KAFKA_MCP_HTTP_AUTH_TOKEN="$TOKEN" \
+  -e KAFKA_MCP_HTTP_CORS_ALLOW_ORIGINS="https://mcp-client.example" \
+  -v "$PWD/kafka-mcp.yaml:/etc/kafka-mcp.yaml" -e CONFIG_FILE=/etc/kafka-mcp.yaml \
+  -p 8090:8090 kafka-mcp
+```
+
+A command-line client sends no `Origin` header and is unaffected by CORS. A
+request that does carry an `Origin` is refused with 403 unless that origin is
+in `allow_origins`. This happens before any tool runs, because CORS on its own
+only hides the response from the page and the request itself would still
+execute. **No origin is allowed by default**, so no web page the user visits
+can drive the tools. To use a browser client, name its origin:
 
 ```yaml
 http:
@@ -285,10 +422,15 @@ http:
     max_age: 600
 ```
 
+The same list from the environment is comma-separated:
+`KAFKA_MCP_HTTP_CORS_ALLOW_ORIGINS="https://a.example,https://b.example"`.
+Setting it to `*` restores the old allow-everything behaviour.
+
 `http.cors` is ada's CORS middleware configuration, read straight from the
 file, so every option that middleware has is available here. Each key is
 optional and keeps its own default, so setting `allow_origins` alone does not
-drop the rest. The defaults are the values above with `allow_origins: ["*"]`.
+drop the rest. The defaults are the values above with no `allow_origins`.
+`allow_origins: ["*"]` restores the old allow-everything behaviour.
 
 Three of them are load-bearing for the MCP transport. `allow_methods` needs
 `GET`, `POST` and `DELETE`: requests are posted, the event stream is a GET,
@@ -307,11 +449,9 @@ together with a wildcard `allow_origins` is refused by the middleware at
 startup unless `unsafe_wildcard_origin_with_allow_credentials` is also set,
 which it should not be.
 
-**These endpoints have no authentication of their own.** An allowed origin can
-drive every tool with the server's Kafka credentials, from any page the
-browser's user happens to visit. `allow_origins` is the only built-in HTTP
-barrier, so narrow it to the pages that should have that power, protect writable
-paths in a reverse proxy, and set `read_only: true` on endpoints that should not
+An allowed origin can drive every tool with the server's Kafka credentials, so
+list only pages that should have that power, set `auth_token` (a browser client
+then has to send it), and set `read_only: true` on endpoints that should not
 write. A less obvious path such as `/mcp/rw` is not authentication.
 
 ## Connecting a client
@@ -354,6 +494,10 @@ endpoint:
   }
 }
 ```
+
+When the server sets `http.auth_token`, add
+`"headers": {"Authorization": "Bearer {env:KAFKA_MCP_HTTP_AUTH_TOKEN}"}` to each
+entry; see [Authentication and browser clients](#authentication-and-browser-clients).
 
 The key becomes the tool prefix, so these appear as `kafka-local_list_topics`
 and `kafka-prod-read_list_topics`. Name entries after both the cluster and the
@@ -401,8 +545,9 @@ not registered, so it is absent from `tools/list` and from `server_config`.
 `copy_message` and `produce_message` stay, because `read_only` protects the
 cluster being written to and the destination is chosen per call. Copying a
 message out of a read-only production cluster, or seeding a writable preprod
-cluster from a protected session, is exactly what they are for. Both refuse
-outright when the destination is the read-only cluster itself.
+cluster from a protected session, is exactly what they are for. The destination
+must be in the endpoint's `destinations`, and both refuse outright when the
+destination is the read-only cluster itself.
 
 Hiding a tool decides what is advertised, not what is permitted: both tools
 still refuse at the point of mutation, so a registration mistake cannot turn
@@ -519,15 +664,17 @@ mistake.
 
 ### `list_clusters`
 
-Lists the clusters this server serves, with whether each is reachable and
-whether it accepts writes. Takes no parameters. Available from every endpoint,
+Lists the clusters this server's endpoints serve, with whether each is
+reachable, whether it is configured `read_only`, and whether this session may
+write to it (`writable`: its own cluster unless the endpoint is read-only,
+another only when listed in `destinations`). Takes no parameters. Available from every endpoint,
 so a session can discover what `copy_message`, `produce_message` and
 `compare_clusters` may target.
 
 ```json
 {"clusters": [
-  {"name": "prod", "connected": true, "read_only": true},
-  {"name": "preprod", "connected": true, "read_only": false}
+  {"name": "prod", "connected": true, "read_only": true, "writable": false},
+  {"name": "preprod", "connected": true, "read_only": false, "writable": true}
 ], "count": 2}
 ```
 
@@ -591,12 +738,12 @@ seconds old, so a topic created moments earlier may still appear in
 ### `list_topics`
 
 Lists the topics on the cluster, sorted by name, each with its partition count,
-replication factor and the configs it sets for itself.
+replication factor, the configs it sets for itself, and its size on disk.
 
 | Parameter         | Type   | Required | Meaning                                                  |
 | ----------------- | ------ | -------- | -------------------------------------------------------- |
 | `script`          | string | no       | JavaScript predicate deciding whether a topic is listed  |
-| `timeout_seconds` | int    | no       | Limit for evaluating the script. Default 30              |
+| `timeout_seconds` | int    | no       | Limit for evaluating the script. Default 30, at most 3600 |
 
 The predicate sees:
 
@@ -607,9 +754,11 @@ The predicate sees:
 | `replication_factor` | number  | Replicas of the first partition                      |
 | `internal`           | boolean | Kafka's own topics, such as `__consumer_offsets`     |
 | `configs`            | object  | Values this topic sets for itself, e.g. `configs['retention.ms']` |
+| `size_bytes`         | number  | One copy of the topic's log segments on disk; -1 when not reported |
 
 ```js
 return topic.indexOf('orders') >= 0
+return size_bytes > 10e9                       // the topics filling the disk
 return partitions > 6
 return configs['cleanup.policy'] === 'compact'
 return replication_factor === 1 && !internal
@@ -621,7 +770,7 @@ return replication_factor === 1 && !internal
 
 ```json
 {"topics": [{"topic": "orders", "partitions": 12, "replication_factor": 3,
-             "configs": {"retention.ms": "604800000"}}],
+             "configs": {"retention.ms": "604800000"}, "size_bytes": 48318382080}],
  "count": 1}
 ```
 
@@ -637,10 +786,14 @@ A topic whose predicate throws, or is cut short by the timeout, is counted in
 `script_errors` rather than listed, so a broken filter is never mistaken for an
 empty cluster.
 
+Sizes come from DescribeLogDirs, which needs `describe` on the cluster. When the
+brokers do not answer it, every `size_bytes` is -1 and `warnings` says why.
+Sizes are bytes on disk after compression.
+
 ### `describe_topic`
 
-Reports a topic's partitions, offset ranges, message count, time span and full
-configuration. Use it before searching to see how much data a search would read
+Reports a topic's partitions, offset ranges, message count, size on disk, time
+span and full configuration. Use it before searching to see how much data a search would read
 and how far back the topic can hold data at all.
 
 | Parameter | Type     | Required | Meaning                      |
@@ -656,7 +809,8 @@ Item fields:
 ```json
 {"results": [{"index": 0, "result": {
    "topic": "orders", "partition_count": 1, "message_count": 3,
-   "partitions": [{"partition": 0, "start_offset": 0, "end_offset": 3, "message_count": 3}],
+   "size_bytes": 2048, "replicated_size_bytes": 6144,
+   "partitions": [{"partition": 0, "start_offset": 0, "end_offset": 3, "message_count": 3, "size_bytes": 2048}],
    "configs": [{"key": "cleanup.policy", "value": "delete", "source": "DYNAMIC_TOPIC_CONFIG", "is_default": false},
                {"key": "retention.ms", "value": "604800000", "source": "DEFAULT_CONFIG", "is_default": true}]}}],
  "succeeded": 1, "failed": 0, "applied": 0, "atomic": false}
@@ -667,6 +821,10 @@ means unlimited. `is_default` is true when the value is inherited rather than
 set on the topic. Two entries decide whether a message can still exist at all:
 `retention.ms` (how long messages are kept) and `cleanup.policy` (`compact`
 keeps only the latest message per key).
+
+`size_bytes` is one copy of the topic, per partition and in total;
+`replicated_size_bytes` counts every replica, which is what the brokers' disks
+hold. Both are omitted, with a warning, when the brokers do not report log dirs.
 
 ### `sample_messages`
 
@@ -686,9 +844,9 @@ Item fields:
 | Field             | Type   | Required | Meaning                               |
 | ----------------- | ------ | -------- | ------------------------------------- |
 | `topic`           | string | yes      | Topic to sample                       |
-| `sample_size`     | int    | no       | Messages to read in total. Default 20 |
+| `sample_size`     | int    | no       | Messages to read in total. Default 20, at most 1000 |
 | `partitions`      | int[]  | no       | Restrict to these partitions          |
-| `max_value_bytes` | int    | no       | Value bytes per message. Default 512  |
+| `max_value_bytes` | int    | no       | Value bytes per message. Default 512, at most 1 MiB |
 
 ```json
 {"results": [{"index": 0, "result": {
@@ -697,6 +855,7 @@ Item fields:
    "key_stats": {"present": 20, "absent": 0, "unique": 20, "all_unique": true},
    "key_in_value": ["payload.orderId"],
    "schemas": [{"format": "avro", "schema_id": 7, "message_type": "shop.Order", "count": 20}],
+   "value_bytes": {"min": 180, "p50": 412, "max": 9020},
    "sampled_ranges": [{"partition": 0, "start": 980, "end": 1000}]}}],
  "succeeded": 1, "failed": 0, "applied": 0, "atomic": false}
 ```
@@ -722,12 +881,14 @@ them client-side; the result reports what was covered.
 | `from_offset` / `to_offset` | int | no | Offset window, end exclusive |
 | `from_timestamp` / `to_timestamp` | string | no | RFC3339 time window |
 | `direction` | string | no | `newest_first` (default) or `oldest_first` |
-| `max_matches` | int | no | Stop after this many matches. Default 10 |
-| `max_messages_scanned` | int | no | Read at most this many. Default 10000 |
-| `max_value_bytes` | int | no | Value bytes per match. Default 512 |
-| `timeout_seconds` | int | no | Wall-clock limit. Default 30 |
+| `max_matches` | int | no | Stop after this many matches. Default 10, at most 1000 |
+| `max_messages_scanned` | int | no | Read at most this many. Default 10000, at most 100000000 |
+| `max_value_bytes` | int | no | Value bytes per match. Default 512, at most 1 MiB |
+| `timeout_seconds` | int | no | Wall-clock limit. Default 30, at most 3600 |
 | `count_only` | bool | no | Return counts only, no message bodies |
-| `output_file` | string | no | Write every match to this file as JSONL |
+| `output_file` | string | no | Write every match to this new file as JSONL |
+| `group_by` | string | no | Expression returning a bucket per match; counts per bucket |
+| `max_groups` | int | no | Largest buckets returned with `group_by`. Default 20, at most 1000 |
 
 #### The script
 
@@ -740,6 +901,10 @@ Return true to keep a message. In scope:
 | `headers` | object of header name to string |
 | `partition`, `offset` | numbers |
 | `timestamp` | a `Date` |
+| `value_bytes`, `key_bytes` | raw sizes in bytes, before decoding |
+| `format` | `json`, `avro`, `protobuf`, `json_schema`, `msgpack`, `text`, `binary` or `null` |
+| `schema_id` | the registry id the value names, or `null` |
+| `decode_error` | why a value that named a schema could not be decoded, or `null` |
 
 ```js
 return key === 'order-123'
@@ -749,6 +914,8 @@ return value.payload.cancelledAt === undefined // field absent
 return headers['correlation-id'] === 'corr-999'
 return /ORD-\d{4}/.test(value.payload.orderId)
 return value.indexOf('ERROR') >= 0             // non-JSON topic: value is a string
+return schema_id === 57                        // written with one schema
+return value_bytes > 900000                    // close to max.message.bytes
 ```
 
 Searching by key exactly is far more precise than searching the body: `123`
@@ -782,14 +949,18 @@ become the `stopped_reason` on a wide topic sooner than on a narrow one.
 
 #### Parallelism
 
-`parallelism` splits a **single-partition** topic's offset range between that
-many readers, which is what makes a full scan of one large partition fast. A
+`parallelism` reads a **single-partition** topic with that many concurrent
+readers, which is what makes a full scan of one large partition fast. Readers
+take chunks newest first (or oldest first), and a `max_matches` stop is decided
+only on chunks completed in that order, so the matches returned are the same as
+a sequential search would return. Because readers finish out of order,
+`scanned_ranges` may list several runs for the partition. A
 multi-partition topic is already read in parallel across its partitions, so the
 setting does not apply there, and a range too small to divide is read by one
 reader.
 
-It pays off for `count_only`, `output_file` and full scans of a single
-partition.
+It pays off for `count_only`, `group_by`, `output_file` and full scans of a
+single partition.
 
 #### Result
 
@@ -807,6 +978,30 @@ and narrow the search.
 For large result sets, use `count_only` to learn how many matches exist, then
 `output_file` to write them out instead of returning them.
 
+#### Grouping
+
+`group_by` summarises instead of listing. It is an expression over the same
+variables as `script` that returns a bucket name. Every match in the range is
+counted per bucket, as with `count_only`, and no bodies are returned. `null` and
+`undefined` form the bucket `null`; an object is grouped by its JSON.
+
+```json
+{"name": "search_messages", "arguments": {"topic": "orders-dlq",
+  "group_by": "return headers['error-reason']", "from_timestamp": "2026-10-10T06:00:00Z"}}
+```
+
+```json
+{"topic": "orders-dlq", "match_count": 1840, "matches": [],
+ "groups": [{"key": "timeout", "count": 1702, "example": {"partition": 2, "offset": 90311}},
+            {"key": "bad_schema", "count": 138, "example": {"partition": 0, "offset": 4410}}],
+ "complete": true}
+```
+
+Buckets are sorted by count. `groups_truncated` is true when more than
+`max_groups` existed. A message the expression throws on is counted in
+`script_errors` and not bucketed. `group_by` cannot be combined with
+`output_file`.
+
 ### `get_message`
 
 Reads messages at exact offsets, plus optional neighbours.
@@ -822,8 +1017,8 @@ Item fields:
 | `topic`           | string | yes      | Topic to read from                         |
 | `partition`       | int    | yes      | Partition to read from                     |
 | `offset`          | int    | yes      | Exact offset to read                       |
-| `context`         | int    | no       | Also return this many messages either side |
-| `max_value_bytes` | int    | no       | Value bytes to return. Default 4096        |
+| `context`         | int    | no       | Also return this many messages either side, at most 100 |
+| `max_value_bytes` | int    | no       | Value bytes to return. Default 4096, at most 1 MiB |
 
 ```json
 {"name": "get_message", "arguments": {"items": [
@@ -859,19 +1054,25 @@ Item fields, giving `subject` or `id`:
 | `subject` | string | either   | Subject, usually `<topic>-value` or `<topic>-key` |
 | `version` | int    | no       | Subject version. Defaults to the latest         |
 | `id`      | int    | either   | Schema id, e.g. from `get_message`              |
+| `check_schema` | object | no  | `{"schema": "...", "type": "avro"}`: test a candidate against the subject, without registering it. Needs `subject` |
 
 ```json
 {"results": [{"index": 0, "result": {
    "schema_id": 7, "subject": "orders-value", "version": 3, "versions": [1, 2, 3],
    "type": "avro", "schema": "{...}", "references": [],
-   "message_types": null, "used_by": null}}],
+   "message_types": null, "used_by": null, "compatibility": "BACKWARD",
+   "check": {"compatible": false, "messages": ["{errorType:'TYPE_MISMATCH', …}"]}}}],
  "succeeded": 1, "failed": 0, "applied": 0, "atomic": false}
 ```
 
 `message_types` lists Protobuf messages, which `produce_message` takes as
 `message_type`. Looking up an `id` fills `used_by` with the subject versions
-that use it. The call fails as a whole when the cluster has no
-`schema_registry`.
+that use it. A subject lookup reports `compatibility`, the level in force,
+inherited from the registry's global level when the subject sets none.
+`check_schema` asks the registry whether the candidate could be registered as
+the subject's next version under that level. `check.messages` gives the
+registry's reasons when it could not. Nothing is registered. The call fails as
+a whole when the cluster has no `schema_registry`.
 
 ### `list_consumer_groups`
 
@@ -899,7 +1100,22 @@ partition is stuck" into "this pod on this host is stuck".
 
 | Parameter | Type     | Required | Meaning                   |
 | --------- | -------- | -------- | ------------------------- |
-| `items`   | object[] | yes      | 1 to 100 groups, each `{"group": "..."}` |
+| `items`   | object[] | yes      | 1 to 100 groups, each `{"group": "...", "sample_seconds": 30}` |
+
+`sample_seconds` (optional, at most 60) watches the group for that long before
+describing it, reading it every second, and adds `observation`:
+
+```json
+"observation": {"seconds": 30, "samples": 31,
+  "states": ["Stable", "PreparingRebalance", "CompletingRebalance", "Stable"],
+  "joined": [{"member_id": "payments-7-b…", "client_id": "payments-7", "host": "/10.0.4.17"}],
+  "left":   [{"member_id": "payments-7-a…", "client_id": "payments-7", "host": "/10.0.4.17"}],
+  "unstable": true}
+```
+
+A member that restarts rejoins with a new `member_id`, so it appears in both
+`left` and `joined` with the same host. That is how a crash-looping consumer
+behind a rebalance storm is found. The call blocks for the window.
 
 ```json
 {"results": [{"index": 0, "result": {
@@ -959,11 +1175,12 @@ Item fields:
 | ------------------- | ------ | -------- | --------------------------------------------------------- |
 | `topic`             | string | yes      | Topic to measure                                          |
 | `group`             | string | no       | Defaults to every group consuming the topic               |
-| `sample_seconds`    | int    | no       | Consume-rate sample window. Default 5. **The call blocks** |
+| `sample_seconds`    | int    | no       | Consume-rate sample window. Default 5, at most 300. **The call blocks** |
 | `skip_consume_rate` | bool   | no       | Return immediately, without a rate or estimate            |
+| `measure_backlog_age` | bool | no       | Also report how old each backlog is, against retention. One fetch per lagging partition |
 
-Sampling windows run concurrently, so several measurements do not add their
-waits together.
+Up to 4 sampling windows run at a time, so the call takes about
+`sample_seconds` for every 4 items.
 
 ```json
 {"results": [{"index": 0, "result": {
@@ -989,6 +1206,19 @@ says what the numbers mean: `caught_up`, `draining` (with an ETA), `growing`
 (never clears, with `growing_by_per_minute`), `stalled`, `no_active_consumers`,
 or `not_measured`. An ETA is only given when the lag is genuinely shrinking.
 
+Every partition also reports `start_offset`, and `offset_expired: true` when the
+committed offset is below it. Retention has then deleted the group's position:
+the consumer resets by its `auto.offset.reset` instead of resuming, and the
+group carries a warning. `produce_rate.partitions` gives per-partition counts
+for the last minute and hour, which separates key skew from a slow consumer.
+
+With `measure_backlog_age`, each lagging partition reports
+`committed_timestamp` (the next message to consume) and `lag_seconds`. Each
+group reports `oldest_unconsumed_at`, and the topic its `retention_ms`.
+`retention_risk` is set, with a warning, once the oldest unconsumed message has
+used half of the retention: unless the group catches up, retention deletes it
+before it is consumed.
+
 ### `cluster_health`
 
 Checks the cluster this endpoint serves in one call: brokers, controller, and
@@ -1013,6 +1243,11 @@ every partition that is not fully healthy.
 condition behind `NOT_ENOUGH_REPLICAS`: producers using `acks=all` fail until
 the in-sync replicas recover. A broker leading no partitions while others lead
 many is usually one that restarted and was never given leadership back.
+
+A problem partition being moved between brokers carries `reassigning: true` with
+its `adding_replicas` and `removing_replicas`, and `summary.reassigning` counts
+them. An added replica is out of sync until it has copied the log, so
+`under_replicated` there is expected during the move rather than an outage.
 
 Some Kafka-compatible brokers, Redpanda among them, do not report
 `min.insync.replicas`. The topics affected are listed in `min_isr_unknown`, and
@@ -1212,8 +1447,10 @@ Item fields:
 | Field                   | Type   | Required | Meaning                                                         |
 | ----------------------- | ------ | -------- | --------------------------------------------------------------- |
 | `topic`                 | string | yes      | Topic to delete from                                            |
-| `partition`             | int    | yes      | Partition to delete from                                        |
-| `before_offset`         | int    | yes      | Everything below this offset goes; this one becomes the first  |
+| `partition`             | int    | yes*     | Partition to delete from. Not used with `all_partitions`        |
+| `before_offset`         | int    | one of   | Everything below this offset goes; this one becomes the first  |
+| `before_timestamp`      | string | one of   | RFC3339: everything written before this moment goes, resolved per partition |
+| `all_partitions`        | bool   | no       | With `before_timestamp`, cut every partition of the topic       |
 | `acknowledge_data_loss` | bool   | no       | Required to apply                                               |
 
 ```json
@@ -1227,6 +1464,15 @@ Item fields:
 `affected_groups` lists every group committed below the cut, with how many
 messages it would lose without ever processing them; such a group resumes from
 the new start. Use the partition's end offset as `before_offset` to empty it.
+
+`before_timestamp` resolves to the first offset written at or after the moment,
+and the preview's `before_offset` shows what it resolved to. With
+`all_partitions` one item covers the whole topic: `partitions` lists each
+partition's own cut, start and end, and affected groups; the item carries `all_partitions: true` and `partition: -1`, and `messages_deleted`
+is their total. Partitions holding nothing older are left alone, and if none
+does, the item is refused. An offset means nothing across partitions, so
+`all_partitions` takes only a timestamp. Cuts are applied partition by
+partition and are not atomic.
 
 ### `delete_consumer_group`
 
@@ -1334,8 +1580,8 @@ happens only with `confirm`.
 For a copy within the endpoint's own cluster, its `read_only` policy protects
 the destination. A read-only endpoint can still be the source of a
 cross-cluster copy, because copying out changes nothing there. A different
-destination cluster is writable when it has at least one writable endpoint;
-`list_clusters` reports that effective state. The tool is refused entirely
+destination cluster must be listed in the calling endpoint's `destinations` and
+not configured `read_only`; `list_clusters` reports that as `writable`. The tool is refused entirely
 when the destination is read-only, preview included, because writing is all it
 does.
 
@@ -1388,7 +1634,8 @@ key does not hash to, which breaks ordering for that key. The response warns
 whenever an explicit partition is used.
 
 `read_only` protects the cluster being written to, so a read-only endpoint may
-still produce into a different, writable cluster, and is refused outright —
+still produce into a different cluster listed in its `destinations`, and is
+refused outright —
 preview included — when writing to its own. A produced message cannot be
 deleted; it stays until retention removes it.
 
@@ -1422,6 +1669,12 @@ holding every workflow itself, so a session reads only the one it needs:
 - `purge-messages.md` — deleting old messages from a partition while keeping the
   topic, or removing abandoned consumer groups.
 - `authorization-error.md` — working out which ACL is refusing a client.
+- `unstable-consumer-group.md` — finding why a group keeps rebalancing and which
+  consumer keeps leaving.
+- `partition-skew.md` — telling key skew from a slow consumer when one partition
+  lags, and finding the hot keys.
+- `schema-error.md` — testing a schema change before it ships, and tracing which
+  schema broke producers or consumers.
 
 The umbrella also resolves the overlap between them: "the consumer is behind"
 opens three of these guides, and `consumer_lag`'s `status` is what decides which
@@ -1431,7 +1684,7 @@ one is right.
 
 | Command                | Purpose                                  |
 | ---------------------- | ---------------------------------------- |
-| `make up` / `make down`| Start / stop Redpanda and Console        |
+| `make env-up` / `make env-down` | Start / stop Redpanda and Console |
 | `make build`           | Build with goreleaser into `dist/`       |
 | `make run`             | Run the HTTP server from source          |
 | `go test ./...`        | All tests, including container tests     |

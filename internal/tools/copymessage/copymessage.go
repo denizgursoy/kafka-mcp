@@ -66,8 +66,8 @@ type Output struct {
 	KeySchema          *serde.Encoded  `json:"key_schema,omitempty"`
 	ValueSchema        *serde.Encoded  `json:"value_schema,omitempty"`
 	Applied            bool            `json:"applied"`
-	WrittenPartition   int32           `json:"written_partition,omitempty"`
-	WrittenOffset      int64           `json:"written_offset,omitempty"`
+	WrittenPartition   int32           `json:"written_partition"`
+	WrittenOffset      int64           `json:"written_offset"`
 	ProvenanceHeaders  []string        `json:"provenance_headers,omitempty"`
 	Warnings           []string        `json:"warnings,omitempty"`
 	Note               string          `json:"note,omitempty"`
@@ -210,11 +210,10 @@ func run(
 	destinationName := sourceCluster
 
 	if input.DestinationCluster != "" && input.DestinationCluster != sourceCluster {
-		destination = clusters.Destination(input.DestinationCluster)
-		if destination == nil {
-			return Output{}, fmt.Errorf(
-				"unknown destination_cluster %q: use list_clusters to see which clusters this server serves",
-				input.DestinationCluster)
+		var err error
+		destination, err = clusters.Destination(own, input.DestinationCluster)
+		if err != nil {
+			return Output{}, err
 		}
 
 		destinationName = input.DestinationCluster

@@ -14,7 +14,6 @@ same message", or "skip this record and move on".
 | `consumer_lag`         | Confirming the consumer is genuinely stuck           |
 | `open_transactions`    | Ruling out a hung transaction, which looks the same  |
 | `describe_consumer_group` | Which member and host owns the stuck partition   |
-| `list_consumer_groups` | The group's state and member count                   |
 | `get_message`          | Reading the message that is blocking the consumer    |
 | `copy_message`         | Preserving it in a dead letter topic                 |
 | `search_messages`      | Preserving several messages to a file                |
@@ -24,10 +23,10 @@ same message", or "skip this record and move on".
 
 ### 0. Check the server may change anything
 
-Call `server_config` **first**. If `read_only` is true, stop here.
-
-A read-only endpoint does not expose `commit_offset` at all, so there is no
-preview to fall back on either.
+Call `server_config` **first** and look for `commit_offset` in its `tools`
+list. If it is missing, stop here: a read-only endpoint does not expose it, and
+a writable one may have switched it off in its `tools` configuration. Either
+way there is no preview to fall back on.
 
 Tell the user the message can be diagnosed but not skipped, and that skipping
 needs a server configured without `read_only`. Do not walk them through
@@ -47,6 +46,12 @@ Call `consumer_lag`. A poison message looks like this:
 - Lag that does not shrink between two calls a few seconds apart.
 
 It is **not** a poison message when:
+
+- **any partition has `offset_expired`** — retention deleted the group's
+  position, and the consumer resets instead of resuming. See
+  [replay-messages.md](replay-messages.md) for where it should resume.
+- **the group keeps rebalancing** — members that keep leaving look stalled
+  between rebalances. See [unstable-consumer-group](unstable-consumer-group.md).
 
 - **`status: no_active_consumers`** — nothing is running. Start the consumer.
 - **`status: draining`** — it is working, just slowly. Skipping loses data for
@@ -90,7 +95,10 @@ Show the user what it is. Often the message itself explains the failure — a
 truncated payload, an unexpected type, a schema that changed. Schema-encoded
 messages are shown decoded; a `decode_error` on the poison message, or a
 `schema_id` different from its neighbours', is often the cause itself: a
-producer wrote with a schema the consumer does not know.
+producer wrote with a schema the consumer does not know. When that is the
+cause, [schema-error](schema-error.md) shows how many messages carry the new
+schema and since when. Skipping one message does not help if the producer keeps
+writing more of them.
 
 ### 3. Offer preservation, and let the user choose
 
@@ -103,7 +111,9 @@ to choose**:
 - **`copy_message` to a dead letter topic** — durable, stays in Kafka, and the
   copy carries headers recording where it came from, when, and by which
   principal. Best when the message will be reprocessed later, or when other
-  systems need to see it. The destination topic must already exist. When the
+  systems need to see it. The destination topic must already exist, and a
+  dead letter topic on another cluster must be in this endpoint's
+  `destinations`. When the
   dead letter topic is on a cluster with a different Schema Registry, the
   preview warns about the schema id; set `translate_schema` so the copy stays
   decodable there.
@@ -127,13 +137,13 @@ each one knowingly.
 
 ### 5. Stop the consumers
 
-`commit_offset` refuses while the group has active members, and the reason
-matters: a running consumer keeps its position in memory and only reads the
+`commit_offset` warns in its preview and refuses on `confirm` while the group
+has active members, and the reason matters: a running consumer keeps its position in memory and only reads the
 committed offset when it joins a group. A commit made while it is running is
 overwritten by its next commit, leaving the group exactly where it was.
 
 So the fix would appear to work and change nothing. Have the user stop the
-consumers, then confirm with `list_consumer_groups` that the group is `Empty`.
+consumers, then confirm with `describe_consumer_group` that the group is `Empty`.
 
 `allow_active_members` exists for the case where the consumers are restarted
 immediately afterwards. It does not make the commit stick; it only stops the

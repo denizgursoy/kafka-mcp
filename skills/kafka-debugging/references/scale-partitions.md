@@ -20,11 +20,11 @@ Use this when the user says "add partitions", "increase the partition count",
 
 ### 0. Check the server may change anything
 
-Call `server_config` **first**. If `read_only` is true, stop here.
-
-A read-only endpoint does not expose `add_partitions` at all, so there is no
-preview to fall back on. Tell the user the topic can be diagnosed but not
-scaled, and that scaling needs a server configured without `read_only`. Do not
+Call `server_config` **first** and look for `add_partitions` in its `tools`
+list. If it is missing, stop here: a read-only endpoint does not expose it, and
+a writable one may have switched it off in its `tools` configuration. There is
+no preview to fall back on. Tell the user the topic can be diagnosed but not
+scaled here, and that scaling needs an endpoint that exposes `add_partitions`. Do not
 walk them through the investigation below for a change that cannot happen.
 
 Steps 1 and 2 are still worth doing on their own terms, because knowing whether
@@ -108,12 +108,13 @@ batch first. Partition changes are not atomic and successful items cannot be
 rolled back.
 
 If the broker refuses with an authorization error, the fix is a Kafka ACL:
-adding partitions needs ALTER on the topic for the principal this server
+adding partitions needs `alter` on the topic for the principal this server
 connects as. That is a request to whoever administers the cluster, not
 something to work around.
 
-If `add_partitions` is not among the tools at all, the cluster is read-only and
-step 0 was skipped. That is this server's configuration, not Kafka.
+If `add_partitions` is not among the tools at all, step 0 was skipped: the
+endpoint is read-only or has the tool switched off. That is this server's
+configuration, not Kafka.
 
 ### 6. Verify and explain what happens next
 

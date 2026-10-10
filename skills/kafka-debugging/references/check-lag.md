@@ -15,7 +15,7 @@ payments consumer", "how fast are we processing", or "when will it catch up".
 | `describe_consumer_group` | Which member owns a lagging partition            |
 | `delete_consumer_group` | Removing an abandoned group whose lag nobody drains |
 | `consumer_lag`         | Lag, produce and consume rates, and the estimate    |
-| `describe_topic`       | Retention, when judging whether a backlog is at risk|
+| `describe_topic`       | The topic's configuration and size                  |
 
 ## Steps
 
@@ -33,7 +33,8 @@ before anything else, because it decides how the numbers should be read:
 - **Empty** — no members. The group may still report lag, because committed
   offsets outlive the consumers that made them. Nothing will drain it.
 - **PreparingRebalance** — members are joining or leaving, so a rate sampled
-  now is unreliable
+  now is unreliable. If it keeps coming back, see
+  [unstable-consumer-group](unstable-consumer-group.md)
 - **Dead** — the group is gone
 
 If no group consumes the topic, say so. A topic nobody consumes has no lag, and
@@ -43,8 +44,8 @@ that is a different answer from "the consumers are keeping up".
 
 Call `consumer_lag` with one `items` entry per topic, and the group on the item
 if the user named one. Comparing several topic/group pairs is the same call with
-more entries, and their sampling windows run concurrently instead of adding one
-wait window per call. Read each item's own result.
+more entries. Up to 4 sampling windows run at a time, so the call takes about
+`sample_seconds` for every 4 entries. Read each item's own result.
 
 The call **blocks for `sample_seconds`** (default 5), because Kafka stores no
 history of consumption: the only way to learn the consume rate is to read the
@@ -57,6 +58,16 @@ window would be noisy.
 
 Give the total, then the per-partition breakdown when lag is uneven, since one
 badly lagging partition is a different problem from a uniformly slow consumer.
+Uneven lag has its own guide: [partition-skew](partition-skew.md).
+
+**Check `offset_expired` first.** It means the committed offset is below the
+partition's `start_offset`: retention already deleted the group's position. The
+lag number is then not a backlog. The next time the consumer fetches, it resets
+by its `auto.offset.reset` (to the start or the end), and the messages between
+the commit and the start are gone. The group carries a warning saying so. Report
+it ahead of everything else, because the fix is a decision about where the
+group should resume ([replay-messages](replay-messages.md)), not more
+throughput.
 
 A partition carrying an `error` has **unknown** lag, not zero. Never fold it
 into a total as though it were caught up.
@@ -100,15 +111,19 @@ never arrive is worse than none.
 
 ### 7. When the backlog is large, check retention
 
-If the lag is big or growing, call `describe_topic` and compare the backlog
-against `retention.ms`. If the oldest unconsumed messages are approaching
-retention, they will be **deleted before they are ever consumed**. That is data
-loss, and it is worth raising unprompted.
+If the lag is big or growing, call `consumer_lag` again with
+`measure_backlog_age: true`. For each partition it reads the next unconsumed
+message and reports `committed_timestamp` and `lag_seconds`. Each group gets
+`oldest_unconsumed_at`, and the topic gets `retention_ms`. `retention_risk` is
+true once the oldest unconsumed message has used half of the retention. Then
+those messages will be **deleted before they are ever consumed** unless the
+group speeds up. That is data loss, and it is worth raising unprompted, with
+the age and the retention side by side.
 
 ## Notes
 
-- Lag is counted in messages, not bytes or time. A lag of 10,000 tiny messages
-  and 10,000 large ones are very different amounts of work.
+- Lag is counted in messages. `measure_backlog_age` turns it into time. A lag of
+  10,000 tiny messages and 10,000 large ones are very different amounts of work.
 - Rates are per topic, so a consumer group reading several topics may be busy
   elsewhere.
 - A group can be caught up on one partition and far behind on another; the

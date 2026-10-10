@@ -131,3 +131,68 @@ func (c *Codec) messageTypes(ctx context.Context, id int) []string {
 func noRegistry() error {
 	return fmt.Errorf("this cluster has no schema_registry configured, so there are no schemas to look up")
 }
+
+// CompatibilityLevel returns the level in force for a subject, falling back to
+// the registry's global level when the subject sets none.
+func (c *Codec) CompatibilityLevel(ctx context.Context, subject string) (string, error) {
+	if !c.HasRegistry() {
+		return "", noRegistry()
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, registryTimeout)
+	defer cancel()
+
+	results := c.registry.client.Compatibility(sr.WithParams(ctx, sr.DefaultToGlobal), subject)
+	if len(results) == 0 {
+		return "", fmt.Errorf("compatibility of subject %q: the registry returned nothing", subject)
+	}
+
+	if results[0].Err != nil {
+		return "", fmt.Errorf("compatibility of subject %q: %w", subject, registryError(results[0].Err))
+	}
+
+	return results[0].Level.String(), nil
+}
+
+// CheckCompatibility asks the registry whether candidate could be registered
+// under subject, without registering it. kind is avro, protobuf or
+// json_schema; empty means the subject's current type.
+func (c *Codec) CheckCompatibility(ctx context.Context, subject string, candidate string, kind string) (bool, []string, error) {
+	if !c.HasRegistry() {
+		return false, nil, noRegistry()
+	}
+
+	schemaType, err := schemaKind(kind)
+	if err != nil {
+		return false, nil, err
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, registryTimeout)
+	defer cancel()
+
+	result, err := c.registry.client.CheckCompatibility(sr.WithParams(ctx, sr.Verbose), subject, -1,
+		sr.Schema{Schema: candidate, Type: schemaType})
+	if err != nil {
+		return false, nil, fmt.Errorf("check compatibility against subject %q: %w", subject, registryError(err))
+	}
+
+	messages := result.Messages
+	if messages == nil {
+		messages = []string{}
+	}
+
+	return result.Is, messages, nil
+}
+
+func schemaKind(kind string) (sr.SchemaType, error) {
+	switch kind {
+	case "", FormatAvro:
+		return sr.TypeAvro, nil
+	case FormatProtobuf:
+		return sr.TypeProtobuf, nil
+	case FormatJSONSchema:
+		return sr.TypeJSON, nil
+	}
+
+	return 0, fmt.Errorf("type must be avro, protobuf or json_schema, got %q", kind)
+}

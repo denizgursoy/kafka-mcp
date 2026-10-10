@@ -190,6 +190,7 @@ func tlsConfig(settings *config.TLS) (*tls.Config, error) {
 	if err != nil {
 		return nil, fmt.Errorf("configure tls: %w", err)
 	}
+	cfg.InsecureSkipVerify = settings.InsecureSkipVerify
 
 	return cfg, nil
 }

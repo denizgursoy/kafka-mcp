@@ -17,8 +17,8 @@ type Item struct {
 	Topic         string `json:"topic" jsonschema:"Topic to read from. Matched exactly and case-sensitively."`
 	Partition     int32  `json:"partition" jsonschema:"Partition to read from."`
 	Offset        int64  `json:"offset" jsonschema:"Exact offset of the message to read."`
-	Context       int    `json:"context,omitempty" jsonschema:"Optional number of messages to also return either side of this offset. Defaults to 0. Clamped to what the partition holds."`
-	MaxValueBytes int    `json:"max_value_bytes,omitempty" jsonschema:"Optional maximum number of value bytes to return per message. Defaults to 4096. Values longer than this are cut and flagged with truncated=true."`
+	Context       int    `json:"context,omitempty" jsonschema:"Optional number of messages to also return either side of this offset. Defaults to 0, at most 100. Clamped to what the partition holds."`
+	MaxValueBytes int    `json:"max_value_bytes,omitempty" jsonschema:"Optional maximum number of value bytes to return per message. Defaults to 4096, at most 1048576. Values longer than this are cut and flagged with truncated=true."`
 }
 
 // Input is the argument set accepted by the get_message tool.
@@ -35,6 +35,12 @@ type Output struct {
 }
 
 type BatchOutput = batch.Output[Output]
+
+// Limits on caller input. Both size what is read and held in memory.
+const (
+	maxContext    = 100
+	maxValueBytes = 1 << 20
+)
 
 const description = `
 Read 1 to 20 Kafka messages at exact addresses in one call through items, and
@@ -101,6 +107,14 @@ func get(
 
 	if input.Context < 0 {
 		return Output{}, fmt.Errorf("context must not be negative, got %d", input.Context)
+	}
+
+	if input.Context > maxContext {
+		return Output{}, fmt.Errorf("context must be at most %d, got %d", maxContext, input.Context)
+	}
+
+	if err := batch.Bounded("max_value_bytes", input.MaxValueBytes, maxValueBytes); err != nil {
+		return Output{}, err
 	}
 
 	start := input.Offset - int64(input.Context)

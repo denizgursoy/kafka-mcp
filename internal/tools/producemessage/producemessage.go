@@ -244,11 +244,10 @@ func run(
 	destinationName := source.Config().Name
 
 	if input.DestinationCluster != "" && input.DestinationCluster != destinationName {
-		destination = clusters.Destination(input.DestinationCluster)
-		if destination == nil {
-			return Output{}, fmt.Errorf(
-				"unknown destination_cluster %q: use list_clusters to see which clusters this server serves",
-				input.DestinationCluster)
+		var err error
+		destination, err = clusters.Destination(own, input.DestinationCluster)
+		if err != nil {
+			return Output{}, err
 		}
 
 		destinationName = input.DestinationCluster
@@ -325,7 +324,9 @@ func run(
 	}
 
 	if !confirm {
-		out.Message.Partition = 0
+		// Without an explicit partition the key decides at write time, and
+		// nothing has been written yet; 0 is the conventional placeholder.
+		out.Message.Partition = record.Partition
 		out.Note = "nothing was written. Call again with confirm true to produce this message."
 
 		return out, nil

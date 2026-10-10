@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/dop251/goja"
+	"github.com/dop251/goja/ast"
 )
 
 // maxCallStackSize turns runaway recursion into a catchable JavaScript error
@@ -60,7 +61,21 @@ func Compile(source string, parameters ...string) (*Script, error) {
 
 	wrapped += ") {\n" + source + "\n})"
 
-	program, err := goja.Compile("filter.js", wrapped, true)
+	// The source is pasted into a wrapper, so a script containing `})` could
+	// close it early and put statements at the top level. Those run when the
+	// program loads, before any Guard exists, and an endless loop there could
+	// never be stopped. Only a program that is exactly one function literal
+	// is allowed to load.
+	parsed, err := goja.Parse("filter.js", wrapped)
+	if err != nil {
+		return nil, fmt.Errorf("script does not compile: %w", err)
+	}
+
+	if !singleFunction(parsed) {
+		return nil, fmt.Errorf("script must be a single function body; it closes the function it is wrapped in")
+	}
+
+	program, err := goja.CompileAST(parsed, true)
 	if err != nil {
 		return nil, fmt.Errorf("script does not compile: %w", err)
 	}
@@ -94,6 +109,24 @@ func Compile(source string, parameters ...string) (*Script, error) {
 	return &Script{runtime: runtime, fn: fn, source: source}, nil
 }
 
+// singleFunction reports whether a program is one expression statement whose
+// expression is a function literal, which is the only shape that defines the
+// predicate without running anything.
+func singleFunction(program *ast.Program) bool {
+	if len(program.Body) != 1 {
+		return false
+	}
+
+	statement, ok := program.Body[0].(*ast.ExpressionStatement)
+	if !ok {
+		return false
+	}
+
+	_, ok = statement.Expression.(*ast.FunctionLiteral)
+
+	return ok
+}
+
 // Runtime exposes the underlying runtime so a caller can build values that only
 // make sense inside it, such as a real JavaScript Date.
 func (s *Script) Runtime() *goja.Runtime {
@@ -117,6 +150,12 @@ func (s *Script) Call(arguments ...goja.Value) (bool, error) {
 	}
 
 	return result.ToBoolean(), nil
+}
+
+// Evaluate runs the script and returns what it returned, for callers that need
+// a value rather than a match, such as a grouping key.
+func (s *Script) Evaluate(arguments ...goja.Value) (goja.Value, error) {
+	return s.fn(goja.Undefined(), arguments...)
 }
 
 // Interrupt stops a script that is currently running. It is safe to call from

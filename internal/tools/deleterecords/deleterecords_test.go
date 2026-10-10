@@ -3,6 +3,7 @@ package deleterecords_test
 import (
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/suite"
 
@@ -203,6 +204,93 @@ func (s *DeleteRecordsSuite) TestBatchAppliesValidItemsAndReportsTheRest() {
 	s.Require().Equal(1, out.Failed, "the missing partition must be one failed item")
 	s.Require().EqualValues(1, s.startOffset(topic, 0), "partition 0 must start at the requested cut")
 	s.Require().EqualValues(2, s.startOffset(topic, 1), "the item after a failed one must still apply")
+}
+
+func (s *DeleteRecordsSuite) timedTopic(prefix string, partitions int32) (string, time.Time) {
+	topic := s.env.CreateTopicWithPartitions(s.T(), prefix, partitions)
+	cut := time.Now().Add(-time.Hour).Truncate(time.Millisecond)
+	before, after := cut.Add(-time.Minute), cut.Add(time.Minute)
+
+	messages := []testenv.Message{}
+	for partition := int32(0); partition < partitions; partition++ {
+		messages = append(messages,
+			testenv.Message{Value: "old", Partition: partition, Timestamp: before},
+			testenv.Message{Value: "old", Partition: partition, Timestamp: before},
+			testenv.Message{Value: "new", Partition: partition, Timestamp: after},
+		)
+	}
+	// Partition 1 gets an extra old message, so its cut differs from 0's.
+	if partitions > 1 {
+		messages = append([]testenv.Message{{Value: "old", Partition: 1, Timestamp: before}}, messages...)
+	}
+	s.env.Produce(s.T(), topic, messages...)
+
+	return topic, cut
+}
+
+func (s *DeleteRecordsSuite) TestCutsAtATimestamp() {
+	topic, cut := s.timedTopic("delete-records-time", 1)
+
+	out, err := s.deleteOne(false, true, deleterecords.Item{
+		Topic: topic, Partition: 0, BeforeTimestamp: &cut, AcknowledgeDataLoss: true,
+	})
+
+	s.Require().NoError(err, "a cut by time must resolve and apply")
+	s.Require().EqualValues(2, out.BeforeOffset,
+		"the cut is the first offset at or after the moment, which keeps the message written then")
+	s.Require().EqualValues(2, s.startOffset(topic, 0), "the broker must agree the older messages are gone")
+}
+
+func (s *DeleteRecordsSuite) TestCutsEveryPartitionAtATimestamp() {
+	topic, cut := s.timedTopic("delete-records-time-all", 2)
+
+	out, err := s.deleteOne(false, false, deleterecords.Item{Topic: topic, AllPartitions: true, BeforeTimestamp: &cut})
+	s.Require().NoError(err, "a preview over every partition must succeed")
+
+	s.Run("each partition gets its own cut", func() {
+		s.Require().Len(out.Partitions, 2, "both partitions must be reported, sorted")
+		s.Require().EqualValues(2, out.Partitions[0].BeforeOffset, "partition 0 has two older messages")
+		s.Require().EqualValues(3, out.Partitions[1].BeforeOffset,
+			"partition 1 has three, so copying one partition's cut to another would be wrong; resolving per partition is the point")
+	})
+	s.Run("the item is marked as covering every partition", func() {
+		s.Require().True(out.AllPartitions, "a reader must not take the top-level offsets for one partition's cut")
+		s.Require().EqualValues(-1, out.Partition, "no single partition is meant, and 0 would name a real one")
+	})
+	s.Run("the preview totals the loss", func() {
+		s.Require().EqualValues(5, out.MessagesDeleted, "two plus three older messages would go")
+		s.Require().EqualValues(0, s.startOffset(topic, 1), "a preview deletes nothing")
+	})
+
+	applied, err := s.deleteOne(false, true, deleterecords.Item{
+		Topic: topic, AllPartitions: true, BeforeTimestamp: &cut, AcknowledgeDataLoss: true,
+	})
+	s.Require().NoError(err, "applying a cut over every partition must succeed")
+	s.Require().True(applied.Deleted, "the result must say the deletion happened")
+	s.Require().EqualValues(2, s.startOffset(topic, 0), "partition 0 must start at its cut")
+	s.Require().EqualValues(3, s.startOffset(topic, 1), "partition 1 must start at its own cut")
+}
+
+func (s *DeleteRecordsSuite) TestTimestampCutSkipsPartitionsWithNothingOlder() {
+	topic, _ := s.timedTopic("delete-records-time-nothing", 2)
+	early := time.Now().Add(-48 * time.Hour)
+
+	_, err := s.deleteOne(false, false, deleterecords.Item{Topic: topic, AllPartitions: true, BeforeTimestamp: &early})
+
+	s.Require().ErrorContains(err, "nothing",
+		"a moment older than every message deletes nothing anywhere, and must say so rather than report an empty success")
+}
+
+func (s *DeleteRecordsSuite) TestRefusesAmbiguousCuts() {
+	topic := s.topicWith("delete-records-ambiguous", 3)
+	at := time.Now()
+
+	_, err := s.deleteOne(false, false, deleterecords.Item{Topic: topic, BeforeOffset: 2, BeforeTimestamp: &at})
+	s.Require().ErrorContains(err, "before_offset", "an offset and a time are two different cuts; one must be chosen")
+
+	_, err = s.deleteOne(false, false, deleterecords.Item{Topic: topic, AllPartitions: true, BeforeOffset: 2})
+	s.Require().ErrorContains(err, "all_partitions",
+		"an offset means nothing across partitions, so all_partitions needs before_timestamp")
 }
 
 func (s *DeleteRecordsSuite) TestRefusesDuplicatePartitions() {

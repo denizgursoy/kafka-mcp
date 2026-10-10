@@ -3,6 +3,7 @@ package kafkaclient
 import (
 	"context"
 	"fmt"
+	"slices"
 	"sort"
 	"time"
 
@@ -71,42 +72,100 @@ func (r *Registry) Endpoint(name string) *Client {
 	return client.ForEndpoint(endpoint)
 }
 
-// ReadOnly reports whether every endpoint for a cluster refuses writes. This
-// is the cluster-level answer used when choosing a cross-cluster destination.
-func (r *Registry) ReadOnly(name string) bool {
+// endpointConfig returns the policy of a configured endpoint. A name that is
+// not an endpoint but is a cluster gets that cluster's legacy policy, which is
+// what direct package tests and callers predating explicit endpoints pass.
+func (r *Registry) endpointConfig(name string) *config.Endpoint {
 	if r == nil || r.cfg == nil {
-		return true
+		return nil
 	}
-	found := false
-	for _, endpoint := range r.cfg.Endpoints {
-		if endpoint.Cluster != name {
-			continue
-		}
-		found = true
-		if !endpoint.ReadOnly {
-			return false
-		}
+	if endpoint := r.cfg.Endpoints[name]; endpoint != nil {
+		return endpoint
 	}
-	if found {
-		return true
+	if r.cfg.Clusters[name] != nil {
+		return config.LegacyEndpoints(r.cfg.Clusters)[name]
 	}
-	client := r.clients[name]
-	return client == nil || client.Config().ReadOnly
+
+	return nil
 }
 
-// Destination returns a cluster client scoped to the effective destination
-// policy used by cross-cluster copy operations.
-func (r *Registry) Destination(name string) *Client {
-	client := r.Get(name)
+// Writable reports whether a session on endpoint may write to cluster: its
+// own cluster when the endpoint is not read_only, another only when the
+// endpoint lists it in destinations, and never a cluster configured read_only.
+func (r *Registry) Writable(endpoint string, cluster string) bool {
+	policy := r.endpointConfig(endpoint)
+	client := r.clients[cluster]
+	if policy == nil || client == nil || client.Config().ReadOnly {
+		return false
+	}
+	if cluster == policy.Cluster {
+		return !policy.ReadOnly
+	}
+
+	return slices.Contains(policy.Destinations, cluster)
+}
+
+// Destination returns the client a cross-cluster write from endpoint should
+// use for cluster, scoped so RequireWritable gives the effective answer.
+//
+// A cluster the endpoint does not list is refused here, before anything is
+// read, even when some other endpoint could write to it: that permission
+// belongs to a different session. A listed cluster configured read_only is
+// returned, and refuses at RequireWritable with its own reason.
+func (r *Registry) Destination(endpoint string, cluster string) (*Client, error) {
+	policy := r.endpointConfig(endpoint)
+	if policy == nil {
+		return nil, fmt.Errorf("unknown endpoint %q", endpoint)
+	}
+
+	client := r.Exposed(cluster)
 	if client == nil {
-		return nil
+		return nil, fmt.Errorf(
+			"unknown destination_cluster %q: use list_clusters to see which clusters this server serves", cluster)
+	}
+
+	if cluster != policy.Cluster && !slices.Contains(policy.Destinations, cluster) {
+		return nil, fmt.Errorf(
+			"endpoint %q may not write to cluster %q: it is not in this endpoint's destinations %v",
+			policy.Name, cluster, policy.Destinations)
 	}
 
 	return client.ForEndpoint(&config.Endpoint{
-		Name:     name,
-		Cluster:  name,
-		ReadOnly: r.ReadOnly(name),
-	})
+		Name:     policy.Name,
+		Cluster:  cluster,
+		ReadOnly: !r.Writable(endpoint, cluster),
+	}), nil
+}
+
+// Exposed returns the client for a cluster that at least one endpoint serves,
+// or nil. Cross-cluster tools use it so that a cluster defined in the
+// configuration but never given an endpoint stays unreachable.
+func (r *Registry) Exposed(name string) *Client {
+	if r == nil || r.cfg == nil {
+		return nil
+	}
+	if len(r.cfg.Endpoints) == 0 {
+		return r.clients[name]
+	}
+	for _, endpoint := range r.cfg.Endpoints {
+		if endpoint.Cluster == name {
+			return r.clients[name]
+		}
+	}
+
+	return nil
+}
+
+// ExposedNames returns, sorted, every cluster at least one endpoint serves.
+func (r *Registry) ExposedNames() []string {
+	names := make([]string, 0, len(r.names))
+	for _, name := range r.names {
+		if r.Exposed(name) != nil {
+			names = append(names, name)
+		}
+	}
+
+	return names
 }
 
 // Get returns the client for a cluster, or nil when the name is unknown.

@@ -52,6 +52,13 @@ Read the top first:
 Group the problems by the replica that is missing from `isr`. When every problem
 shares one broker id, that broker is the cause, and saying so is the answer.
 
+**A problem with `reassigning: true` is a partition being moved.**
+`adding_replicas` are copying the log and join the ISR when they catch up, so
+`under_replicated` there is expected while the move runs. Say a reassignment is
+in progress rather than calling it an outage. `summary.reassigning` counts these
+partitions. Treat them as a problem only if the same partition stays reassigning
+across several checks, which means the move is stuck.
+
 ### 4. Say what was not checked
 
 If `min_isr_unknown` lists topics, the broker did not report
@@ -71,9 +78,13 @@ transaction (`open_transactions`, see
   electing leaders or reassigning replicas is cluster administration outside
   this server.
 - Lowering a topic's `min.insync.replicas` to make producers succeed again
-  trades durability for availability. It is possible with `alter_topic_config`,
-  but it is the user's decision to make, with that trade said out loud, and it
-  should be reverted once the broker is back.
+  trades durability for availability. It is possible with `alter_topic_config`
+  (follow [tune-topic-config.md](tune-topic-config.md), which checks the
+  endpoint may write first), but it is the user's decision to make, with that
+  trade said out loud, and it should be reverted once the broker is back.
+- `cluster_health` reports partitions; it does not report disk usage. For "a
+  broker's disk is filling up", `list_topics` with a `size_bytes` script ranks
+  the topics by size; see [tune-topic-config.md](tune-topic-config.md).
 - Metadata is a snapshot. A partition recovering from a broker restart moves
   through `offline` and `under_replicated` within seconds; call again before
   concluding a problem is persistent.

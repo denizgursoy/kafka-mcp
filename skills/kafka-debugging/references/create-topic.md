@@ -115,7 +115,7 @@ atomic: report any per-item error and never imply successful topics were rolled
 back.
 
 If the broker refuses with an authorization error, the fix is a Kafka ACL:
-creating a topic needs `CREATE` on the topic or the cluster for the principal
+creating a topic needs `create` on the topic or the cluster for the principal
 this server connects as. That is a request to whoever administers the cluster,
 not something to work around.
 

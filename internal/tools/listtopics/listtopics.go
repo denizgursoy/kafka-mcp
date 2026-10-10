@@ -10,14 +10,16 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/twmb/franz-go/pkg/kadm"
 
+	"github.com/denizgursoy/kafka-mcp/internal/domain/batch"
 	"github.com/denizgursoy/kafka-mcp/internal/domain/script"
 	"github.com/denizgursoy/kafka-mcp/internal/domain/topicconfig"
+	"github.com/denizgursoy/kafka-mcp/internal/domain/topicsize"
 )
 
 // scriptParameters are the variables a predicate sees, in the order match
 // supplies them.
 var scriptParameters = []string{
-	"topic", "partitions", "replication_factor", "internal", "configs",
+	"topic", "partitions", "replication_factor", "internal", "configs", "size_bytes",
 }
 
 // defaultTimeout bounds how long predicates may run in total. It matches
@@ -25,10 +27,13 @@ var scriptParameters = []string{
 // the same in both tools.
 const defaultTimeout = 30 * time.Second
 
+// maxTimeoutSeconds bounds how long a caller may let predicates run.
+const maxTimeoutSeconds = 3600
+
 // Input is the argument set accepted by the list_topics tool.
 type Input struct {
-	Script        string `json:"script,omitempty" jsonschema:"Optional JavaScript that decides whether a topic is listed. Return true to keep it. In scope: topic (the name), partitions (number), replication_factor (number), internal (true for Kafka's own topics such as __consumer_offsets) and configs (an object of the values this topic sets for itself, such as configs['retention.ms']; inherited cluster defaults are not included). Examples: return topic.indexOf('orders') >= 0; return partitions > 6; return configs['cleanup.policy'] === 'compact'; return replication_factor === 1 && !internal. Omit to list every topic."`
-	TimeoutSecond int    `json:"timeout_seconds,omitempty" jsonschema:"Optional wall-clock limit in seconds for evaluating the script. Defaults to 30. A topic whose evaluation is cut short is counted in script_errors rather than listed."`
+	Script        string `json:"script,omitempty" jsonschema:"Optional JavaScript that decides whether a topic is listed. Return true to keep it. In scope: topic (the name), partitions (number), replication_factor (number), internal (true for Kafka's own topics such as __consumer_offsets) configs (an object of the values this topic sets for itself, such as configs['retention.ms']; inherited cluster defaults are not included) and size_bytes (one copy of the topic's log segments on disk, -1 when the brokers did not report it). Examples: return topic.indexOf('orders') >= 0; return partitions > 6; return configs['cleanup.policy'] === 'compact'; return replication_factor === 1 && !internal. Omit to list every topic."`
+	TimeoutSecond int    `json:"timeout_seconds,omitempty" jsonschema:"Optional wall-clock limit in seconds for evaluating the script. Defaults to 30, at most 3600. A topic whose evaluation is cut short is counted in script_errors rather than listed."`
 }
 
 // Topic is one topic and the shape a predicate filters on.
@@ -46,6 +51,8 @@ type Topic struct {
 	// defaults are excluded: they are not choices anyone made, and including
 	// them would make every topic look configured.
 	Configs map[string]string `json:"configs,omitempty"`
+	// SizeBytes is one copy of the topic's log segments, -1 when unknown.
+	SizeBytes int64 `json:"size_bytes"`
 }
 
 // Output is the result returned by the list_topics tool.
@@ -56,6 +63,9 @@ type Output struct {
 	// are not listed, and a caller must not read their absence as a cluster
 	// that does not hold them.
 	ScriptErrors int `json:"script_errors,omitempty"`
+	// Warnings reports what could not be measured, such as sizes the brokers
+	// would not describe.
+	Warnings []string `json:"warnings,omitempty"`
 }
 
 const description = `
@@ -106,6 +116,10 @@ func Run(
 	admin *kadm.Client,
 	input Input,
 ) (Output, error) {
+
+	if err := batch.Bounded("timeout_seconds", input.TimeoutSecond, maxTimeoutSeconds); err != nil {
+		return Output{}, err
+	}
 
 	listed, err := admin.ListTopics(ctx)
 	if err != nil {
@@ -161,6 +175,11 @@ func Run(
 
 	out := Output{Topics: make([]Topic, 0, len(names))}
 
+	sizes, err := topicsize.Read(ctx, admin)
+	if err != nil {
+		out.Warnings = append(out.Warnings, "size_bytes is -1 for every topic: "+err.Error())
+	}
+
 	for _, name := range names {
 		detail := listed[name]
 
@@ -170,6 +189,11 @@ func Run(
 			ReplicationFactor: replicationFactor(detail),
 			Internal:          detail.IsInternal,
 			Configs:           topicconfig.Explicit(configs[name]),
+			SizeBytes:         -1,
+		}
+
+		if size, ok := sizes.Topics[name]; ok {
+			topic.SizeBytes = size.Bytes
 		}
 
 		if filter != nil {
@@ -211,6 +235,7 @@ func match(filter *script.Script, topic Topic) (bool, error) {
 		filter.Value(topic.ReplicationFactor),
 		filter.Value(topic.Internal),
 		filter.Value(configs),
+		filter.Value(topic.SizeBytes),
 	)
 	if err != nil {
 		return false, fmt.Errorf("script failed on topic %q: %w", topic.Topic, err)

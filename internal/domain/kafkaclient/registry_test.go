@@ -106,6 +106,65 @@ func (s *RegistrySuite) TestScopesPermissionsPerEndpoint() {
 	})
 }
 
+func (s *RegistrySuite) TestDestinationsArePerEndpoint() {
+	registry, err := kafkaclient.NewRegistry(&config.Config{
+		Clusters: map[string]*config.Cluster{
+			"prod":    {Name: "prod", Brokers: []string{s.env.Broker()}},
+			"preprod": {Name: "preprod", Brokers: []string{s.env.Broker()}},
+			"locked":  {Name: "locked", Brokers: []string{s.env.Broker()}, ReadOnly: true},
+			"hidden":  {Name: "hidden", Brokers: []string{s.env.Broker()}},
+		},
+		Endpoints: map[string]*config.Endpoint{
+			"prod-read":  {Name: "prod-read", Cluster: "prod", ReadOnly: true, Destinations: []string{"preprod", "locked"}},
+			"prod-write": {Name: "prod-write", Cluster: "prod"},
+			"preprod":    {Name: "preprod", Cluster: "preprod"},
+			"locked":     {Name: "locked", Cluster: "locked"},
+		},
+	})
+	s.Require().NoError(err, "the registry must build")
+	s.T().Cleanup(registry.Close)
+
+	s.Run("a listed destination is writable", func() {
+		client, err := registry.Destination("prod-read", "preprod")
+		s.Require().NoError(err, "a cluster the endpoint lists is one the operator chose to let it write to")
+		s.Require().NoError(client.RequireWritable("copy"),
+			"read_only protects the cluster written to, so a read-only endpoint may still seed a listed writable cluster")
+	})
+	s.Run("an unlisted destination is refused even when another endpoint can write to it", func() {
+		_, err := registry.Destination("preprod", "prod")
+		s.Require().ErrorContains(err, "destinations",
+			"prod has a writable endpoint, but that is a different session's permission; this endpoint never listed prod")
+	})
+	s.Run("cluster read_only still wins over a listing", func() {
+		client, err := registry.Destination("prod-read", "locked")
+		s.Require().NoError(err, "a listed cluster resolves")
+		s.Require().ErrorContains(client.RequireWritable("copy"), "read-only",
+			"a cluster configured read_only is protected from every endpoint, whatever they list")
+	})
+	s.Run("an endpoint with no destinations writes nowhere else", func() {
+		_, err := registry.Destination("prod-write", "preprod")
+		s.Require().ErrorContains(err, "destinations",
+			"absence of a list means no cross-cluster writes, so a new endpoint is narrow until widened")
+	})
+	s.Run("an unknown cluster is reported by name", func() {
+		_, err := registry.Destination("prod-read", "nowhere")
+		s.Require().ErrorContains(err, "nowhere", "a typo is the likeliest cause and must be quoted")
+	})
+	s.Run("writability is reported per endpoint", func() {
+		s.Require().True(registry.Writable("prod-read", "preprod"), "a listed writable cluster is writable from here")
+		s.Require().False(registry.Writable("prod-read", "prod"), "the endpoint's own cluster follows its read_only")
+		s.Require().True(registry.Writable("prod-write", "prod"), "a writable endpoint may write its own cluster")
+		s.Require().False(registry.Writable("preprod", "prod"), "an unlisted cluster is not writable from here")
+		s.Require().False(registry.Writable("prod-read", "locked"), "a read_only cluster is never writable")
+	})
+	s.Run("a cluster no endpoint exposes is unreachable", func() {
+		s.Require().Nil(registry.Exposed("hidden"),
+			"a cluster defined but never given an endpoint must not be readable through another endpoint's cross-cluster tools")
+		s.Require().NotNil(registry.Exposed("preprod"), "an exposed cluster stays reachable")
+		s.Require().NotContains(registry.ExposedNames(), "hidden", "the roster must not reveal a cluster nobody exposed")
+	})
+}
+
 func (s *RegistrySuite) TestKeepsAnUnreachableCluster() {
 	registry, err := kafkaclient.NewRegistry(&config.Config{
 		Clusters: map[string]*config.Cluster{

@@ -2,6 +2,7 @@ package searchmessages
 
 import (
 	"context"
+	"strconv"
 	"testing"
 	"time"
 
@@ -142,6 +143,33 @@ func (s *ScriptSuite) TestReadsTheMessageMetadata() {
 	s.Run("the timestamp as a date", func() {
 		s.Require().True(s.matches(`return timestamp.getUTCFullYear() === 2026`),
 			"the timestamp must be a Date so a script can compare times without parsing strings")
+	})
+}
+
+func (s *ScriptSuite) TestReadsTheMessageShape() {
+	s.Run("the value size", func() {
+		s.Require().True(s.matches(`return value_bytes === `+itoa(len(s.record().Value))),
+			"MESSAGE_TOO_LARGE investigations need the size of each message, which the decoded value no longer shows")
+	})
+
+	s.Run("the key size", func() {
+		s.Require().True(s.matches(`return key_bytes === 9`),
+			"the key's size must be readable too, since it counts toward the message size")
+	})
+
+	s.Run("the format", func() {
+		s.Require().True(s.matches(`return format === 'json'`),
+			"the format separates messages written by different producers, which is how a format change is found")
+	})
+
+	s.Run("no schema id on a plain message", func() {
+		s.Require().True(s.matches(`return schema_id === null`),
+			"a message without a registry framing has no schema id, and null says so rather than a misleading 0")
+	})
+
+	s.Run("no decode error on a plain message", func() {
+		s.Require().True(s.matches(`return decode_error === null`),
+			"a message that decoded must report no error, so a script can find the ones that did not")
 	})
 }
 
@@ -292,4 +320,8 @@ func (s *ScriptSuite) TestHasNoAccessToTheHost() {
 				"the script sandbox must expose no host capability: a filter has no business reaching the filesystem, the network or the clock")
 		})
 	}
+}
+
+func itoa(value int) string {
+	return strconv.Itoa(value)
 }

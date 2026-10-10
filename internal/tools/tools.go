@@ -142,7 +142,7 @@ func Register(
 	// registration is what stops the two from disagreeing.
 	endpoint.add("list_topics", func() { listtopics.Register(server, kafka.Admin()) })
 	endpoint.add("list_consumer_groups", func() { listconsumergroups.Register(server, kafka.Admin()) })
-	endpoint.add("consumer_lag", func() { consumerlag.Register(server, kafka.Admin()) })
+	endpoint.add("consumer_lag", func() { consumerlag.Register(server, kafka.Admin(), kafka.Reader()) })
 	endpoint.add("describe_topic", func() { describetopic.Register(server, kafka.Admin(), kafka.Reader()) })
 	endpoint.add("sample_messages", func() { samplemessages.Register(server, kafka.Admin(), kafka.Reader()) })
 	endpoint.add("search_messages", func() {
@@ -184,7 +184,7 @@ func Register(
 	endpoint.add("compare_clusters", func() { compareclusters.Register(server, clusters, name) })
 	endpoint.add("copy_message", func() { copymessage.Register(server, clusters, name) })
 	endpoint.add("produce_message", func() { producemessage.Register(server, clusters, name) })
-	endpoint.add("list_clusters", func() { listclusters.Register(server, clusters) })
+	endpoint.add("list_clusters", func() { listclusters.Register(server, clusters, name) })
 
 	// server_config is registered last and unconditionally, because it is what
 	// reports the list the additions above have been building.

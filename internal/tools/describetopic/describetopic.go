@@ -13,6 +13,7 @@ import (
 	"github.com/denizgursoy/kafka-mcp/internal/domain/batch"
 	"github.com/denizgursoy/kafka-mcp/internal/domain/records"
 	"github.com/denizgursoy/kafka-mcp/internal/domain/topicconfig"
+	"github.com/denizgursoy/kafka-mcp/internal/domain/topicsize"
 )
 
 // Item is one topic to describe.
@@ -31,6 +32,9 @@ type Partition struct {
 	StartOffset  int64 `json:"start_offset"`
 	EndOffset    int64 `json:"end_offset"`
 	MessageCount int64 `json:"message_count"`
+	// SizeBytes is one copy of the partition's log segments. Nil when the
+	// brokers did not report it.
+	SizeBytes *int64 `json:"size_bytes,omitempty"`
 }
 
 // Config is one topic-level configuration entry.
@@ -48,15 +52,23 @@ type Output struct {
 	Partitions      []Partition `json:"partitions"`
 	OldestTimestamp *time.Time  `json:"oldest_timestamp,omitempty"`
 	NewestTimestamp *time.Time  `json:"newest_timestamp,omitempty"`
-	Configs         []Config    `json:"configs"`
+	// SizeBytes is one copy of every partition; ReplicatedSizeBytes counts
+	// every replica, which is what the brokers' disks hold. Nil when the
+	// brokers did not report log dirs, for example without DESCRIBE on the
+	// cluster.
+	SizeBytes           *int64   `json:"size_bytes,omitempty"`
+	ReplicatedSizeBytes *int64   `json:"replicated_size_bytes,omitempty"`
+	Warnings            []string `json:"warnings,omitempty"`
+	Configs             []Config `json:"configs"`
 }
 
 type BatchOutput = batch.Output[Output]
 
 const description = `
 Describe 1 to 20 topics in one call through items: partitions, offset ranges,
-approximate message count, oldest/newest timestamps and complete effective
-configuration. Config entries identify whether values are inherited or
+approximate message count, size on disk (size_bytes per partition and topic,
+replicated_size_bytes across replicas), oldest/newest timestamps and complete
+effective configuration. Config entries identify whether values are inherited or
 topic-specific.
 
 Results follow items order, each carrying index with result or error, so a
@@ -180,6 +192,22 @@ func describe(
 		})
 
 		out.MessageCount += count
+	}
+
+	// Size is a separate, optional answer: a principal without DESCRIBE on
+	// the cluster cannot read log dirs, and that must not hide the rest.
+	sizes, err := topicsize.Read(ctx, admin, input.Topic)
+	if err != nil {
+		out.Warnings = append(out.Warnings, "size_bytes is not reported: "+err.Error())
+	} else if total, ok := sizes.Topics[input.Topic]; ok {
+		out.SizeBytes = &total.Bytes
+		out.ReplicatedSizeBytes = &total.ReplicatedBytes
+		for i := range out.Partitions {
+			if size, ok := sizes.Partitions[input.Topic][out.Partitions[i].Partition]; ok {
+				bytes := size.Bytes
+				out.Partitions[i].SizeBytes = &bytes
+			}
+		}
 	}
 
 	// kadm returns maps, and Go map iteration order is random, so sort to keep

@@ -474,6 +474,108 @@ func (s *SearchMessagesSuite) TestOmittingTheScriptMatchesEveryMessage() {
 		"with no condition to apply every message matches")
 }
 
+func (s *SearchMessagesSuite) groupTopic() string {
+	topic := s.env.CreateTopic(s.T(), "search-group")
+	s.env.Produce(s.T(), topic,
+		testenv.Message{Value: `{"error":"timeout"}`},
+		testenv.Message{Value: `{"error":"timeout"}`},
+		testenv.Message{Value: `{"error":"bad_schema"}`},
+		testenv.Message{Value: `{"error":"timeout"}`},
+		testenv.Message{Value: `{"ok":true}`},
+	)
+
+	return topic
+}
+
+func (s *SearchMessagesSuite) TestGroupsMatchesByAnExpression() {
+	topic := s.groupTopic()
+
+	out, err := searchmessages.Run(s.T().Context(), s.env.Admin(), s.env.Reader(), "", searchmessages.Input{
+		Topic:   topic,
+		Script:  `return value.error !== undefined`,
+		GroupBy: `return value.error`,
+	})
+	s.Require().NoError(err, "grouping must succeed")
+
+	s.Run("buckets are counted and sorted by size", func() {
+		s.Require().Len(out.Groups, 2, "two distinct error values matched")
+		s.Require().Equal("timeout", out.Groups[0].Key, "the largest bucket comes first, which is the answer to 'what is filling the DLQ'")
+		s.Require().Equal(3, out.Groups[0].Count, "three messages carry timeout")
+		s.Require().Equal("bad_schema", out.Groups[1].Key, "the smaller bucket follows")
+		s.Require().Equal(1, out.Groups[1].Count, "one message carries bad_schema")
+	})
+	s.Run("each bucket points at an example", func() {
+		s.Require().EqualValues(2, out.Groups[1].Example.Offset,
+			"a bucket is only actionable if the caller can open one of its messages with get_message")
+	})
+	s.Run("every match is counted and no bodies are returned", func() {
+		s.Require().Equal(4, out.MatchCount, "grouping counts every match in the range, like count_only")
+		s.Require().Empty(out.Matches, "grouping answers with counts, so bodies would only cost context")
+		s.Require().True(out.Complete, "the whole range was read")
+	})
+}
+
+func (s *SearchMessagesSuite) TestGroupingWithoutAScriptGroupsEveryMessage() {
+	topic := s.groupTopic()
+
+	out, err := searchmessages.Run(s.T().Context(), s.env.Admin(), s.env.Reader(), "", searchmessages.Input{
+		Topic:   topic,
+		GroupBy: `return format`,
+	})
+	s.Require().NoError(err, "grouping without a filter must succeed")
+
+	s.Require().Len(out.Groups, 1, "every message is JSON")
+	s.Require().Equal("json", out.Groups[0].Key, "the script scope, including format, is available to group_by")
+	s.Require().Equal(5, out.Groups[0].Count, "every message is grouped when there is no filter")
+}
+
+func (s *SearchMessagesSuite) TestGroupingCapsTheNumberOfBuckets() {
+	topic := s.groupTopic()
+
+	out, err := searchmessages.Run(s.T().Context(), s.env.Admin(), s.env.Reader(), "", searchmessages.Input{
+		Topic:     topic,
+		GroupBy:   `return String(offset)`,
+		MaxGroups: 2,
+	})
+	s.Require().NoError(err, "grouping past the cap must still succeed")
+
+	s.Require().Len(out.Groups, 2, "no more buckets than max_groups are returned")
+	s.Require().True(out.GroupsTruncated, "the caller must be told buckets were dropped, or the list reads as complete")
+	s.Require().Equal(5, out.MatchCount, "dropped buckets are still counted in match_count")
+}
+
+func (s *SearchMessagesSuite) TestGroupingReportsNonStringKeysAndErrors() {
+	topic := s.groupTopic()
+
+	out, err := searchmessages.Run(s.T().Context(), s.env.Admin(), s.env.Reader(), "", searchmessages.Input{
+		Topic:   topic,
+		GroupBy: `if (value.ok) { throw new Error("boom") } return value.error`,
+	})
+	s.Require().NoError(err, "a group_by that throws on some messages must not fail the search")
+
+	s.Require().Equal(1, out.ScriptErrors, "a message the expression threw on is counted, not silently bucketed")
+	total := 0
+	for _, group := range out.Groups {
+		total += group.Count
+	}
+	s.Require().Equal(4, total, "only messages the expression returned a key for are bucketed")
+}
+
+func (s *SearchMessagesSuite) TestGroupingRefusesConflictingOptions() {
+	search := func(input searchmessages.Input) error {
+		input.Topic = "t"
+		_, err := searchmessages.Run(s.T().Context(), s.env.Admin(), s.env.Reader(), "", input)
+		return err
+	}
+
+	s.Require().ErrorContains(search(searchmessages.Input{GroupBy: `return 1`, OutputFile: "x.jsonl"}), "group_by",
+		"grouping returns counts, so there are no messages to write to a file")
+	s.Require().ErrorContains(search(searchmessages.Input{GroupBy: `return 1`, MaxGroups: 5000}), "max_groups",
+		"an unbounded bucket count turns a summary back into a dump")
+	s.Require().ErrorContains(search(searchmessages.Input{GroupBy: `return ===`}), "compile",
+		"a malformed expression must be refused before anything is read")
+}
+
 func (s *SearchMessagesSuite) TestRejectsImpossibleParallelism() {
 	topic := s.env.CreateTopic(s.T(), "search-bad-parallelism")
 
@@ -487,6 +589,35 @@ func (s *SearchMessagesSuite) TestRejectsImpossibleParallelism() {
 
 	s.Require().Error(err,
 		"each reader is a connection, so an unbounded parallelism would let one search exhaust the broker's connection budget")
+}
+
+func (s *SearchMessagesSuite) TestRejectsUnboundedInputs() {
+	search := func(input searchmessages.Input) error {
+		input.Topic = "t"
+		_, err := searchmessages.Run(s.T().Context(), s.env.Admin(), s.env.Reader(), "", input)
+		return err
+	}
+
+	s.Run("max_matches beyond the limit", func() {
+		s.Require().ErrorContains(search(searchmessages.Input{MaxMatches: 1 << 40}), "max_matches",
+			"max_matches sizes an allocation from caller input, so an unbounded value can crash the server")
+	})
+	s.Run("max_messages_scanned beyond the limit", func() {
+		s.Require().ErrorContains(search(searchmessages.Input{MaxScanned: 1 << 40}), "max_messages_scanned",
+			"an unbounded scan turns one call into a full read of the cluster")
+	})
+	s.Run("timeout_seconds beyond the limit", func() {
+		s.Require().ErrorContains(search(searchmessages.Input{TimeoutSecond: 1 << 30}), "timeout_seconds",
+			"a timeout of years is no timeout, and the call would hold its readers that long")
+	})
+	s.Run("max_value_bytes beyond the limit", func() {
+		s.Require().ErrorContains(search(searchmessages.Input{MaxValueBytes: 1 << 40}), "max_value_bytes",
+			"a response is held in memory and sent to a model, so it must stay bounded")
+	})
+	s.Run("negative limits", func() {
+		s.Require().ErrorContains(search(searchmessages.Input{MaxMatches: -1}), "max_matches",
+			"a negative limit is a caller mistake, not a request for the default")
+	})
 }
 
 func (s *SearchMessagesSuite) TestErrorsWhenBrokerUnreachable() {

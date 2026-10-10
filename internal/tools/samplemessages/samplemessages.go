@@ -20,9 +20,9 @@ import (
 // Item is one topic to sample.
 type Item struct {
 	Topic         string  `json:"topic" jsonschema:"Topic to sample. Matched exactly and case-sensitively."`
-	SampleSize    int     `json:"sample_size,omitempty" jsonschema:"Optional number of messages to read in total, spread across partitions. Defaults to 20."`
+	SampleSize    int     `json:"sample_size,omitempty" jsonschema:"Optional number of messages to read in total, spread across partitions. Defaults to 20, at most 1000."`
 	Partitions    []int32 `json:"partitions,omitempty" jsonschema:"Optional partitions to sample. Defaults to every partition."`
-	MaxValueBytes int     `json:"max_value_bytes,omitempty" jsonschema:"Optional maximum value bytes to return per message. Defaults to 512."`
+	MaxValueBytes int     `json:"max_value_bytes,omitempty" jsonschema:"Optional maximum value bytes to return per message. Defaults to 512, at most 1048576."`
 }
 
 // Input is the argument set accepted by the sample_messages tool.
@@ -68,6 +68,13 @@ type KeyStats struct {
 	Examples  []string `json:"examples,omitempty"`
 }
 
+// Sizes summarises the raw value sizes in the sample, before decoding.
+type Sizes struct {
+	Min int `json:"min"`
+	P50 int `json:"p50"`
+	Max int `json:"max"`
+}
+
 // SampledRange reports the offsets a partition was sampled from.
 type SampledRange struct {
 	Partition int32 `json:"partition"`
@@ -85,6 +92,7 @@ type Output struct {
 	KeyStats      KeyStats          `json:"key_stats"`
 	KeyInValue    []string          `json:"key_in_value"`
 	Schemas       []Schema          `json:"schemas"`
+	ValueBytes    Sizes             `json:"value_bytes"`
 }
 
 type BatchOutput = batch.Output[Output]
@@ -93,13 +101,18 @@ const (
 	defaultSampleSize    = 20
 	defaultMaxValueBytes = 512
 
+	// Limits on caller input, which sizes what is read and held in memory.
+	maxSampleSize    = 1000
+	maxValueBytesCap = 1 << 20
+
 	maxExamples = 3
 )
 
 const description = `
 Sample the newest messages of 1 to 20 topics in one call through items, and
 summarize value formats, field paths, key usage, the schemas values were
-written with, and sampled offset ranges. Use this to design a search_messages
+written with, raw value sizes (value_bytes min/p50/max), and sampled offset
+ranges. Use this to design a search_messages
 predicate, and to find the schema to produce against.
 
 Avro, Protobuf and JSON Schema values carrying a Schema Registry id, and topics
@@ -159,6 +172,14 @@ func sample(
 
 	if input.Topic == "" {
 		return Output{}, fmt.Errorf("topic is required")
+	}
+
+	if err := batch.Bounded("sample_size", input.SampleSize, maxSampleSize); err != nil {
+		return Output{}, err
+	}
+
+	if err := batch.Bounded("max_value_bytes", input.MaxValueBytes, maxValueBytesCap); err != nil {
+		return Output{}, err
 	}
 
 	size := input.SampleSize
@@ -327,8 +348,13 @@ func describe(ctx context.Context, reader *records.Reader, out *Output, collecte
 	keyPaths := make(map[string]int)
 	schemas := make(map[Schema]int)
 	structuredCount := 0
+	sizes := make([]int, 0, len(collected))
+
+	defer func() { out.ValueBytes = summarise(sizes) }()
 
 	for _, record := range collected {
+		sizes = append(sizes, len(record.Value))
+
 		key := reader.Decode(ctx, record, serde.Key)
 		value := reader.Decode(ctx, record, serde.Value)
 
@@ -532,4 +558,16 @@ func example(document any) string {
 	}
 
 	return strings.TrimSpace(fmt.Sprint(document))
+}
+
+// summarise reports the smallest, median and largest of sizes.
+func summarise(sizes []int) Sizes {
+	if len(sizes) == 0 {
+		return Sizes{}
+	}
+
+	sorted := append([]int(nil), sizes...)
+	sort.Ints(sorted)
+
+	return Sizes{Min: sorted[0], P50: sorted[len(sorted)/2], Max: sorted[len(sorted)-1]}
 }

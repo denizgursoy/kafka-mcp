@@ -40,6 +40,14 @@ func (s *ListClustersSuite) registry() *kafkaclient.Registry {
 			"prod":    {Name: "prod", Brokers: []string{s.env.Broker()}, ReadOnly: true},
 			"preprod": {Name: "preprod", Brokers: []string{s.env.Broker()}},
 			"down":    {Name: "down", Brokers: []string{"127.0.0.1:1"}},
+			"dev":     {Name: "dev", Brokers: []string{s.env.Broker()}},
+			"hidden":  {Name: "hidden", Brokers: []string{s.env.Broker()}},
+		},
+		Endpoints: map[string]*config.Endpoint{
+			"prod":    {Name: "prod", Cluster: "prod", ReadOnly: true, Destinations: []string{"preprod"}},
+			"preprod": {Name: "preprod", Cluster: "preprod"},
+			"down":    {Name: "down", Cluster: "down"},
+			"dev":     {Name: "dev", Cluster: "dev"},
 		},
 	})
 	s.Require().NoError(err, "building the registry must succeed")
@@ -63,15 +71,20 @@ func (s *ListClustersSuite) byName(out listclusters.Output) map[string]listclust
 }
 
 func (s *ListClustersSuite) TestReportsEveryCluster() {
-	out, err := listclusters.Run(s.T().Context(), s.registry())
+	out, err := listclusters.Run(s.T().Context(), s.registry(), "prod")
 
 	s.Require().NoError(err, "listing clusters must succeed")
 
-	s.Run("the whole roster is returned", func() {
-		s.Require().Len(out.Clusters, 3,
-			"every configured cluster must be listed, because this is what makes a copy destination discoverable")
-		s.Require().Equal(3, out.Count,
+	s.Run("every exposed cluster is returned", func() {
+		s.Require().Len(out.Clusters, 4,
+			"every cluster an endpoint serves must be listed, because this is what makes a copy destination discoverable")
+		s.Require().Equal(4, out.Count,
 			"count must agree with the list it describes")
+	})
+
+	s.Run("a cluster no endpoint serves is not revealed", func() {
+		s.Require().NotContains(s.byName(out), "hidden",
+			"a cluster defined but never exposed must not be discoverable from another endpoint")
 	})
 
 	s.Run("names are sorted", func() {
@@ -86,7 +99,7 @@ func (s *ListClustersSuite) TestReportsEveryCluster() {
 }
 
 func (s *ListClustersSuite) TestReportsConnectivity() {
-	out, err := listclusters.Run(s.T().Context(), s.registry())
+	out, err := listclusters.Run(s.T().Context(), s.registry(), "prod")
 
 	s.Require().NoError(err, "listing clusters must succeed")
 
@@ -104,7 +117,7 @@ func (s *ListClustersSuite) TestReportsConnectivity() {
 }
 
 func (s *ListClustersSuite) TestReportsWhetherWritesAreAllowed() {
-	out, err := listclusters.Run(s.T().Context(), s.registry())
+	out, err := listclusters.Run(s.T().Context(), s.registry(), "prod")
 
 	s.Require().NoError(err, "listing clusters must succeed")
 
@@ -113,11 +126,20 @@ func (s *ListClustersSuite) TestReportsWhetherWritesAreAllowed() {
 	s.Require().True(indexed["prod"].ReadOnly,
 		"a read-only cluster must say so, so a caller does not choose it as a copy destination and meet a refusal")
 	s.Require().False(indexed["preprod"].ReadOnly,
-		"a writable cluster must say so, because that is what makes it usable as a copy destination")
+		"a writable cluster must say so")
+
+	s.Run("writable is answered for this endpoint", func() {
+		s.Require().True(indexed["preprod"].Writable,
+			"preprod is in this endpoint's destinations, so a copy there will be accepted")
+		s.Require().False(indexed["dev"].Writable,
+			"dev accepts writes in general, but not from this endpoint, which never listed it")
+		s.Require().False(indexed["prod"].Writable,
+			"this endpoint is read_only, so its own cluster is not writable from it")
+	})
 }
 
 func (s *ListClustersSuite) TestRevealsNoConnectionDetails() {
-	out, err := listclusters.Run(s.T().Context(), s.registry())
+	out, err := listclusters.Run(s.T().Context(), s.registry(), "prod")
 
 	s.Require().NoError(err, "listing clusters must succeed")
 

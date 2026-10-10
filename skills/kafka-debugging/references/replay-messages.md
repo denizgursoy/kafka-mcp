@@ -16,6 +16,7 @@ beginning", or "rewind payments to before the bad deploy".
 | `describe_topic`          | Oldest timestamp, to check the moment is still retained |
 | `commit_offset`           | Previewing and moving the group                         |
 | `consumer_lag`            | Confirming the replay is being consumed                 |
+| `list_consumer_groups`    | Finding the group when the user names an application    |
 
 ## Steps
 
@@ -39,6 +40,13 @@ A replay needs three things, and each must be explicit:
 
 `earliest` means everything the topic still holds; `latest` means skip
 everything unread. Both are `position`, not `timestamp`.
+
+A group whose `consumer_lag` shows `offset_expired` needs this guide even when
+the user did not ask for a replay: retention deleted its position, and unless
+an offset is committed deliberately the consumer's `auto.offset.reset` decides
+for it, silently skipping or reprocessing. Moving it to `earliest` keeps every
+message still retained; `latest` drops the backlog. Make that choice with the
+user.
 
 ### 2. Check the moment is still in the topic
 

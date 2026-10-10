@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"unicode/utf8"
 
+	"github.com/dop251/goja"
 	"github.com/twmb/franz-go/pkg/kgo"
 
 	"github.com/denizgursoy/kafka-mcp/internal/domain/script"
@@ -16,6 +17,7 @@ import (
 // match supplies them.
 var scriptParameters = []string{
 	"value", "key", "headers", "partition", "offset", "timestamp",
+	"value_bytes", "key_bytes", "format", "schema_id", "decode_error",
 }
 
 // filter is a compiled user predicate bound to Kafka records.
@@ -53,6 +55,51 @@ func (f *filter) guard(ctx context.Context) func() {
 // An error means the script failed on this message, which is different from
 // the message not matching, and the caller counts the two separately.
 func (f *filter) match(record *kgo.Record, value, key serde.Decoded) (bool, error) {
+	arguments, err := f.arguments(record, value, key)
+	if err != nil {
+		return false, err
+	}
+
+	matched, err := f.Call(arguments...)
+	if err != nil {
+		return false, fmt.Errorf("script failed on partition %d offset %d: %w",
+			record.Partition, record.Offset, err)
+	}
+
+	return matched, nil
+}
+
+// group evaluates a group_by expression and returns the bucket name. null and
+// undefined become "null", so a missing field is its own visible bucket.
+func (f *filter) group(record *kgo.Record, value, key serde.Decoded) (string, error) {
+	arguments, err := f.arguments(record, value, key)
+	if err != nil {
+		return "", err
+	}
+
+	result, err := f.Evaluate(arguments...)
+	if err != nil {
+		return "", fmt.Errorf("group_by failed on partition %d offset %d: %w",
+			record.Partition, record.Offset, err)
+	}
+
+	if goja.IsNull(result) || goja.IsUndefined(result) {
+		return "null", nil
+	}
+
+	if _, isObject := result.(*goja.Object); isObject {
+		encoded, err := json.Marshal(result.Export())
+		if err == nil {
+			return string(encoded), nil
+		}
+	}
+
+	return result.String(), nil
+}
+
+// arguments renders a record as the values a script sees, in the order of
+// scriptParameters.
+func (f *filter) arguments(record *kgo.Record, value, key serde.Decoded) ([]goja.Value, error) {
 	runtime := f.Runtime()
 
 	// A time.Time passed through ToValue arrives as a wrapped Go value with no
@@ -62,24 +109,23 @@ func (f *filter) match(record *kgo.Record, value, key serde.Decoded) (bool, erro
 		runtime.ToValue(record.Timestamp.UnixMilli()),
 	)
 	if err != nil {
-		return false, fmt.Errorf("build timestamp for partition %d offset %d: %w",
+		return nil, fmt.Errorf("build timestamp for partition %d offset %d: %w",
 			record.Partition, record.Offset, err)
 	}
 
-	matched, err := f.Call(
+	return []goja.Value{
 		f.Value(scriptValue(record.Value, value)),
 		f.Value(scriptKey(record.Key, key)),
 		f.Value(decodeHeaders(record.Headers)),
 		f.Value(record.Partition),
 		f.Value(record.Offset),
 		timestamp,
-	)
-	if err != nil {
-		return false, fmt.Errorf("script failed on partition %d offset %d: %w",
-			record.Partition, record.Offset, err)
-	}
-
-	return matched, nil
+		f.Value(len(record.Value)),
+		f.Value(len(record.Key)),
+		f.Value(value.Format),
+		f.Value(nullIfZero(value.SchemaID)),
+		f.Value(nullIfEmpty(value.Error)),
+	}, nil
 }
 
 // scriptValue turns a record value into what the script sees: the decoded
@@ -147,4 +193,22 @@ func decodeHeaders(headers []kgo.RecordHeader) map[string]any {
 	}
 
 	return decoded
+}
+
+// nullIfZero and nullIfEmpty hand the script null for an absent value, so a
+// predicate can test for presence without knowing the zero value's meaning.
+func nullIfZero(value int) any {
+	if value == 0 {
+		return nil
+	}
+
+	return value
+}
+
+func nullIfEmpty(value string) any {
+	if value == "" {
+		return nil
+	}
+
+	return value
 }

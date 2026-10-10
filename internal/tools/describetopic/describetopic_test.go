@@ -1,6 +1,8 @@
 package describetopic_test
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"testing"
 	"time"
@@ -87,6 +89,35 @@ func (s *DescribeTopicSuite) TestReportsOffsetsAndCounts() {
 		"the end offset must be the offset the next message will get, one past the last message")
 	s.Require().EqualValues(3, partition.MessageCount,
 		"message count must be end minus start, which is what a search would have to scan")
+}
+
+func (s *DescribeTopicSuite) TestReportsSizeOnDisk() {
+	topic := s.env.CreateTopicWithPartitions(s.T(), "describe-size", 2)
+	s.env.Produce(s.T(), topic,
+		testenv.Message{Value: incompressible(4096), Partition: 0},
+		testenv.Message{Value: incompressible(4096), Partition: 0},
+	)
+
+	var out describetopic.Output
+	s.Require().Eventually(func() bool {
+		var err error
+		out, err = s.describe(topic)
+		return err == nil && out.SizeBytes != nil && *out.SizeBytes >= 8192
+	}, 15*time.Second, 250*time.Millisecond,
+		"the brokers report segment sizes, and 8 KiB of values must show up as at least that many bytes")
+
+	s.Run("each partition carries its own size", func() {
+		s.Require().NotNil(out.Partitions[0].SizeBytes, "partition 0 holds the data")
+		s.Require().GreaterOrEqual(*out.Partitions[0].SizeBytes, int64(8192), "both messages are on partition 0")
+		s.Require().NotNil(out.Partitions[1].SizeBytes, "an empty partition still reports its size")
+		s.Require().Less(*out.Partitions[1].SizeBytes, int64(8192),
+			"which partition holds the bytes is what finds a disk hog inside one topic")
+	})
+	s.Run("replicated size covers every replica", func() {
+		s.Require().NotNil(out.ReplicatedSizeBytes, "the disk footprint across replicas must be reported")
+		s.Require().GreaterOrEqual(*out.ReplicatedSizeBytes, *out.SizeBytes,
+			"replicas can only add to the footprint, never shrink it")
+	})
 }
 
 func (s *DescribeTopicSuite) TestReportsEveryPartitionSorted() {
@@ -301,4 +332,13 @@ func (s *DescribeTopicSuite) TestBatchDescribesSeveralTopicsWithPartialErrors() 
 	s.Require().Equal(1, out.Results[0].Result.PartitionCount, "the first topic must be described")
 	s.Require().NotEmpty(out.Results[1].Error, "the missing topic must carry its own error")
 	s.Require().Equal(2, out.Results[2].Result.PartitionCount, "the final valid topic must still be described")
+}
+
+// incompressible returns n bytes of random hex, so the size the brokers report
+// is not shrunk by compression.
+func incompressible(n int) string {
+	raw := make([]byte, n/2)
+	_, _ = rand.Read(raw)
+
+	return hex.EncodeToString(raw)
 }

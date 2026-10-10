@@ -162,6 +162,29 @@ func (s *ClusterHealthSuite) TestClassifyISRBelowMinimum() {
 		"it is also under-replicated, and both issues must be listed")
 }
 
+func (s *ClusterHealthSuite) TestMarksReassigningPartitions() {
+	problems := []clusterhealth.Problem{
+		{Topic: "orders", Partition: 0, Issues: []string{clusterhealth.IssueUnderReplicated}},
+		{Topic: "orders", Partition: 1, Issues: []string{clusterhealth.IssueUnderReplicated}},
+	}
+
+	marked := clusterhealth.MarkReassigning(problems, kadm.ListPartitionReassignmentsResponses{
+		"orders": {1: {Topic: "orders", Partition: 1, AddingReplicas: []int32{4}, RemovingReplicas: []int32{2}}},
+	})
+
+	s.Require().False(marked[0].Reassigning, "a partition with no reassignment is a real problem")
+	s.Require().True(marked[1].Reassigning,
+		"a replica being added is out of sync until it catches up, which looks exactly like an outage unless it is labelled")
+	s.Require().Equal([]int32{4}, marked[1].AddingReplicas, "which replica is being added explains the gap in the ISR")
+	s.Require().Equal([]int32{2}, marked[1].RemovingReplicas, "which replica is leaving is reported too")
+}
+
+func (s *ClusterHealthSuite) TestHealthyClusterHasNoReassignments() {
+	out, err := clusterhealth.Run(s.T().Context(), s.env.Admin(), clusterhealth.Input{})
+	s.Require().NoError(err, "a healthy cluster must be checkable")
+	s.Require().Zero(out.Summary.Reassigning, "nothing is moving on a fresh broker")
+}
+
 func (s *ClusterHealthSuite) TestClassifyAFullISRAsHealthy() {
 	minimum := 2
 

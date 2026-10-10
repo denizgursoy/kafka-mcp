@@ -584,6 +584,36 @@ func (s *CopyMessageSuite) TestAllowsAReadOnlySourceCluster() {
 		"the message must have arrived on the writable cluster")
 }
 
+func (s *CopyMessageSuite) TestRefusesADestinationTheEndpointDoesNotList() {
+	source := s.env.CreateTopic(s.T(), "cross-unlisted-source")
+	destination := s.other.CreateTopic(s.T(), "cross-unlisted-destination")
+
+	s.env.Produce(s.T(), source, testenv.Message{Value: "payload"})
+
+	registry, err := kafkaclient.NewRegistry(&config.Config{
+		Clusters: map[string]*config.Cluster{
+			"here":  {Name: "here", Brokers: []string{s.env.Broker()}},
+			"there": {Name: "there", Brokers: []string{s.other.Broker()}},
+		},
+		Endpoints: map[string]*config.Endpoint{
+			"here-read": {Name: "here-read", Cluster: "here", ReadOnly: true},
+			"there":     {Name: "there", Cluster: "there"},
+		},
+	})
+	s.Require().NoError(err, "building the registry must succeed")
+	s.T().Cleanup(registry.Close)
+
+	_, err = s.copyOne(registry, "here-read", true, copymessage.Item{
+		SourceTopic:        source,
+		DestinationTopic:   destination,
+		DestinationCluster: "there",
+	})
+
+	s.Require().ErrorContains(err, "destinations",
+		"another endpoint can write to there, but that is not this session's permission")
+	s.Require().Zero(s.endOffsetOn(s.other, destination), "nothing may have been written")
+}
+
 func (s *CopyMessageSuite) TestErrorsOnAnUnknownDestinationCluster() {
 	source := s.env.CreateTopic(s.T(), "cross-unknown-source")
 

@@ -233,6 +233,51 @@ func (s *ScriptSuite) TestGuardCostsNothingWhenTheScriptFinishes() {
 	stop()
 }
 
+func (s *ScriptSuite) TestRejectsAScriptThatEscapesItsFunction() {
+	s.Run("an endless loop outside the function is refused at compile time", func() {
+		done := make(chan error, 1)
+		go func() {
+			_, err := script.Compile(`}); while (true) {} (function () {`, "topic")
+			done <- err
+		}()
+
+		select {
+		case err := <-done:
+			s.Require().ErrorContains(err, "single function body",
+				"code placed outside the wrapper runs at load time, before any guard exists, so it must never be executed")
+		case <-time.After(5 * time.Second):
+			s.Require().Fail("compiling ran code outside the predicate, and nothing can stop it there")
+		}
+	})
+
+	s.Run("a second top-level statement is refused", func() {
+		_, err := script.Compile(`}); globalThis.x = 1; (function () {`, "topic")
+		s.Require().ErrorContains(err, "single function body",
+			"anything beyond the one function literal is code that runs outside the predicate")
+	})
+
+	s.Run("a closing brace inside a string still compiles", func() {
+		compiled, err := script.Compile(`return topic === "})"`, "topic")
+		s.Require().NoError(err, "braces inside literals are data, not an escape, and must not be refused")
+		defer compiled.Close()
+
+		matched, err := compiled.Call(compiled.Value("})"))
+		s.Require().NoError(err, "the predicate must evaluate")
+		s.Require().True(matched, "the literal must compare as written")
+	})
+}
+
+func (s *ScriptSuite) TestEvaluatesToAValue() {
+	compiled, err := script.Compile(`return topic.split("-")[0]`, "topic")
+	s.Require().NoError(err, "an expression body must compile")
+	defer compiled.Close()
+
+	value, err := compiled.Evaluate(compiled.Value("orders-v2"))
+	s.Require().NoError(err, "evaluating must succeed")
+	s.Require().Equal("orders", value.String(),
+		"a grouping expression returns a value rather than a verdict, so its result must come back unconverted")
+}
+
 func (s *ScriptSuite) TestGuardToleratesNoScript() {
 	stop := script.Guard(s.T().Context(), nil, "stopped")
 

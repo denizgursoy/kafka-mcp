@@ -70,7 +70,7 @@ func (s *ServerConfigSuite) TestReportsTheConnectionAndPermissions() {
 	out, err := serverconfig.Run(
 		client,
 		&config.Config{OutputDir: "/var/tmp/exports", HTTP: config.HTTP{Address: ":8090"}},
-		&config.Endpoint{Name: "prod-read", Cluster: "production", Path: "/mcp", Description: "Production investigation", ReadOnly: true},
+		&config.Endpoint{Name: "prod-read", Cluster: "production", Path: "/mcp", Description: "Production investigation", ReadOnly: true, Destinations: []string{"preprod"}},
 		[]string{"list_topics", "describe_topic"},
 	)
 
@@ -98,6 +98,11 @@ func (s *ServerConfigSuite) TestReportsTheConnectionAndPermissions() {
 			"the caller must see the exact configured route rather than infer it from a cluster name")
 		s.Require().Equal("Production investigation", out.Description,
 			"the operator-provided purpose tells an MCP caller when this endpoint should be used")
+	})
+
+	s.Run("the destinations are reported", func() {
+		s.Require().Equal([]string{"preprod"}, out.Destinations,
+			"a read-only session must be able to learn where it may still copy to before attempting one")
 	})
 
 	s.Run("the registered tools are listed", func() {
