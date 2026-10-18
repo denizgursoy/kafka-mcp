@@ -24,6 +24,8 @@ import (
 	"fmt"
 	"unicode/utf8"
 
+	"github.com/twmb/franz-go/pkg/sr"
+
 	"github.com/denizgursoy/kafka-mcp/internal/domain/config"
 )
 
@@ -112,6 +114,19 @@ func New(cluster *config.Cluster) (*Codec, error) {
 			codec.fixed[settings] = fixed
 		}
 	}
+
+	return codec, nil
+}
+
+// NewWithRegistry is New, but decodes and encodes through a registry client
+// the caller already holds instead of building one from configuration.
+func NewWithRegistry(cluster *config.Cluster, client *sr.Client) (*Codec, error) {
+	codec, err := New(cluster)
+	if err != nil || client == nil {
+		return codec, err
+	}
+
+	codec.registry = &registry{client: client, schemas: map[int]*compiled{}}
 
 	return codec, nil
 }

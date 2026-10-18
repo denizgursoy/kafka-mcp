@@ -55,6 +55,18 @@ func NewRegistry(cfg *config.Config) (*Registry, error) {
 	return registry, nil
 }
 
+// BorrowRegistry holds clients built with Borrow, without connecting to
+// anything. Closing it leaves the borrowed clients open.
+func BorrowRegistry(cfg *config.Config, clients map[string]*Client) *Registry {
+	registry := &Registry{clients: clients, cfg: cfg}
+	for name := range clients {
+		registry.names = append(registry.names, name)
+	}
+	sort.Strings(registry.names)
+
+	return registry
+}
+
 // Endpoint returns a policy-scoped client for one configured MCP endpoint.
 func (r *Registry) Endpoint(name string) *Client {
 	if r == nil || r.cfg == nil {

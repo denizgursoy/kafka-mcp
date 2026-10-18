@@ -137,6 +137,14 @@ func (r Range) Empty() bool {
 type Reader struct {
 	options []kgo.Opt
 	codec   *serde.Codec
+	factory func(topic string) (*kgo.Client, error)
+}
+
+// NewReaderWithFactory reads through clients an embedding application builds,
+// so its authentication is reused. Each call must return a new client that
+// consumes the topic directly; the session closes it.
+func NewReaderWithFactory(factory func(topic string) (*kgo.Client, error)) *Reader {
+	return &Reader{factory: factory}
 }
 
 // NewReader returns a Reader for the given seed brokers.
@@ -153,7 +161,7 @@ func NewReaderWithOptions(options ...kgo.Opt) *Reader {
 // WithCodec returns a reader that decodes messages with codec: Schema
 // Registry framing and the cluster's topic_formats.
 func (r *Reader) WithCodec(codec *serde.Codec) *Reader {
-	return &Reader{options: r.options, codec: codec}
+	return &Reader{options: r.options, codec: codec, factory: r.factory}
 }
 
 // Decode decodes one part of a record with this reader's codec.
@@ -210,6 +218,18 @@ type Session struct {
 // The partitions to read are chosen per scan, so the session starts consuming
 // nothing. It must be closed by the caller.
 func (r *Reader) Session(topic string) (*Session, error) {
+	if r.factory != nil {
+		client, err := r.factory(topic)
+		if err != nil {
+			return nil, fmt.Errorf("create record reader: %w", err)
+		}
+		if client == nil {
+			return nil, fmt.Errorf("create record reader: factory returned no client")
+		}
+
+		return &Session{client: client, topic: topic}, nil
+	}
+
 	options := append([]kgo.Opt(nil), r.options...)
 	options = append(options,
 		// Consuming must be configured at construction for partitions to be

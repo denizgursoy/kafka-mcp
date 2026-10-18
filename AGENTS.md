@@ -39,6 +39,8 @@ Layout:
 
 ```
 cmd/server/main.go        MCP server entrypoint: config, HTTP, one server per cluster
+pkg/kafkamcp/             The only public package: registers the tools on a
+                          host's MCP server with the host's Kafka clients
 internal/tools/
   tools.go                Which tools an endpoint exposes, and their registration
   <tool>/                 One package per MCP tool

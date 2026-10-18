@@ -14,6 +14,7 @@ import (
 	"github.com/twmb/franz-go/pkg/sasl"
 	"github.com/twmb/franz-go/pkg/sasl/plain"
 	"github.com/twmb/franz-go/pkg/sasl/scram"
+	"github.com/twmb/franz-go/pkg/sr"
 	"github.com/twmb/tlscfg"
 
 	"github.com/twmb/franz-go/pkg/kadm"
@@ -33,6 +34,54 @@ type Client struct {
 	manual   *manualProducer
 	cfg      *config.Cluster
 	endpoint *config.Endpoint
+
+	// borrowed clients belong to an embedding application, which closes them.
+	borrowed bool
+}
+
+// Borrowed is what an embedding application lends: clients it built and
+// keeps closing itself. Only the clients NewReader returns are closed here.
+type Borrowed struct {
+	Kafka          *kgo.Client
+	Admin          *kadm.Client
+	NewReader      func(topic string) (*kgo.Client, error)
+	ManualProducer func() (*kgo.Client, error)
+	SchemaRegistry *sr.Client
+}
+
+// Borrow wraps clients an embedding application already holds. cfg carries
+// only the name, policy and reporting fields; nothing in it is dialled.
+func Borrow(cfg *config.Cluster, lent Borrowed) (*Client, error) {
+	if lent.Kafka == nil || lent.NewReader == nil {
+		return nil, fmt.Errorf("cluster %q: a Kafka client and a reader factory are required", cfg.Name)
+	}
+
+	codec, err := serde.NewWithRegistry(cfg, lent.SchemaRegistry)
+	if err != nil {
+		return nil, err
+	}
+
+	admin := lent.Admin
+	if admin == nil {
+		admin = kadm.NewClient(lent.Kafka)
+	}
+
+	manual := lent.ManualProducer
+	if manual == nil {
+		manual = func() (*kgo.Client, error) {
+			return nil, fmt.Errorf("cluster %q has no manual-partition producer", cfg.Name)
+		}
+	}
+
+	return &Client{
+		client:   lent.Kafka,
+		admin:    admin,
+		reader:   records.NewReaderWithFactory(lent.NewReader).WithCodec(codec),
+		codec:    codec,
+		manual:   &manualProducer{factory: manual},
+		cfg:      cfg,
+		borrowed: true,
+	}, nil
 }
 
 // manualProducer is a second producer that honours Record.Partition.
@@ -47,6 +96,9 @@ type Client struct {
 // so a server whose callers never name a partition opens no extra connection.
 type manualProducer struct {
 	options []kgo.Opt
+	// factory, when set, is a borrowed producer the embedding application
+	// owns; it is asked every time and never closed here.
+	factory func() (*kgo.Client, error)
 
 	once   sync.Once
 	client *kgo.Client
@@ -54,6 +106,15 @@ type manualProducer struct {
 }
 
 func (m *manualProducer) get() (*kgo.Client, error) {
+	if m.factory != nil {
+		client, err := m.factory()
+		if err == nil && client == nil {
+			err = fmt.Errorf("manual producer factory returned no client")
+		}
+
+		return client, err
+	}
+
 	m.once.Do(func() {
 		m.client, m.err = kgo.NewClient(
 			append(m.options, kgo.RecordPartitioner(kgo.ManualPartitioner()))...)
@@ -87,6 +148,7 @@ func (c *Client) ForEndpoint(endpoint *config.Endpoint) *Client {
 		manual:   c.manual,
 		cfg:      c.cfg,
 		endpoint: endpoint,
+		borrowed: c.borrowed,
 	}
 }
 
@@ -275,6 +337,10 @@ func (c *Client) Ping(ctx context.Context) error {
 }
 
 func (c *Client) Close() {
+	if c.borrowed {
+		return
+	}
+
 	if c.manual != nil {
 		c.manual.close()
 	}

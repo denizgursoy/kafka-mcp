@@ -120,6 +120,12 @@ func SameRegistry(a, b *Codec) bool {
 		return true
 	}
 
+	// A registry client handed in by an embedding application has no URLs to
+	// compare, so only the same client counts as the same registry.
+	if a.cluster == nil || b.cluster == nil || a.cluster.SchemaRegistry == nil || b.cluster.SchemaRegistry == nil {
+		return false
+	}
+
 	left, right := a.cluster.SchemaRegistry.URLs, b.cluster.SchemaRegistry.URLs
 	if len(left) != len(right) {
 		return false

@@ -454,6 +454,36 @@ list only pages that should have that power, set `auth_token` (a browser client
 then has to send it), and set `read_only: true` on endpoints that should not
 write. A less obvious path such as `/mcp/rw` is not authentication.
 
+## Embedding the tools in a Go application
+
+An application that already holds Kafka clients can register these tools on
+its own MCP server with `github.com/denizgursoy/kafka-mcp/pkg/kafkamcp`. That
+package loads no configuration, opens no listener and dials nothing. The host
+keeps routing, authentication and transport; the tools, results, read-only
+refusals and audit records are the same as the executable's.
+
+```go
+clusters, err := kafkamcp.NewClusters(
+    kafkamcp.Connection{Name: "stage", Kafka: stageClient, NewReader: newStageReader},
+    kafkamcp.Connection{Name: "prod", Kafka: prodClient, NewReader: newProdReader, ReadOnly: true},
+)
+server := mcp.NewServer(&mcp.Implementation{Name: "my-app-stage"}, nil)
+err = clusters.Register(server, "stage", kafkamcp.Options{Destinations: []string{"prod"}})
+http.Handle("/mcp/stage", mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return server }, nil))
+```
+
+- `NewReader` must return a **new** client consuming the topic directly
+  (`kgo.ConsumePartitions`) on every call. The tools close those clients; they
+  never close `Kafka`, `Admin`, `ManualProducer` or `SchemaRegistry`.
+- Every cluster passed to `NewClusters` can be read by `compare_clusters` and
+  `list_clusters`. `copy_message` and `produce_message` write to another
+  cluster only when it is in `Options.Destinations`, and a `ReadOnly`
+  connection refuses every write, whichever server it arrives from.
+- `Options.ReadOnly` hides and refuses writes to the registered cluster;
+  `Options.Tools` switches tools off by name, and an unknown name is an error.
+- `server_config` reports authentication as `host-managed`, along with
+  `Connection.Brokers` and `Connection.Principal`. Both are only reported.
+
 ## Connecting a client
 
 For the default stdio transport, configure the client to launch the binary. A
