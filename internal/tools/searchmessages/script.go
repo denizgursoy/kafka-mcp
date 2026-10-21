@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"unicode/utf8"
 
 	"github.com/dop251/goja"
 	"github.com/twmb/franz-go/pkg/kgo"
@@ -12,13 +11,6 @@ import (
 	"github.com/denizgursoy/kafka-mcp/internal/domain/script"
 	"github.com/denizgursoy/kafka-mcp/internal/domain/serde"
 )
-
-// scriptParameters are the variables a search predicate sees, in the order
-// match supplies them.
-var scriptParameters = []string{
-	"value", "key", "headers", "partition", "offset", "timestamp",
-	"value_bytes", "key_bytes", "format", "schema_id", "decode_error",
-}
 
 // filter is a compiled user predicate bound to Kafka records.
 //
@@ -31,7 +23,7 @@ type filter struct {
 
 // compileScript prepares a user script for evaluation against records.
 func compileScript(source string) (*filter, error) {
-	compiled, err := script.Compile(source, scriptParameters...)
+	compiled, err := script.Compile(source, script.RecordParameters...)
 	if err != nil {
 		return nil, err
 	}
@@ -98,117 +90,7 @@ func (f *filter) group(record *kgo.Record, value, key serde.Decoded) (string, er
 }
 
 // arguments renders a record as the values a script sees, in the order of
-// scriptParameters.
+// script.RecordParameters.
 func (f *filter) arguments(record *kgo.Record, value, key serde.Decoded) ([]goja.Value, error) {
-	runtime := f.Runtime()
-
-	// A time.Time passed through ToValue arrives as a wrapped Go value with no
-	// Date methods, so the timestamp is constructed as a real JavaScript Date.
-	timestamp, err := runtime.New(
-		runtime.Get("Date").ToObject(runtime),
-		runtime.ToValue(record.Timestamp.UnixMilli()),
-	)
-	if err != nil {
-		return nil, fmt.Errorf("build timestamp for partition %d offset %d: %w",
-			record.Partition, record.Offset, err)
-	}
-
-	return []goja.Value{
-		f.Value(scriptValue(record.Value, value)),
-		f.Value(scriptKey(record.Key, key)),
-		f.Value(decodeHeaders(record.Headers)),
-		f.Value(record.Partition),
-		f.Value(record.Offset),
-		timestamp,
-		f.Value(len(record.Value)),
-		f.Value(len(record.Key)),
-		f.Value(value.Format),
-		f.Value(nullIfZero(value.SchemaID)),
-		f.Value(nullIfEmpty(value.Error)),
-	}, nil
-}
-
-// scriptValue turns a record value into what the script sees: the decoded
-// document for JSON and every schema format, the raw text otherwise, so topics
-// that do not hold JSON remain searchable.
-func scriptValue(raw []byte, decoded serde.Decoded) any {
-	if len(raw) == 0 {
-		return nil
-	}
-
-	if decoded.Document != nil {
-		return decoded.Document
-	}
-
-	if decoded.Format == serde.FormatText {
-		// A bare JSON scalar such as 42 or "abc" is text to the renderer but
-		// has always reached scripts parsed, and a predicate written as
-		// value === 42 must keep working.
-		var parsed any
-		if err := json.Unmarshal(raw, &parsed); err == nil {
-			return parsed
-		}
-
-		return decoded.Text
-	}
-
-	// Binary payloads cannot be rendered as text without corrupting them, so
-	// the script sees the bytes and can inspect their length or contents.
-	return raw
-}
-
-// scriptKey renders a key for the script: the decoded document when the key
-// has a schema, the string otherwise, and null when there is none, so a script
-// can tell a missing key from an empty one.
-func scriptKey(raw []byte, decoded serde.Decoded) any {
-	if raw == nil {
-		return nil
-	}
-
-	switch decoded.Format {
-	case serde.FormatText, serde.FormatJSON:
-		return string(raw)
-	case serde.FormatBinary:
-		return raw
-	}
-
-	if decoded.Document != nil {
-		return decoded.Document
-	}
-
-	return string(raw)
-}
-
-func decodeHeaders(headers []kgo.RecordHeader) map[string]any {
-	decoded := make(map[string]any, len(headers))
-
-	for _, header := range headers {
-		if utf8.Valid(header.Value) {
-			decoded[header.Key] = string(header.Value)
-
-			continue
-		}
-
-		decoded[header.Key] = header.Value
-	}
-
-	return decoded
-}
-
-// nullIfZero and nullIfEmpty hand the script null for an absent value, so a
-// predicate can test for presence without knowing the zero value's meaning.
-func nullIfZero(value int) any {
-	if value == 0 {
-		return nil
-	}
-
-	return value
-}
-
-func nullIfEmpty(value string) any {
-	if value == "" {
-		return nil
-	}
-
-	return value
+	return script.RecordArguments(f.Script, record, value, key)
 }

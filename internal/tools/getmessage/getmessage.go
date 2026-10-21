@@ -23,7 +23,7 @@ type Item struct {
 
 // Input is the argument set accepted by the get_message tool.
 type Input struct {
-	Items []Item `json:"items" jsonschema:"The message addresses to read, 1 to 20 of them. Reading one message is an array of length one. Results follow this order and an address that cannot be read is reported against its own item."`
+	Items []Item `json:"items" jsonschema:"The message addresses to read, 1 to 500 of them. Reading one message is an array of length one. Results follow this order and an address that cannot be read is reported against its own item."`
 }
 
 // Output is the result returned for one message address.
@@ -43,7 +43,7 @@ const (
 )
 
 const description = `
-Read 1 to 20 Kafka messages at exact addresses in one call through items, and
+Read 1 to 500 Kafka messages at exact addresses in one call through items, and
 optionally nearby messages for context. Returns key, value, headers, timestamp
 and original value size.
 

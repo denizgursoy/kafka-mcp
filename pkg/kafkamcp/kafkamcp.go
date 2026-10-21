@@ -65,7 +65,8 @@ type Options struct {
 	Tools map[string]bool
 	// Path is reported by server_config as where the host serves the server.
 	Path string
-	// OutputDir is where search_messages writes exports.
+	// OutputDir is where search_messages and transform_messages write
+	// output_file, and where produce_message reads input_file.
 	OutputDir string
 }
 

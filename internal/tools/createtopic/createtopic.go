@@ -44,7 +44,7 @@ const (
 
 // Input is the argument set accepted by the create_topic tool.
 type Input struct {
-	Items   []Item `json:"items" jsonschema:"The topics to create, 1 to 100 of them. Creating one topic is an array of length one. Duplicate topic names are refused before anything is created."`
+	Items   []Item `json:"items" jsonschema:"The topics to create, 1 to 1000 of them. Creating one topic is an array of length one. Duplicate topic names are refused before anything is created."`
 	Confirm bool   `json:"confirm,omitempty" jsonschema:"Optional. When false or omitted, nothing is created: every item is validated by the broker and the response describes what would happen. Must be true to actually create. One confirm covers the whole batch."`
 }
 
@@ -63,7 +63,7 @@ type Output struct {
 type BatchOutput = batch.Output[Output]
 
 const description = `
-Create 1 to 100 Kafka topics in one call through items, each with optional
+Create 1 to 1000 Kafka topics in one call through items, each with optional
 partition count, replication factor and topic-level configs. Omitted values use
 broker defaults. Existing topics are refused rather than modified. Creating one
 topic is an items array of length one.

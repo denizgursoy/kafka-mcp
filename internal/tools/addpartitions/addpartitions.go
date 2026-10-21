@@ -28,7 +28,7 @@ type Item struct {
 
 // Input is the argument set accepted by the add_partitions tool.
 type Input struct {
-	Items   []Item `json:"items" jsonschema:"The topics to change, 1 to 100 of them. Changing one topic is an array of length one. Duplicate topic names are refused before anything changes."`
+	Items   []Item `json:"items" jsonschema:"The topics to change, 1 to 1000 of them. Changing one topic is an array of length one. Duplicate topic names are refused before anything changes."`
 	Confirm bool   `json:"confirm,omitempty" jsonschema:"Optional. When false or omitted, nothing is changed and the response describes what would happen for every item. Must be true to actually add partitions. One confirm covers the whole batch."`
 }
 
@@ -52,7 +52,7 @@ type BatchOutput = batch.Output[Output]
 const defaultSampleSize = 20
 
 const description = `
-Increase the partition count of 1 to 100 topics in one call through items, and
+Increase the partition count of 1 to 1000 topics in one call through items, and
 report each topic's current count, affected consumer groups, sampled key usage
 and warnings. Changing one topic is an items array of length one.
 

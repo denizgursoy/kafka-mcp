@@ -12,6 +12,7 @@ import (
 	"github.com/twmb/franz-go/pkg/kgo"
 	"github.com/twmb/franz-go/pkg/sr"
 
+	"github.com/denizgursoy/kafka-mcp/internal/domain/batch"
 	"github.com/denizgursoy/kafka-mcp/internal/domain/config"
 	"github.com/denizgursoy/kafka-mcp/internal/domain/kafkaclient"
 	"github.com/denizgursoy/kafka-mcp/internal/domain/records"
@@ -156,7 +157,7 @@ func (s *ProduceMessageSuite) produceOne(
 ) (producemessage.Output, error) {
 	s.T().Helper()
 
-	out, err := producemessage.Run(s.T().Context(), clusters, own, producemessage.Input{
+	out, err := producemessage.Run(s.T().Context(), clusters, own, "", producemessage.Input{
 		Items:   []producemessage.Item{item},
 		Confirm: confirm,
 	})
@@ -626,6 +627,7 @@ func (s *ProduceMessageSuite) TestBatchProducesInInputOrder() {
 		s.T().Context(),
 		s.client(false),
 		"here",
+		"",
 		producemessage.Input{
 			Items: []producemessage.Item{
 				{Topic: topic, Value: "first"},
@@ -666,6 +668,7 @@ func (s *ProduceMessageSuite) TestBatchReportsItemErrorsWithoutHidingSuccesses()
 		s.T().Context(),
 		s.client(false),
 		"here",
+		"",
 		producemessage.Input{
 			Items: []producemessage.Item{
 				{Topic: topic, Value: "good"},
@@ -697,6 +700,7 @@ func (s *ProduceMessageSuite) TestBatchPreviewWritesNothing() {
 		s.T().Context(),
 		s.client(false),
 		"here",
+		"",
 		producemessage.Input{
 			Items: []producemessage.Item{
 				{Topic: topic, Value: "first"},
@@ -714,12 +718,12 @@ func (s *ProduceMessageSuite) TestBatchPreviewWritesNothing() {
 func (s *ProduceMessageSuite) TestBatchRejectsTooManyItems() {
 	topic := s.env.CreateTopic(s.T(), "produce-batch-limit")
 
-	items := make([]producemessage.Item, 21)
+	items := make([]producemessage.Item, batch.MaxHeavyItems+1)
 	for index := range items {
 		items[index] = producemessage.Item{Topic: topic, Value: "x"}
 	}
 
-	_, err := producemessage.Run(s.T().Context(), s.client(false), "here",
+	_, err := producemessage.Run(s.T().Context(), s.client(false), "here", "",
 		producemessage.Input{Items: items, Confirm: true})
 
 	s.Require().Error(err,
@@ -729,7 +733,7 @@ func (s *ProduceMessageSuite) TestBatchRejectsTooManyItems() {
 }
 
 func (s *ProduceMessageSuite) TestBatchRejectsAnEmptyItemList() {
-	_, err := producemessage.Run(s.T().Context(), s.client(false), "here",
+	_, err := producemessage.Run(s.T().Context(), s.client(false), "here", "",
 		producemessage.Input{Items: []producemessage.Item{}, Confirm: true})
 
 	s.Require().Error(err,
@@ -738,4 +742,154 @@ func (s *ProduceMessageSuite) TestBatchRejectsAnEmptyItemList() {
 
 func intPointer(value int32) *int32 {
 	return &value
+}
+
+// writeInput writes lines to a new file in a fresh directory and returns the
+// directory, so a case reads back exactly what it put there.
+func (s *ProduceMessageSuite) writeInput(name string, lines ...string) string {
+	s.T().Helper()
+
+	dir := s.T().TempDir()
+	content := ""
+
+	for _, line := range lines {
+		content += line + "\n"
+	}
+
+	s.Require().NoError(os.WriteFile(filepath.Join(dir, name), []byte(content), 0o600),
+		"the input file must be written")
+
+	return dir
+}
+
+func (s *ProduceMessageSuite) TestInputFileProducesEveryLineInOrder() {
+	topic := s.env.CreateTopic(s.T(), "produce-file")
+	dir := s.writeInput("send.jsonl",
+		`{"topic":"`+topic+`","key":"a","value":"first"}`,
+		``,
+		`{"topic":"`+topic+`","key":"b","value":"second","headers":{"trace":"t-2"}}`,
+		`{"topic":"`+topic+`","value":"third"}`,
+	)
+
+	out, err := producemessage.Run(s.T().Context(), s.client(false), "here", dir, producemessage.Input{
+		InputFile: "send.jsonl",
+		Confirm:   true,
+	})
+	s.Require().NoError(err, "sending a valid file must succeed")
+	s.Require().NotNil(out.File, "a file send must report a file summary")
+
+	s.Run("every line is written and counted", func() {
+		s.Require().Equal(3, out.File.Lines, "blank lines are not messages and must not be counted")
+		s.Require().Equal(3, out.File.Written, "every valid line must be written")
+		s.Require().True(out.File.Applied, "a file send that wrote messages must say it applied")
+		s.Require().Equal(int64(3), s.endOffset(topic), "the topic must hold exactly the file's messages")
+	})
+
+	s.Run("file order is kept", func() {
+		_, first, _ := s.read(topic, 0)
+		_, last, _ := s.read(topic, 2)
+		s.Require().Equal("first", string(first), "the first line must be the first message")
+		s.Require().Equal("third", string(last), "the last line must be the last message")
+	})
+
+	s.Run("each line keeps its own key and headers", func() {
+		key, _, headers := s.read(topic, 1)
+		s.Require().Equal("b", key, "a line's key must be written with it")
+		s.Require().Equal("t-2", headers["trace"], "a line's headers must be written with it")
+		s.Require().Contains(headers, "kafka-mcp-produced-by-tool",
+			"messages from a file are as fabricated as any other and must carry provenance")
+	})
+}
+
+func (s *ProduceMessageSuite) TestInputFilePreviewWritesNothingAndReportsBadLines() {
+	topic := s.env.CreateTopic(s.T(), "produce-file-preview")
+	dir := s.writeInput("send.jsonl",
+		`{"topic":"`+topic+`","value":"good"}`,
+		`not json`,
+		`{"topic":"`+topic+`","valeu":"misspelt"}`,
+		`{"topic":"`+topic+`","value":"also good"}`,
+	)
+
+	out, err := producemessage.Run(s.T().Context(), s.client(false), "here", dir, producemessage.Input{
+		InputFile: "send.jsonl",
+	})
+	s.Require().NoError(err, "previewing a file with bad lines must succeed, so every bad line is reported at once")
+
+	s.Require().Zero(s.endOffset(topic), "a preview must write nothing")
+	s.Require().Equal(2, out.File.Valid, "the two well-formed lines must count as valid")
+	s.Require().Equal(2, out.File.Invalid, "both broken lines must be counted")
+	s.Require().Len(out.File.Errors, 2, "each broken line must be reported")
+	s.Require().Equal(2, out.File.Errors[0].Line, "an error must name its line, so the user can find it in the file")
+	s.Require().Contains(out.File.Errors[1].Error, "valeu",
+		"a misspelt field must be named, because ignoring it would write a message without its value")
+}
+
+func (s *ProduceMessageSuite) TestInputFileSkipsBadLinesOnConfirm() {
+	topic := s.env.CreateTopic(s.T(), "produce-file-partial")
+	dir := s.writeInput("send.jsonl",
+		`{"topic":"`+topic+`","value":"good"}`,
+		`{"topic":"`+topic+`","value":""}`,
+		`{"topic":"`+topic+`","value":"also good"}`,
+	)
+
+	out, err := producemessage.Run(s.T().Context(), s.client(false), "here", dir, producemessage.Input{
+		InputFile: "send.jsonl",
+		Confirm:   true,
+	})
+	s.Require().NoError(err, "a file with one invalid line must still send the valid ones, as a batch does")
+
+	s.Require().Equal(2, out.File.Written, "only the valid lines may be written")
+	s.Require().Equal(int64(2), s.endOffset(topic), "the invalid line must not reach the topic")
+}
+
+func (s *ProduceMessageSuite) TestInputFileRefusesAReadOnlyDestination() {
+	topic := s.env.CreateTopic(s.T(), "produce-file-read-only")
+	dir := s.writeInput("send.jsonl", `{"topic":"`+topic+`","value":"x"}`)
+
+	_, err := producemessage.Run(s.T().Context(), s.client(true), "here", dir, producemessage.Input{
+		InputFile: "send.jsonl",
+		Confirm:   true,
+	})
+	s.Require().ErrorContains(err, "read-only",
+		"a read-only destination refuses every line alike, so it must refuse the call rather than report it per line")
+	s.Require().Zero(s.endOffset(topic), "a refused file must leave the topic untouched")
+}
+
+func (s *ProduceMessageSuite) TestInputFileRefusesUnsafeNames() {
+	dir := s.T().TempDir()
+
+	s.Run("a path", func() {
+		_, err := producemessage.Run(s.T().Context(), s.client(false), "here", dir, producemessage.Input{
+			InputFile: "../etc/passwd",
+		})
+		s.Require().ErrorContains(err, "file name",
+			"input_file must be confined to the output directory, or a caller could make the server read any file")
+	})
+
+	s.Run("a symlink", func() {
+		outside := filepath.Join(s.T().TempDir(), "secret.jsonl")
+		s.Require().NoError(os.WriteFile(outside, []byte(`{"topic":"x","value":"y"}`), 0o600), "the target must exist")
+		s.Require().NoError(os.Symlink(outside, filepath.Join(dir, "link.jsonl")), "the link must exist")
+
+		_, err := producemessage.Run(s.T().Context(), s.client(false), "here", dir, producemessage.Input{
+			InputFile: "link.jsonl",
+		})
+		s.Require().Error(err, "a symlink in the directory must not let the server read a file outside it")
+	})
+
+	s.Run("a missing file", func() {
+		_, err := producemessage.Run(s.T().Context(), s.client(false), "here", dir, producemessage.Input{
+			InputFile: "nope.jsonl",
+		})
+		s.Require().ErrorContains(err, "does not exist", "a missing file must be named as missing")
+	})
+
+	s.Run("items and input_file together", func() {
+		_, err := producemessage.Run(s.T().Context(), s.client(false), "here", dir, producemessage.Input{
+			InputFile: "nope.jsonl",
+			Items:     []producemessage.Item{{Topic: "x", Value: "y"}},
+		})
+		s.Require().ErrorContains(err, "either items or input_file",
+			"giving both leaves which messages to write ambiguous, so it must be refused")
+	})
 }

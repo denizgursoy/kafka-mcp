@@ -122,8 +122,8 @@ endpoints:
       commit_offset: false
 ```
 
-Cross-cluster writes are granted per endpoint. `copy_message` and
-`produce_message` may name a `destination_cluster`, and that cluster must be
+Cross-cluster writes are granted per endpoint. `copy_message`,
+`produce_message` and `transform_messages` may name a `destination_cluster`, and that cluster must be
 listed in the calling endpoint's `destinations`:
 
 ```yaml
@@ -180,9 +180,10 @@ file, HTTP, then environment; environment overrides use the `KAFKA_MCP_` prefix 
 
 At least one cluster with a broker is required. `http.address` defaults to
 `:8090`, `http.base_path` defaults to the HTTP root, and `output_dir` defaults
-to the system temp directory. Exports are confined to that directory:
-`output_file` takes a new file name, never a path; an existing name is refused
-rather than overwritten.
+to the system temp directory. `search_messages` and `transform_messages` write
+their `output_file` there, and `produce_message` reads its `input_file` from
+there. Both take a file name, never a path; an existing `output_file` name is
+refused rather than overwritten, and a symlinked `input_file` is refused.
 
 `brokers` accepts either one address as a scalar or several addresses as a YAML
 list. Each address is passed to Kafka as a separate seed broker.
@@ -476,8 +477,8 @@ http.Handle("/mcp/stage", mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.
   (`kgo.ConsumePartitions`) on every call. The tools close those clients; they
   never close `Kafka`, `Admin`, `ManualProducer` or `SchemaRegistry`.
 - Every cluster passed to `NewClusters` can be read by `compare_clusters` and
-  `list_clusters`. `copy_message` and `produce_message` write to another
-  cluster only when it is in `Options.Destinations`, and a `ReadOnly`
+  `list_clusters`. `copy_message`, `produce_message` and `transform_messages`
+  write to another cluster only when it is in `Options.Destinations`, and a `ReadOnly`
   connection refuses every write, whichever server it arrives from.
 - `Options.ReadOnly` hides and refuses writes to the registered cluster;
   `Options.Tools` switches tools off by name, and an unknown name is an error.
@@ -572,11 +573,12 @@ A writable endpoint can withhold individual tools too, with its `tools` map.
 That is the same mechanism seen from the client: the tool is
 not registered, so it is absent from `tools/list` and from `server_config`.
 
-`copy_message` and `produce_message` stay, because `read_only` protects the
-cluster being written to and the destination is chosen per call. Copying a
+`copy_message`, `produce_message` and `transform_messages` stay, because
+`read_only` protects the cluster being written to and the destination is chosen
+per call. Copying a
 message out of a read-only production cluster, or seeding a writable preprod
 cluster from a protected session, is exactly what they are for. The destination
-must be in the endpoint's `destinations`, and both refuse outright when the
+must be in the endpoint's `destinations`, and each refuses to write when the
 destination is the read-only cluster itself.
 
 Hiding a tool decides what is advertised, not what is permitted: both tools
@@ -627,7 +629,8 @@ stream, so nothing extra has to be configured:
 
 The tools that change a cluster — `add_partitions`, `alter_topic_config`,
 `commit_offset`, `create_topic`, `copy_message`, `delete_consumer_group`,
-`delete_records`, `delete_topic`, `produce_message` — are logged at `INFO`.
+`delete_records`, `delete_topic`, `produce_message`, `transform_messages` — are
+logged at `INFO`.
 Everything else is logged at `DEBUG`, because reads are constant and change
 nothing, so recording them at the same level would bury the writes among them.
 Raise the log level to see them.
@@ -635,9 +638,11 @@ Raise the log level to see them.
 Two fields carry most of the weight. `confirm` separates a real write from a
 preview, and `targets` names the topic, group, partition and offset each item
 pointed at, so a record says which topic was touched rather than only that some
-topic was.
+topic was. Tools without items record their top-level topic and destination, and
+a `produce_message` send from `input_file` records the file name.
 
-**Message content is never logged.** `produce_message` and `copy_message` carry
+**Message content is never logged.** `produce_message`, `copy_message` and
+`transform_messages` carry
 arbitrary payloads, and an audit log is usually readable by more people than the
 data it describes, so keys, values and headers are left out. The audit code has
 no field to unmarshal them into, so content cannot reach a log even by mistake.
@@ -666,7 +671,7 @@ acted. A shared credential cannot be made to answer it.
 `consumer_lag`, `describe_consumer_group`, `open_transactions`,
 `add_partitions`, `alter_topic_config`, `create_topic`, `commit_offset`,
 `delete_consumer_group`, `delete_records`, `delete_topic`, `copy_message` and
-`produce_message` take their target **only** as a required `items` array. There
+`produce_message` take their target **only** as an `items` array. There
 is no single-target form: one operation is an `items` array of length one.
 
 ```json
@@ -678,8 +683,10 @@ Everything naming or shaping an operation lives on the item, so each field and
 its description exist in exactly one place. What governs the whole call stays at
 the top level, which in practice means `confirm`.
 
-The message-heavy tools accept at most 20 items; lag, schema and administrative
-tools accept at most 100.
+The message-heavy tools accept at most 500 items; lag, schema and administrative
+tools accept at most 1000. For more messages than that, `transform_messages`
+scans a topic in one call and `produce_message` sends any number from
+`input_file`.
 
 Every response is the same envelope. Results stay in input order, each entry
 carrying `index` and either `result` or `error`, followed by `succeeded`,
@@ -698,8 +705,8 @@ Lists the clusters this server's endpoints serve, with whether each is
 reachable, whether it is configured `read_only`, and whether this session may
 write to it (`writable`: its own cluster unless the endpoint is read-only,
 another only when listed in `destinations`). Takes no parameters. Available from every endpoint,
-so a session can discover what `copy_message`, `produce_message` and
-`compare_clusters` may target.
+so a session can discover what `copy_message`, `produce_message`,
+`transform_messages` and `compare_clusters` may target.
 
 ```json
 {"clusters": [
@@ -721,7 +728,7 @@ not, or to check whether two environments still match.
 
 | Parameter | Type     | Required | Meaning                          |
 | --------- | -------- | -------- | -------------------------------- |
-| `items`   | object[] | yes      | 1 to 100 clusters to compare against |
+| `items`   | object[] | yes      | 1 to 1000 clusters to compare against |
 
 Item fields:
 
@@ -828,7 +835,7 @@ and how far back the topic can hold data at all.
 
 | Parameter | Type     | Required | Meaning                      |
 | --------- | -------- | -------- | ---------------------------- |
-| `items`   | object[] | yes      | 1 to 20 topics to describe   |
+| `items`   | object[] | yes      | 1 to 500 topics to describe   |
 
 Item fields:
 
@@ -867,7 +874,7 @@ producing to find the schema to write against.
 
 | Parameter | Type     | Required | Meaning                   |
 | --------- | -------- | -------- | ------------------------- |
-| `items`   | object[] | yes      | 1 to 20 topics to sample  |
+| `items`   | object[] | yes      | 1 to 500 topics to sample  |
 
 Item fields:
 
@@ -1038,7 +1045,7 @@ Reads messages at exact offsets, plus optional neighbours.
 
 | Parameter | Type     | Required | Meaning                             |
 | --------- | -------- | -------- | ----------------------------------- |
-| `items`   | object[] | yes      | 1 to 20 addresses to read           |
+| `items`   | object[] | yes      | 1 to 500 addresses to read           |
 
 Item fields:
 
@@ -1075,7 +1082,7 @@ sampled message may not show.
 
 | Parameter | Type     | Required | Meaning                       |
 | --------- | -------- | -------- | ----------------------------- |
-| `items`   | object[] | yes      | 1 to 100 schemas to look up   |
+| `items`   | object[] | yes      | 1 to 1000 schemas to look up   |
 
 Item fields, giving `subject` or `id`:
 
@@ -1130,7 +1137,7 @@ partition is stuck" into "this pod on this host is stuck".
 
 | Parameter | Type     | Required | Meaning                   |
 | --------- | -------- | -------- | ------------------------- |
-| `items`   | object[] | yes      | 1 to 100 groups, each `{"group": "...", "sample_seconds": 30}` |
+| `items`   | object[] | yes      | 1 to 1000 groups, each `{"group": "...", "sample_seconds": 30}` |
 
 `sample_seconds` (optional, at most 60) watches the group for that long before
 describing it, reading it every second, and adds `observation`:
@@ -1173,7 +1180,7 @@ offset stuck, and every `read_committed` consumer stops there. In
 
 | Parameter | Type     | Required | Meaning                          |
 | --------- | -------- | -------- | -------------------------------- |
-| `items`   | object[] | yes      | 1 to 100 topics, each `{"topic": "..."}` |
+| `items`   | object[] | yes      | 1 to 1000 topics, each `{"topic": "..."}` |
 
 ```json
 {"results": [{"index": 0, "result": {
@@ -1197,7 +1204,7 @@ and consumed, and when the backlog will clear.
 
 | Parameter | Type     | Required | Meaning                        |
 | --------- | -------- | -------- | ------------------------------ |
-| `items`   | object[] | yes      | 1 to 100 measurements to take  |
+| `items`   | object[] | yes      | 1 to 1000 measurements to take  |
 
 Item fields:
 
@@ -1326,7 +1333,7 @@ count. Not exposed on a read-only endpoint.
 
 | Parameter | Type     | Required | Meaning                                      |
 | --------- | -------- | -------- | -------------------------------------------- |
-| `items`   | object[] | yes      | 1 to 100 topics to change                    |
+| `items`   | object[] | yes      | 1 to 1000 topics to change                    |
 | `confirm` | bool     | no       | Default false: preview only, nothing changes |
 
 Item fields:
@@ -1354,7 +1361,7 @@ key not named keeps its value. Not exposed on a read-only endpoint.
 
 | Parameter | Type     | Required | Meaning                                       |
 | --------- | -------- | -------- | --------------------------------------------- |
-| `items`   | object[] | yes      | 1 to 100 topics to change                     |
+| `items`   | object[] | yes      | 1 to 1000 topics to change                     |
 | `confirm` | bool     | no       | Default false: preview only, nothing changes  |
 
 Item fields:
@@ -1388,7 +1395,7 @@ Not exposed on a read-only endpoint.
 
 | Parameter | Type     | Required | Meaning                                                             |
 | --------- | -------- | -------- | ------------------------------------------------------------------- |
-| `items`   | object[] | yes      | 1 to 100 topics to create                                           |
+| `items`   | object[] | yes      | 1 to 1000 topics to create                                           |
 | `confirm` | bool     | no       | Default false: the broker validates the requests and creates nothing |
 
 Item fields:
@@ -1426,7 +1433,7 @@ breaks. Not exposed on a read-only endpoint.
 
 | Parameter | Type     | Required | Meaning                                       |
 | --------- | -------- | -------- | --------------------------------------------- |
-| `items`   | object[] | yes      | 1 to 100 topics to delete                     |
+| `items`   | object[] | yes      | 1 to 1000 topics to delete                     |
 | `confirm` | bool     | no       | Default false: preview only, nothing is deleted |
 
 Item fields:
@@ -1469,7 +1476,7 @@ exposed on a read-only endpoint.
 
 | Parameter | Type     | Required | Meaning                                         |
 | --------- | -------- | -------- | ----------------------------------------------- |
-| `items`   | object[] | yes      | 1 to 100 partitions to truncate                 |
+| `items`   | object[] | yes      | 1 to 1000 partitions to truncate                 |
 | `confirm` | bool     | no       | Default false: preview only, nothing is deleted |
 
 Item fields:
@@ -1512,7 +1519,7 @@ nobody will ever drain. Not exposed on a read-only endpoint.
 
 | Parameter | Type     | Required | Meaning                                         |
 | --------- | -------- | -------- | ----------------------------------------------- |
-| `items`   | object[] | yes      | 1 to 100 groups, each `{"group": "..."}`        |
+| `items`   | object[] | yes      | 1 to 1000 groups, each `{"group": "..."}`        |
 | `confirm` | bool     | no       | Default false: preview only, nothing is deleted |
 
 The preview lists each group's committed offsets and lag. A group with active
@@ -1529,7 +1536,7 @@ read-only endpoint.
 
 | Parameter | Type     | Required | Meaning                                      |
 | --------- | -------- | -------- | -------------------------------------------- |
-| `items`   | object[] | yes      | 1 to 100 moves to make                       |
+| `items`   | object[] | yes      | 1 to 1000 moves to make                       |
 | `confirm` | bool     | no       | Default false: preview only, nothing changes |
 
 Item fields — give exactly one of `offset`, `timestamp` or `position`:
@@ -1575,7 +1582,7 @@ cluster already holds.
 
 | Parameter | Type     | Required | Meaning                                         |
 | --------- | -------- | -------- | ----------------------------------------------- |
-| `items`   | object[] | yes      | 1 to 20 copies to make                          |
+| `items`   | object[] | yes      | 1 to 500 copies to make                          |
 | `confirm` | bool     | no       | Default false: preview only, nothing is written |
 
 Item fields:
@@ -1621,10 +1628,11 @@ Writes new messages to existing topics. Unlike `copy_message`, the caller
 supplies the content, so this can put a message into a topic that no producer
 ever sent.
 
-| Parameter | Type     | Required | Meaning                                         |
-| --------- | -------- | -------- | ----------------------------------------------- |
-| `items`   | object[] | yes      | 1 to 20 messages to write                       |
-| `confirm` | bool     | no       | Default false: preview only, nothing is written |
+| Parameter    | Type     | Required | Meaning                                                  |
+| ------------ | -------- | -------- | -------------------------------------------------------- |
+| `items`      | object[] | one of   | 1 to 500 messages to write                               |
+| `input_file` | string   | one of   | File name in `output_dir`, one item per line as JSON     |
+| `confirm`    | bool     | no       | Default false: preview only, nothing is written          |
 
 Item fields:
 
@@ -1663,11 +1671,103 @@ key decides placement, and naming a partition puts a keyed message where its
 key does not hash to, which breaks ordering for that key. The response warns
 whenever an explicit partition is used.
 
+`input_file` sends any number of messages from a file in `output_dir`, such as
+the one `transform_messages` saves with `output_file`. Each line is one item as
+JSON with the item fields above; a misspelt field is refused rather than
+ignored. Every line is validated before anything is written, and the response
+carries a `file` summary instead of one result per line: `lines`, `valid`,
+`invalid`, `written`, the first three messages, and up to 50 failing lines by
+line number. With `confirm` the valid lines are written in file order and
+invalid ones are skipped. The name must be a file name, not a path, and a
+symlink is refused.
+
+```json
+{"name": "produce_message", "arguments": {"input_file": "orders-fixed.jsonl", "confirm": true}}
+```
+
 `read_only` protects the cluster being written to, so a read-only endpoint may
 still produce into a different cluster listed in its `destinations`, and is
 refused outright —
 preview included — when writing to its own. A produced message cannot be
 deleted; it stays until retention removes it.
+
+### `transform_messages`
+
+Rewrites messages with a JavaScript transform and writes the results as new
+messages, to the same topic, another topic or another cluster. Made for repairs
+such as a document that was wrapped in a field it should not be in:
+
+```json
+{"name": "transform_messages", "arguments": {
+  "topic": "orders",
+  "script": "return value.payload !== undefined",
+  "transform": "return { value: value.payload }",
+  "destination_topic": "orders-fixed"
+}}
+```
+
+| Parameter             | Type     | Required | Meaning                                                              |
+| --------------------- | -------- | -------- | -------------------------------------------------------------------- |
+| `topic`               | string   | yes      | Topic to read from                                                   |
+| `transform`           | string   | yes      | JavaScript returning `{value, key, headers}`, any subset, or `null` to skip |
+| `script`              | string   | no       | Predicate choosing which messages to transform, as in `search_messages` |
+| `partitions`          | int[]    | no       | Partitions to read. Default all                                      |
+| `from_offset`         | int      | no       | Inclusive start offset in every partition read                       |
+| `to_offset`           | int      | no       | Exclusive end offset                                                 |
+| `from_timestamp`      | string   | no       | Inclusive RFC3339 start time                                         |
+| `to_timestamp`        | string   | no       | Exclusive RFC3339 end time                                           |
+| `destination_topic`   | string   | no       | Existing topic to write to. Default the source topic                 |
+| `destination_cluster` | string   | no       | Another cluster to write to                                          |
+| `keep_partition`      | bool     | no       | Write to the source partition number instead of letting the key decide |
+| `value_schema`        | object   | no       | Encode new values to this registry schema, as in `produce_message`   |
+| `key_schema`          | object   | no       | Same, for keys                                                       |
+| `max_messages`        | int      | no       | Selected messages to process. Default 100000, at most 10000000       |
+| `timeout_seconds`     | int      | no       | Default 300, at most 3600                                            |
+| `max_value_bytes`     | int      | no       | Example value limit. The whole value is always written               |
+| `output_file`         | string   | no       | Save the new messages as `produce_message` items, one per line       |
+| `confirm`             | bool     | no       | Default false: nothing is written to Kafka                           |
+
+The transform is JavaScript (ES2020: arrow functions, spread, destructuring,
+regular expressions, `JSON`, `Math`, `Date`; no `console`, `require`, timers or
+network) run once per message, with the same variables as `search_messages`.
+It returns an object with any of `value`, `key` and `headers`; a field left out
+is kept from the original, and an unknown field is refused so a typo cannot
+silently write the original unchanged. Returning `headers` replaces them all:
+spread the originals to keep them, and set one to `null` to remove it, as in
+`{ headers: { ...headers, 'error-reason': null } }`.
+
+An integer beyond 2^53, such as a 64-bit id, reaches the transform as a
+`BigInt`, so passing it through writes it back exactly. Compare it with a
+BigInt literal (`value.id === 1234567890123456789n`) or `String()`. Turning it
+into a `Number` rounds it, and a message whose output holds such a rounded
+integer is refused rather than written. The `script` sees values exactly as
+`search_messages` does, so a count taken there matches what is selected. A string value
+is written as its text, anything else as JSON. A value read with a schema id
+is re-encoded with that same schema; `value_schema` picks another, and is
+required when the destination uses a different registry. A topic in
+`topic_formats` is encoded to its format.
+
+Without `confirm` the response counts `scanned`, `matched`, `transformed`,
+`skipped` and `failed`, shows three before/after `examples`, and groups
+failures by reason in `errors`, each with example addresses. With `confirm` the
+new messages are produced in batches and `written` says how many. Every new
+message carries `kafka-mcp-transformed-from-cluster`, `-from-topic`,
+`-from-partition`, `-from-offset`, `-at`, `-by-tool`, `-by-principal` and,
+when known, `-by-client`.
+
+The originals are never changed: Kafka cannot edit a message, so the repaired
+versions are appended. Writing back to the source topic stops at the end offset
+the call started with, so it never reads its own output. Partitions are read in
+ascending order. A run cut short by `max_messages` or the timeout reports
+`complete: false`, a `stopped_reason` and `scanned_ranges`; resume it with
+`partitions` and `from_offset`. Writing is not atomic, and what was written
+before a stop stays.
+
+`output_file` saves the transformed messages so the set can be inspected and
+then sent with `produce_message` `input_file`. Saving and previewing write
+nothing to Kafka, so they work on a read-only endpoint; `confirm` needs a
+writable destination. Like `copy_message`, the tool stays registered on a
+read-only endpoint, because the destination is chosen per call.
 
 ## Skills
 

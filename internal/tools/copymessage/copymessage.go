@@ -50,7 +50,7 @@ const (
 // only duplicate something the cluster already holds. It has no way to write a
 // message that no producer sent; produce_message does that.
 type Input struct {
-	Items   []Item `json:"items" jsonschema:"The copies to make, 1 to 20 of them. Copying one message is an array of length one. Two items naming the same source and destination are refused before anything is written."`
+	Items   []Item `json:"items" jsonschema:"The copies to make, 1 to 500 of them. Copying one message is an array of length one. Two items naming the same source and destination are refused before anything is written."`
 	Confirm bool   `json:"confirm,omitempty" jsonschema:"Optional. When false or omitted, nothing is written and the response shows the messages that would be copied. Must be true to actually write them. One confirm covers the whole batch."`
 }
 
@@ -76,7 +76,7 @@ type Output struct {
 type BatchOutput = batch.Output[Output]
 
 const description = `
-Copy 1 to 20 existing messages in one call through items, each identified by
+Copy 1 to 500 existing messages in one call through items, each identified by
 topic, partition and offset, to an existing topic on this or another configured
 cluster. Preserves key, value and headers and adds traceable provenance headers.
 Copying one message is an items array of length one.

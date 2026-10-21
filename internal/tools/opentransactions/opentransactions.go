@@ -22,7 +22,7 @@ type Item struct {
 
 // Input is the argument set accepted by the open_transactions tool.
 type Input struct {
-	Items []Item `json:"items" jsonschema:"The topics to check, 1 to 100 of them. Checking one topic is an array of length one. Results follow this order and a missing topic is reported against its own item."`
+	Items []Item `json:"items" jsonschema:"The topics to check, 1 to 1000 of them. Checking one topic is an array of length one. Results follow this order and a missing topic is reported against its own item."`
 }
 
 // Producer is one transactional producer holding a partition back.
@@ -62,7 +62,7 @@ type Output struct {
 type BatchOutput = batch.Output[Output]
 
 const description = `
-Find open transactions holding back read_committed consumers on 1 to 100 topics
+Find open transactions holding back read_committed consumers on 1 to 1000 topics
 in one call through items. A consumer with isolation.level=read_committed
 cannot read past the first message of a transaction that has not been committed
 or aborted, so a transactional producer that hangs or dies mid-transaction

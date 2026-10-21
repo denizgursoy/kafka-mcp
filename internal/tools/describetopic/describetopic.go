@@ -23,7 +23,7 @@ type Item struct {
 
 // Input is the argument set accepted by the describe_topic tool.
 type Input struct {
-	Items []Item `json:"items" jsonschema:"The topics to describe, 1 to 20 of them. Describing one topic is an array of length one. Results follow this order and a missing topic is reported against its own item."`
+	Items []Item `json:"items" jsonschema:"The topics to describe, 1 to 500 of them. Describing one topic is an array of length one. Results follow this order and a missing topic is reported against its own item."`
 }
 
 // Partition describes one partition's offset range and size.
@@ -65,7 +65,7 @@ type Output struct {
 type BatchOutput = batch.Output[Output]
 
 const description = `
-Describe 1 to 20 topics in one call through items: partitions, offset ranges,
+Describe 1 to 500 topics in one call through items: partitions, offset ranges,
 approximate message count, size on disk (size_bytes per partition and topic,
 replicated_size_bytes across replicas), oldest/newest timestamps and complete
 effective configuration. Config entries identify whether values are inherited or

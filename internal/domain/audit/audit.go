@@ -47,6 +47,7 @@ var mutating = map[string]bool{
 	"delete_records":        true,
 	"delete_topic":          true,
 	"produce_message":       true,
+	"transform_messages":    true,
 }
 
 // Mutates reports whether a tool changes the cluster, and so is recorded at
@@ -81,6 +82,12 @@ type item struct {
 type arguments struct {
 	Confirm bool   `json:"confirm"`
 	Items   []item `json:"items"`
+
+	// Tools that scan or read a file instead of taking items name their
+	// target at the top level, with the same field names an item uses.
+	item
+
+	InputFile string `json:"input_file"`
 }
 
 // Principal names the identity the broker sees for a cluster, which is the only
@@ -267,7 +274,15 @@ func describeArguments(raw json.RawMessage) []any {
 // targets names what each item pointed at, so a reader learns which topic was
 // touched rather than only that some topic was.
 func targets(parsed arguments) string {
-	named := make([]string, 0, len(parsed.Items))
+	named := make([]string, 0, len(parsed.Items)+2)
+
+	if described := describeItem(parsed.item); described != "" {
+		named = append(named, described)
+	}
+
+	if parsed.InputFile != "" {
+		named = append(named, "file="+parsed.InputFile)
+	}
 
 	for index, item := range parsed.Items {
 		if index == maxTargets {

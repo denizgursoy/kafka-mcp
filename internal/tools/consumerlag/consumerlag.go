@@ -25,7 +25,7 @@ type Item struct {
 
 // Input is the argument set accepted by the consumer_lag tool.
 type Input struct {
-	Items []Item `json:"items" jsonschema:"The measurements to take, 1 to 100 of them. Measuring one topic is an array of length one. Up to 4 sampling windows run at a time, so the call takes about sample_seconds for every 4 measurements."`
+	Items []Item `json:"items" jsonschema:"The measurements to take, 1 to 1000 of them. Measuring one topic is an array of length one. Up to 4 sampling windows run at a time, so the call takes about sample_seconds for every 4 measurements."`
 }
 
 // PartitionLag is the lag of one partition within a group.
@@ -111,7 +111,7 @@ const (
 )
 
 const description = `
-Measure consumer lag for 1 to 100 topics in one call through items: production
+Measure consumer lag for 1 to 1000 topics in one call through items: production
 and consumption rates, and whether each topic's backlog is caught up, draining,
 growing, stalled or has no active consumers. Returns an ETA only when lag is
 shrinking.

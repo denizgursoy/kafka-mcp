@@ -27,7 +27,7 @@ type Item struct {
 
 // Input is the argument set accepted by the alter_topic_config tool.
 type Input struct {
-	Items   []Item `json:"items" jsonschema:"The topics to change, 1 to 100 of them. Changing one topic is an array of length one. Duplicate topic names are refused before anything changes."`
+	Items   []Item `json:"items" jsonschema:"The topics to change, 1 to 1000 of them. Changing one topic is an array of length one. Duplicate topic names are refused before anything changes."`
 	Confirm bool   `json:"confirm,omitempty" jsonschema:"Optional. When false or omitted, nothing is changed: the broker validates every item and the response shows each key's current and requested value. Must be true to apply. One confirm covers the whole batch."`
 }
 
@@ -69,7 +69,7 @@ const (
 )
 
 const description = `
-Change topic-level configuration of 1 to 100 topics in one call through items.
+Change topic-level configuration of 1 to 1000 topics in one call through items.
 Each item sets keys (set) and removes overrides so the cluster default applies
 again (delete). Every key not named keeps its value: changes are incremental,
 never a full replace. Changing one topic is an items array of length one.

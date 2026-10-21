@@ -20,7 +20,7 @@ type Item struct {
 
 // Input is the argument set accepted by the describe_consumer_group tool.
 type Input struct {
-	Items []Item `json:"items" jsonschema:"The groups to describe, 1 to 100 of them. Describing one group is an array of length one. Results follow this order and a group that does not exist is reported against its own item."`
+	Items []Item `json:"items" jsonschema:"The groups to describe, 1 to 1000 of them. Describing one group is an array of length one. Results follow this order and a group that does not exist is reported against its own item."`
 }
 
 // Assignment is the partitions of one topic a member owns.
@@ -88,7 +88,7 @@ type Output struct {
 type BatchOutput = batch.Output[Output]
 
 const description = `
-Describe 1 to 100 consumer groups in one call through items: state, assignor,
+Describe 1 to 1000 consumer groups in one call through items: state, assignor,
 coordinator broker, every running member (member_id, client_id, host and the
 partitions assigned to it), and for every partition the group owns or has
 committed on, the committed offset, end offset, lag, and the member, client id

@@ -68,7 +68,7 @@ export const tools = [
   {
     name: 'describe_topic',
     group: 'discover',
-    batch: 20,
+    batch: 500,
     summary: 'Offset ranges, message count, size on disk, time span and full configuration.',
     detail:
       'Use it before a search to see how much it would read, and how far back the topic can hold data at all: retention.ms and cleanup.policy decide whether a message can still exist.',
@@ -82,7 +82,7 @@ export const tools = [
   {
     name: 'compare_clusters',
     group: 'discover',
-    batch: 100,
+    batch: 1000,
     summary: 'Topics only here, only there, or configured differently. Creates nothing.',
     detail:
       '"Here" is always the cluster this endpoint serves. Entries carry partitions, replication and explicit configs, so they can be passed straight to create_topic.',
@@ -103,7 +103,7 @@ export const tools = [
   {
     name: 'sample_messages',
     group: 'read',
-    batch: 20,
+    batch: 500,
     summary: 'What recent messages look like: formats, field paths, schemas, and which field the key is.',
     detail:
       'Avro, Protobuf and JSON Schema values are decoded first, so their fields are listed like JSON. When key_in_value names a field, the key is that identifier, and searching the key is the exact, cheap lookup.',
@@ -157,7 +157,7 @@ export const tools = [
   {
     name: 'get_message',
     group: 'read',
-    batch: 20,
+    batch: 500,
     summary: 'Messages at exact offsets, with neighbours on either side.',
     detail:
       'Schema Registry values (Avro, Protobuf, JSON Schema) and configured formats come back decoded to JSON, with format and schema_id. Anything else that is not UTF-8 is base64; decode_error says why a schema-framed value could not be read.',
@@ -177,7 +177,7 @@ export const tools = [
   {
     name: 'get_schema',
     group: 'read',
-    batch: 100,
+    batch: 1000,
     summary: 'A Schema Registry schema, by subject or by the schema id a message carries.',
     detail:
       'Read it before producing to a schema-encoded topic: it names every field a value needs. For Protobuf, message_types are the names produce_message accepts. Looking up an id lists the subjects that use it. A subject reports its compatibility level, and check_schema tests a candidate against it without registering anything.',
@@ -212,7 +212,7 @@ export const tools = [
   {
     name: 'consumer_lag',
     group: 'measure',
-    batch: 100,
+    batch: 1000,
     summary: 'Lag, produce and consume rates, and when the backlog clears, or that it never will.',
     detail:
       'status decides what the numbers mean: caught_up, draining, growing, stalled, no_active_consumers or not_measured. An ETA is only given when lag is really shrinking. offset_expired flags a commit retention already deleted; measure_backlog_age reports how old the backlog is against retention. The call blocks for sample_seconds.',
@@ -235,7 +235,7 @@ export const tools = [
   {
     name: 'describe_consumer_group',
     group: 'measure',
-    batch: 100,
+    batch: 1000,
     summary: 'Members, who owns which partition, and the group\u2019s position and lag on each.',
     detail:
       'Turns a stuck partition into a pod: every partition names its member, client id and host. has_commit false means the group owns a partition it never committed on, so auto.offset.reset decides where it starts. sample_seconds watches the group first and reports the states it went through and the members that joined or left.',
@@ -256,7 +256,7 @@ export const tools = [
   {
     name: 'open_transactions',
     group: 'measure',
-    batch: 100,
+    batch: 1000,
     summary: 'Open transactions holding read_committed consumers back, and the producer holding them.',
     detail:
       'A hung transactional producer stalls every read_committed consumer at its first uncommitted message, which looks exactly like a poison message. The fix is restarting the producer named by transactional_id, not moving an offset.',
@@ -310,7 +310,7 @@ export const tools = [
   {
     name: 'create_topic',
     group: 'change',
-    batch: 100,
+    batch: 1000,
     write: 'own',
     summary: 'Creates topics. The preview is the broker\u2019s own validate-only answer.',
     detail:
@@ -330,7 +330,7 @@ export const tools = [
   {
     name: 'add_partitions',
     group: 'change',
-    batch: 100,
+    batch: 1000,
     write: 'own',
     summary: 'Grows a topic. Irreversible: Kafka cannot reduce a partition count.',
     detail:
@@ -353,7 +353,7 @@ export const tools = [
   {
     name: 'alter_topic_config',
     group: 'change',
-    batch: 100,
+    batch: 1000,
     write: 'own',
     summary: 'Changes topic config incrementally, showing each key\u2019s current and requested value.',
     detail:
@@ -375,7 +375,7 @@ export const tools = [
   {
     name: 'commit_offset',
     group: 'change',
-    batch: 100,
+    batch: 1000,
     write: 'own',
     summary: 'Moves a group to an offset, a time or the earliest/latest position, to skip or to replay.',
     detail:
@@ -402,7 +402,7 @@ export const tools = [
   {
     name: 'delete_topic',
     group: 'change',
-    batch: 100,
+    batch: 1000,
     write: 'own',
     summary: 'Deletes topics, after showing the messages and groups it would destroy.',
     detail:
@@ -423,7 +423,7 @@ export const tools = [
   {
     name: 'delete_records',
     group: 'change',
-    batch: 100,
+    batch: 1000,
     write: 'own',
     summary: 'Deletes a partition\u2019s oldest messages, keeping the topic and its groups.',
     detail:
@@ -448,7 +448,7 @@ export const tools = [
   {
     name: 'delete_consumer_group',
     group: 'change',
-    batch: 100,
+    batch: 1000,
     write: 'own',
     summary: 'Deletes abandoned consumer groups and the lag they keep reporting.',
     detail:
@@ -465,7 +465,7 @@ export const tools = [
   {
     name: 'copy_message',
     group: 'change',
-    batch: 20,
+    batch: 500,
     write: 'destination',
     summary: 'Copies a message by its address, to a dead letter topic or into another cluster.',
     detail:
@@ -494,11 +494,11 @@ export const tools = [
   {
     name: 'produce_message',
     group: 'change',
-    batch: 20,
+    batch: 500,
     write: 'destination',
     summary: 'Writes a new message into an existing topic, marked so it is never mistaken for a real one.',
     detail:
-      'Omit partition unless the exact partition is the point: the key decides placement, and a named partition breaks ordering for that key. For a schema-encoded topic give the value as JSON with value_schema; it is validated and encoded before anything is written. A produced message cannot be deleted.',
+      'Omit partition unless the exact partition is the point: the key decides placement, and a named partition breaks ordering for that key. For a schema-encoded topic give the value as JSON with value_schema; it is validated and encoded before anything is written. For more than 500 messages, or a set saved by transform_messages, pass input_file instead of items: a file in output_dir with one item per line. Every line is validated first and failures are reported by line number. A produced message cannot be deleted.',
     params: [
       ['topic', 'string', true, 'Existing topic'],
       ['value', 'string', true, 'The message body'],
@@ -518,6 +518,43 @@ export const tools = [
         provenance_headers: ['kafka-mcp-produced-at', 'kafka-mcp-produced-by-tool', '…'],
       } }],
       succeeded: 1, failed: 0, applied: 0, atomic: false,
+    },
+  },
+  {
+    name: 'transform_messages',
+    group: 'change',
+    write: 'destination',
+    summary: 'Rewrites messages with JavaScript and writes the results as new messages, keeping the originals.',
+    detail:
+      'For repairs such as a document wrapped in a payload field. The transform is JavaScript run once per message, with the same variables as search_messages, and returns any of value, key and headers; what it leaves out is kept, null skips the message, a header set to null is removed, and an unknown field is refused. Integers beyond 2^53 arrive as BigInt, so 64-bit ids are written back exactly. Schema-encoded values are decoded for it and re-encoded with the same schema. Writing back to the source topic stops at the end offset the call started with. Without confirm nothing reaches Kafka: it counts, shows before/after examples and groups failures. output_file saves the set for produce_message input_file.',
+    params: [
+      ['topic', 'string', true, 'Topic to read from'],
+      ['transform', 'string', true, 'Returns { value, key, headers }, any subset, or null to skip'],
+      ['script', 'string', false, 'Predicate choosing which messages to transform'],
+      ['partitions', 'int[]', false, 'Restrict to these partitions'],
+      ['from_offset / to_offset', 'int', false, 'Offset window, end exclusive'],
+      ['from_timestamp / to_timestamp', 'string', false, 'RFC3339 time window'],
+      ['destination_topic', 'string', false, 'Existing topic to write to. Default the source topic'],
+      ['destination_cluster', 'string', false, 'Defaults to this endpoint\u2019s cluster. Another must be in this endpoint\u2019s destinations'],
+      ['keep_partition', 'bool', false, 'Write to the source partition number instead of letting the key decide'],
+      ['value_schema / key_schema', 'object', false, 'Encode to this registry schema instead of the one read'],
+      ['max_messages', 'int', false, 'Selected messages to process. Default 100000, at most 10000000'],
+      ['timeout_seconds', 'int', false, 'Wall-clock limit. Default 300, at most 3600'],
+      ['output_file', 'string', false, 'Save the new messages as produce_message items, one per line'],
+      ['confirm', 'bool', false, 'Default false: nothing is written to Kafka'],
+    ],
+    call: {
+      topic: 'orders',
+      script: 'return value.payload !== undefined',
+      transform: 'return { value: value.payload }',
+      destination_topic: 'orders-fixed',
+    },
+    result: {
+      topic: 'orders', destination_topic: 'orders-fixed',
+      scanned: 120000, matched: 3412, transformed: 3410, skipped: 0, failed: 2, written: 0,
+      applied: false, complete: true, stopped_reason: 'range_exhausted',
+      examples: [{ before: { offset: 48211, value: '{"payload":{"id":"o-1"…' }, after: { value: '{"id":"o-1"…' } }],
+      errors: [{ reason: "transform: TypeError: Cannot read property 'id' of undefined", count: 2, examples: [{ partition: 3, offset: 50102 }] }],
     },
   },
 ]
@@ -558,6 +595,12 @@ export const scenarios = [
     ask: 'reproduce this in preprod',
     flow: ['get_message', 'get_schema', 'list_clusters', 'copy_message', 'produce_message'],
     note: 'Takes a production message into preprod without writing a byte to production.',
+  },
+  {
+    guide: 'repair-messages',
+    ask: 'these messages came in wrapped in a payload field',
+    flow: ['server_config', 'search_messages', 'transform_messages', 'produce_message'],
+    note: 'Previews the repair with before/after examples and failures by reason, then writes the fixed messages without touching the originals.',
   },
   {
     guide: 'compare-clusters',

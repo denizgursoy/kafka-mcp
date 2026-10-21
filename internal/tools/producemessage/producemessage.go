@@ -66,8 +66,9 @@ type SchemaRef struct {
 // therefore not optional: they are what keeps a fabricated message
 // distinguishable from a genuine one.
 type Input struct {
-	Items   []Item `json:"items" jsonschema:"The messages to write, 1 to 20 of them. Writing one message is an array of length one. Two identical items mean two messages, which is allowed: appending the same payload twice is a real request."`
-	Confirm bool   `json:"confirm,omitempty" jsonschema:"Optional. When false or omitted, nothing is written and the response shows the messages that would be produced. Must be true to actually write them. One confirm covers the whole batch."`
+	Items     []Item `json:"items,omitempty" jsonschema:"The messages to write, 1 to 500 of them. Writing one message is an array of length one. Two identical items mean two messages, which is allowed: appending the same payload twice is a real request. Give either items or input_file, not both."`
+	InputFile string `json:"input_file,omitempty" jsonschema:"Optional name of a file in the server's output directory holding one item per line as JSON, with the same fields as an entry of items, such as the file transform_messages writes with output_file. A file name only, not a path. Use it to send more messages than items allows, or to send a set that was saved and inspected first. Every line is validated before anything is written; without confirm nothing is written and the response counts the valid lines and reports the invalid ones by line number. Give either items or input_file, not both."`
+	Confirm   bool   `json:"confirm,omitempty" jsonschema:"Optional. When false or omitted, nothing is written and the response shows the messages that would be produced. Must be true to actually write them. One confirm covers the whole batch."`
 }
 
 // Output is the result returned by the produce_message tool.
@@ -85,16 +86,59 @@ type Output struct {
 	Note               string          `json:"note,omitempty"`
 }
 
-type BatchOutput = batch.Output[Output]
+// BatchOutput is the response: the batch envelope for items, plus File when
+// the messages came from input_file.
+type BatchOutput struct {
+	batch.Output[Output]
+
+	File *FileOutput `json:"file,omitempty"`
+}
+
+// FileOutput summarises a send from input_file. A file may hold far more
+// messages than a response can list, so it reports counts, the first few
+// messages and the lines that failed rather than one result per line.
+type FileOutput struct {
+	Path     string      `json:"path"`
+	Lines    int         `json:"lines"`
+	Valid    int         `json:"valid"`
+	Invalid  int         `json:"invalid"`
+	Written  int         `json:"written"`
+	Failed   int         `json:"failed"`
+	Applied  bool        `json:"applied"`
+	Examples []Output    `json:"examples"`
+	Errors   []LineError `json:"errors"`
+	// ErrorsTruncated says more lines failed than errors lists.
+	ErrorsTruncated bool   `json:"errors_truncated,omitempty"`
+	Note            string `json:"note,omitempty"`
+}
+
+// LineError is one line of input_file that could not be written.
+type LineError struct {
+	Line  int    `json:"line"`
+	Error string `json:"error"`
+}
+
+// Bounds on a send from input_file.
+const (
+	maxFileLines    = 10_000_000
+	maxLineBytes    = 16 << 20
+	maxFileErrors   = 50
+	maxFileExamples = 3
+)
 
 const description = `
-Write 1 to 20 new messages in one call through items, to existing topics on this
-or another configured cluster. The caller supplies the key, value and headers,
+Write 1 to 500 new messages in one call through items, or any number from
+input_file, to existing topics on this or another configured cluster. The caller supplies the key, value and headers,
 so unlike copy_message this can write content no producer ever sent. Writing one
 message is an items array of length one.
 
 Every message carries provenance headers naming this tool, the time and the
 principal, so a fabricated message stays distinguishable from a genuine one.
+
+input_file names a file in the server's output directory holding one item per
+line as JSON, such as the file transform_messages saves with output_file. Every
+line is validated before any is written, and the response reports counts, a few
+examples and the failing lines by number instead of one result per line.
 
 Nothing is written unless confirm is true; one confirm covers the whole batch,
 and writing is not atomic because Kafka cannot retract a record produced before
@@ -123,6 +167,7 @@ func Register(
 	server *mcp.Server,
 	clusters *kafkaclient.Registry,
 	own string,
+	inputDir string,
 ) {
 	mcp.AddTool(
 		server,
@@ -142,7 +187,7 @@ func Register(
 				client = info.Name
 			}
 
-			out, err := runBatch(ctx, clusters, own, input.Items, input.Confirm, client)
+			out, err := run(ctx, clusters, own, inputDir, input, client)
 			if err != nil {
 				return nil, BatchOutput{}, fmt.Errorf("produce messages: %w", err)
 			}
@@ -155,14 +200,40 @@ func Register(
 // Run validates every message before writing any of them. The write phase is
 // non-atomic because Kafka cannot retract a record produced before a later item
 // failed.
+//
+// inputDir is the directory input_file is read from.
 func Run(
 	ctx context.Context,
 	clusters *kafkaclient.Registry,
 	own string,
+	inputDir string,
 	input Input,
 ) (BatchOutput, error) {
 
-	return runBatch(ctx, clusters, own, input.Items, input.Confirm, "")
+	return run(ctx, clusters, own, inputDir, input, "")
+}
+
+func run(
+	ctx context.Context,
+	clusters *kafkaclient.Registry,
+	own string,
+	inputDir string,
+	input Input,
+	client string,
+) (BatchOutput, error) {
+
+	if input.InputFile != "" {
+		if len(input.Items) > 0 {
+			return BatchOutput{}, fmt.Errorf(
+				"give either items or input_file, not both: which messages to write must be unambiguous")
+		}
+
+		return runFile(ctx, clusters, own, inputDir, input.InputFile, input.Confirm, client)
+	}
+
+	out, err := runBatch(ctx, clusters, own, input.Items, input.Confirm, client)
+
+	return BatchOutput{Output: out}, err
 }
 
 func runBatch(
@@ -172,10 +243,10 @@ func runBatch(
 	items []Item,
 	confirm bool,
 	client string,
-) (BatchOutput, error) {
+) (batch.Output[Output], error) {
 
 	if err := batch.Validate(len(items), batch.MaxHeavyItems); err != nil {
-		return BatchOutput{}, err
+		return batch.Output[Output]{}, err
 	}
 
 	// Duplicate targets are not rejected here, unlike the batch write tools
@@ -184,7 +255,7 @@ func runBatch(
 	// twice is different from creating the same topic twice.
 
 	out, err := batch.Run(ctx, items, batch.MaxHeavyItems, func(ctx context.Context, item Item) (Output, error) {
-		return run(ctx, clusters, own, item, false, client)
+		return runItem(ctx, clusters, own, item, false, client, nil)
 	})
 	if err != nil || !confirm {
 		return out, err
@@ -199,7 +270,7 @@ func runBatch(
 			continue
 		}
 
-		value, applyErr := run(ctx, clusters, own, item, true, client)
+		value, applyErr := runItem(ctx, clusters, own, item, true, client, nil)
 		if applyErr != nil {
 			out.Results[index].Result = nil
 			out.Results[index].Error = applyErr.Error()
@@ -219,15 +290,75 @@ func runBatch(
 	return out, nil
 }
 
-// run previews or performs one write.
-func run(
+// runItem previews or performs one write.
+func runItem(
 	ctx context.Context,
 	clusters *kafkaclient.Registry,
 	own string,
 	input Item,
 	confirm bool,
 	client string,
+	topics *topicCache,
 ) (Output, error) {
+
+	ready, err := prepare(ctx, clusters, own, input, client, topics)
+	if err != nil {
+		return Output{}, err
+	}
+
+	if !confirm {
+		return ready.out, nil
+	}
+
+	written, err := produce(ctx, ready.destination, ready.record, ready.manual)
+	if err != nil {
+		return Output{}, err
+	}
+
+	return ready.applied(written), nil
+}
+
+// readOnlyError marks a refusal because the destination may not be written
+// to, which no other line of a file can avoid either. It keeps the message of
+// the refusal it wraps.
+type readOnlyError struct{ error }
+
+func (e readOnlyError) Unwrap() error { return e.error }
+
+// prepared is one message ready to write: the record, where it goes, and the
+// preview a caller sees before it is written.
+type prepared struct {
+	destination *kafkaclient.Client
+	record      *kgo.Record
+	manual      bool
+	out         Output
+}
+
+// applied is the preview completed with where the record was written.
+func (p *prepared) applied(written *kgo.Record) Output {
+	out := p.out
+	out.Applied = true
+	out.WrittenPartition = written.Partition
+	out.WrittenOffset = written.Offset
+	out.Message.Partition = written.Partition
+	out.Message.Offset = written.Offset
+	out.Message.Timestamp = written.Timestamp.UTC()
+	out.Note = fmt.Sprintf(
+		"produced to cluster %s topic %s partition %d offset %d. A produced message cannot be deleted: it stays until retention removes it",
+		out.DestinationCluster, out.Topic, written.Partition, written.Offset)
+
+	return out
+}
+
+// prepare validates and encodes one message without writing it.
+func prepare(
+	ctx context.Context,
+	clusters *kafkaclient.Registry,
+	own string,
+	input Item,
+	client string,
+	topics *topicCache,
+) (*prepared, error) {
 
 	source := clusters.Endpoint(own)
 	if source == nil {
@@ -237,7 +368,7 @@ func run(
 	}
 
 	if source == nil {
-		return Output{}, fmt.Errorf("unknown endpoint or cluster %q", own)
+		return nil, fmt.Errorf("unknown endpoint or cluster %q", own)
 	}
 
 	destination := source
@@ -247,7 +378,7 @@ func run(
 		var err error
 		destination, err = clusters.Destination(own, input.DestinationCluster)
 		if err != nil {
-			return Output{}, err
+			return nil, err
 		}
 
 		destinationName = input.DestinationCluster
@@ -260,31 +391,31 @@ func run(
 	// Writing is the only thing this tool does, so it refuses outright rather
 	// than offering a preview of a capability it does not have.
 	if err := destination.RequireWritable(toolName); err != nil {
-		return Output{}, err
+		return nil, readOnlyError{err}
 	}
 
 	if input.Topic == "" {
-		return Output{}, fmt.Errorf("topic is required")
+		return nil, fmt.Errorf("topic is required")
 	}
 
 	if input.Value == "" {
-		return Output{}, fmt.Errorf(
+		return nil, fmt.Errorf(
 			"value is required: an empty message and an absent one are different messages, and only one of them was intended")
 	}
 
 	key, value, keyEncoding, valueEncoding, err := encode(ctx, destination, input)
 	if err != nil {
-		return Output{}, err
+		return nil, err
 	}
 
-	partitions, err := topicPartitions(ctx, destination, input.Topic)
+	partitions, err := topics.partitions(ctx, destination, input.Topic)
 	if err != nil {
-		return Output{}, err
+		return nil, err
 	}
 
 	if input.Partition != nil {
 		if *input.Partition < 0 || int(*input.Partition) >= partitions {
-			return Output{}, fmt.Errorf(
+			return nil, fmt.Errorf(
 				"topic %q has %d partition(s), numbered 0 to %d, so partition %d cannot be written to",
 				input.Topic, partitions, partitions-1, *input.Partition)
 		}
@@ -323,31 +454,17 @@ func run(
 			*input.Partition))
 	}
 
-	if !confirm {
-		// Without an explicit partition the key decides at write time, and
-		// nothing has been written yet; 0 is the conventional placeholder.
-		out.Message.Partition = record.Partition
-		out.Note = "nothing was written. Call again with confirm true to produce this message."
+	// Without an explicit partition the key decides at write time, and
+	// nothing has been written yet; 0 is the conventional placeholder.
+	out.Message.Partition = record.Partition
+	out.Note = "nothing was written. Call again with confirm true to produce this message."
 
-		return out, nil
-	}
-
-	written, err := produce(ctx, destination, record, input.Partition != nil)
-	if err != nil {
-		return Output{}, err
-	}
-
-	out.Applied = true
-	out.WrittenPartition = written.Partition
-	out.WrittenOffset = written.Offset
-	out.Message.Partition = written.Partition
-	out.Message.Offset = written.Offset
-	out.Message.Timestamp = written.Timestamp.UTC()
-	out.Note = fmt.Sprintf(
-		"produced to cluster %s topic %s partition %d offset %d. A produced message cannot be deleted: it stays until retention removes it",
-		destinationName, input.Topic, written.Partition, written.Offset)
-
-	return out, nil
+	return &prepared{
+		destination: destination,
+		record:      record,
+		manual:      input.Partition != nil,
+		out:         out,
+	}, nil
 }
 
 // encode turns the caller's key and value into the bytes to write.
@@ -575,16 +692,53 @@ func produce(
 	results := producer.ProduceSync(ctx, record)
 
 	if err := results.FirstErr(); err != nil {
-		if errors.Is(err, kerr.TopicAuthorizationFailed) {
-			return nil, fmt.Errorf(
-				"not authorized to write to %q: the broker refused this request. Producing needs write permission on the topic for the principal this server connects as: %w",
-				record.Topic, err)
-		}
-
-		return nil, fmt.Errorf("write the message to %q: %w", record.Topic, err)
+		return nil, produceError(record.Topic, err)
 	}
 
 	return record, nil
+}
+
+// produceError explains a failed write, naming the permission an
+// authorization failure needs.
+func produceError(topic string, err error) error {
+	if errors.Is(err, kerr.TopicAuthorizationFailed) {
+		return fmt.Errorf(
+			"not authorized to write to %q: the broker refused this request. Producing needs write permission on the topic for the principal this server connects as: %w",
+			topic, err)
+	}
+
+	return fmt.Errorf("write the message to %q: %w", topic, err)
+}
+
+// topicCache remembers partition counts per destination and topic, so a file
+// of a million messages for one topic asks the broker once rather than a
+// million times. A nil cache asks every time.
+type topicCache struct {
+	counts map[string]int
+}
+
+func (c *topicCache) partitions(ctx context.Context, kafka *kafkaclient.Client, topic string) (int, error) {
+	if c == nil {
+		return topicPartitions(ctx, kafka, topic)
+	}
+
+	key := kafka.Name() + "\x00" + topic
+	if count, ok := c.counts[key]; ok {
+		return count, nil
+	}
+
+	count, err := topicPartitions(ctx, kafka, topic)
+	if err != nil {
+		return 0, err
+	}
+
+	if c.counts == nil {
+		c.counts = make(map[string]int)
+	}
+
+	c.counts[key] = count
+
+	return count, nil
 }
 
 // topicPartitions returns how many partitions a topic has, and fails when the

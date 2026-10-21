@@ -27,7 +27,7 @@ type Item struct {
 
 // Input is the argument set accepted by the sample_messages tool.
 type Input struct {
-	Items []Item `json:"items" jsonschema:"The topics to sample, 1 to 20 of them. Sampling one topic is an array of length one. Results follow this order and a topic that cannot be sampled is reported against its own item."`
+	Items []Item `json:"items" jsonschema:"The topics to sample, 1 to 500 of them. Sampling one topic is an array of length one. Results follow this order and a topic that cannot be sampled is reported against its own item."`
 }
 
 // Formats counts how many sampled values were of each kind.
@@ -109,7 +109,7 @@ const (
 )
 
 const description = `
-Sample the newest messages of 1 to 20 topics in one call through items, and
+Sample the newest messages of 1 to 500 topics in one call through items, and
 summarize value formats, field paths, key usage, the schemas values were
 written with, raw value sizes (value_bytes min/p50/max), and sampled offset
 ranges. Use this to design a search_messages

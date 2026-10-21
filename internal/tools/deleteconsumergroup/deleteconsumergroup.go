@@ -24,7 +24,7 @@ type Item struct {
 
 // Input is the argument set accepted by the delete_consumer_group tool.
 type Input struct {
-	Items   []Item `json:"items" jsonschema:"The groups to delete, 1 to 100 of them. Deleting one group is an array of length one. Naming the same group twice is refused before anything is deleted."`
+	Items   []Item `json:"items" jsonschema:"The groups to delete, 1 to 1000 of them. Deleting one group is an array of length one. Naming the same group twice is refused before anything is deleted."`
 	Confirm bool   `json:"confirm,omitempty" jsonschema:"Optional. When false or omitted, nothing is deleted and the response shows each group's committed offsets and lag. Must be true to delete. One confirm covers the whole batch."`
 }
 
@@ -55,7 +55,7 @@ type Output struct {
 type BatchOutput = batch.Output[Output]
 
 const description = `
-Delete 1 to 100 consumer groups in one call through items, removing each
+Delete 1 to 1000 consumer groups in one call through items, removing each
 group's committed offsets. Use it to clean up groups whose consumers were
 decommissioned: their commits keep reporting lag that nobody will ever drain.
 Deleting one group is an items array of length one.

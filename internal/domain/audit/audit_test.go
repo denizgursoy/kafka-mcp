@@ -284,6 +284,33 @@ func (s *AuditSuite) TestRecordsTheEndpointPolicy() {
 		"whether the endpoint could have changed anything is what tells a reader a write was impossible rather than merely absent")
 }
 
+func (s *AuditSuite) TestRecordsTopLevelTargets() {
+	s.Run("a scan names its source and destination", func() {
+		s.records.entries = nil
+
+		s.call(s.endpoint(), "p", "transform_messages",
+			`{"confirm":true,"topic":"orders","destination_topic":"orders-fixed","transform":"return {}"}`,
+			&mcp.CallToolResult{}, nil)
+
+		logged := s.records.only()
+		s.Require().Equal(slog.LevelInfo, logged.level,
+			"transform_messages writes messages, so it must be audited with the other writes")
+		s.Require().Equal("orders ->orders-fixed", logged.attrs["targets"].String(),
+			"a tool that takes its topics at the top level must still say which topics it touched")
+	})
+
+	s.Run("a file send names its file", func() {
+		s.records.entries = nil
+
+		s.call(s.endpoint(), "p", "produce_message",
+			`{"confirm":true,"input_file":"orders-fixed.jsonl"}`,
+			&mcp.CallToolResult{}, nil)
+
+		s.Require().Equal("file=orders-fixed.jsonl", s.records.only().attrs["targets"].String(),
+			"a send from a file carries no items, so the file is the only record of what was written")
+	})
+}
+
 func (s *AuditSuite) TestSurvivesUnparseableArguments() {
 	entries := s.call(s.endpoint(), "p", "produce_message",
 		`{"items":`, &mcp.CallToolResult{}, nil)

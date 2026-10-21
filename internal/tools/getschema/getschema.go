@@ -34,7 +34,7 @@ type Check struct {
 
 // Input is the argument set accepted by the get_schema tool.
 type Input struct {
-	Items []Item `json:"items" jsonschema:"The schemas to look up, 1 to 100 of them. Looking up one schema is an array of length one. Results follow this order and a subject or id that does not exist is reported against its own item."`
+	Items []Item `json:"items" jsonschema:"The schemas to look up, 1 to 1000 of them. Looking up one schema is an array of length one. Results follow this order and a subject or id that does not exist is reported against its own item."`
 }
 
 // Reference is another schema this one depends on.
@@ -72,7 +72,7 @@ type Output struct {
 type BatchOutput = batch.Output[Output]
 
 const description = `
-Read 1 to 100 schemas from this cluster's Schema Registry in one call through
+Read 1 to 1000 schemas from this cluster's Schema Registry in one call through
 items, each by subject (latest version unless version is given) or by the
 schema id a message carries. Returns the schema text, its type (avro, protobuf
 or json_schema), id, version, every version of the subject, the schemas it

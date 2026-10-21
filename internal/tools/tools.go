@@ -44,6 +44,7 @@ import (
 	"github.com/denizgursoy/kafka-mcp/internal/tools/samplemessages"
 	"github.com/denizgursoy/kafka-mcp/internal/tools/searchmessages"
 	"github.com/denizgursoy/kafka-mcp/internal/tools/serverconfig"
+	"github.com/denizgursoy/kafka-mcp/internal/tools/transformmessages"
 )
 
 // ServerConfig is the one tool a cluster may not switch off.
@@ -88,6 +89,7 @@ func Names() []string {
 		"sample_messages",
 		"search_messages",
 		ServerConfig,
+		"transform_messages",
 	}
 }
 
@@ -172,8 +174,9 @@ func Register(
 		endpoint.add("delete_topic", func() { deletetopic.Register(server, kafka) })
 	}
 
-	// These need the whole roster rather than one cluster: copy_message and
-	// produce_message so they can write to another cluster, compare_clusters so
+	// These need the whole roster rather than one cluster: copy_message,
+	// produce_message and transform_messages so they can write to another
+	// cluster, compare_clusters so
 	// it can read another cluster's topics, list_clusters so a caller can
 	// discover which names are valid.
 	//
@@ -183,7 +186,10 @@ func Register(
 	// writable one from a protected session, which is what they exist for.
 	endpoint.add("compare_clusters", func() { compareclusters.Register(server, clusters, name) })
 	endpoint.add("copy_message", func() { copymessage.Register(server, clusters, name) })
-	endpoint.add("produce_message", func() { producemessage.Register(server, clusters, name) })
+	endpoint.add("produce_message", func() { producemessage.Register(server, clusters, name, cfg.OutputDir) })
+	endpoint.add("transform_messages", func() {
+		transformmessages.Register(server, clusters, name, cfg.OutputDir)
+	})
 	endpoint.add("list_clusters", func() { listclusters.Register(server, clusters, name) })
 
 	// server_config is registered last and unconditionally, because it is what

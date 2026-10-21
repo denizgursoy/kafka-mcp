@@ -27,7 +27,7 @@ type Item struct {
 
 // Input is the argument set accepted by the delete_topic tool.
 type Input struct {
-	Items   []Item `json:"items" jsonschema:"The topics to delete, 1 to 100 of them. Deleting one topic is an array of length one. Naming the same topic twice is refused before anything is deleted."`
+	Items   []Item `json:"items" jsonschema:"The topics to delete, 1 to 1000 of them. Deleting one topic is an array of length one. Naming the same topic twice is refused before anything is deleted."`
 	Confirm bool   `json:"confirm,omitempty" jsonschema:"Optional. When false or omitted, nothing is deleted and the response describes what each deletion would destroy. Must be true to actually delete. One confirm covers the whole batch."`
 }
 
@@ -51,7 +51,7 @@ type Output struct {
 type BatchOutput = batch.Output[Output]
 
 const description = `
-Delete 1 to 100 Kafka topics in one call through items. Deleting one topic is an
+Delete 1 to 1000 Kafka topics in one call through items. Deleting one topic is an
 items array of length one.
 
 This is the most destructive tool here. Deleting a topic destroys every message

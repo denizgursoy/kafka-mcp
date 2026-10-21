@@ -39,7 +39,7 @@ const (
 
 // Input is the argument set accepted by the commit_offset tool.
 type Input struct {
-	Items   []Item `json:"items" jsonschema:"The moves to make, 1 to 100 of them. Moving one offset is an array of length one. Two items that would move the same group, topic and partition, including a whole-topic item and a partition item, are refused before anything changes."`
+	Items   []Item `json:"items" jsonschema:"The moves to make, 1 to 1000 of them. Moving one offset is an array of length one. Two items that would move the same group, topic and partition, including a whole-topic item and a partition item, are refused before anything changes."`
 	Confirm bool   `json:"confirm,omitempty" jsonschema:"Optional. When false or omitted, nothing is changed and the response describes what would happen for every item. Must be true to actually move the offsets. One confirm covers the whole batch."`
 }
 
@@ -79,7 +79,7 @@ type Output struct {
 type BatchOutput = batch.Output[Output]
 
 const description = `
-Move 1 to 100 consumer group positions in one call through items. Each item
+Move 1 to 1000 consumer group positions in one call through items. Each item
 names a group and topic and exactly one target: offset (one partition, the next
 offset the group reads), timestamp (RFC3339; each partition moves to its first
 message at or after that time, which is how messages are replayed since a

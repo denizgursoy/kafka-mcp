@@ -12,9 +12,9 @@ import (
 
 const (
 	// MaxItems bounds metadata and administrative batches.
-	MaxItems = 100
+	MaxItems = 1000
 	// MaxHeavyItems bounds batches that open record readers or return messages.
-	MaxHeavyItems      = 20
+	MaxHeavyItems      = 500
 	defaultParallelism = 4
 )
 

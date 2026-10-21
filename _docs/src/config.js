@@ -9,7 +9,7 @@ export const configSections = [
     intro: 'A file has four blocks. Only clusters is required.',
     fields: [
       ['http', 'object', '', 'Where the HTTP server listens. Used only with --server'],
-      ['output_dir', 'string', 'system temp dir', 'Where search_messages writes output_file. Exports never leave this directory'],
+      ['output_dir', 'string', 'system temp dir', 'Where search_messages and transform_messages write output_file, and produce_message reads input_file. Files never leave this directory'],
       ['clusters', 'map', 'required', 'Kafka connections, keyed by a name you choose'],
       ['endpoints', 'map', 'one per cluster', 'MCP views onto a cluster, each with its own path and policy'],
     ],

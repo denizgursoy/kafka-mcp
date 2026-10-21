@@ -34,7 +34,7 @@ type Item struct {
 
 // Input is the argument set accepted by the compare_clusters tool.
 type Input struct {
-	Items []Item `json:"items" jsonschema:"The clusters to compare against, 1 to 100 of them. Comparing one cluster is an array of length one. Results follow this order and an unreachable cluster is reported against its own item."`
+	Items []Item `json:"items" jsonschema:"The clusters to compare against, 1 to 1000 of them. Comparing one cluster is an array of length one. Results follow this order and an unreachable cluster is reported against its own item."`
 }
 
 // Cluster describes one side of a comparison.
@@ -102,7 +102,7 @@ type Output struct {
 type BatchOutput = batch.Output[Output]
 
 const description = `
-Compare the topics of 1 to 100 other clusters against the one this endpoint
+Compare the topics of 1 to 1000 other clusters against the one this endpoint
 serves, through items. Reports which topics only this cluster has, which only
 the other has, which exist on both but disagree, and how many brokers and topics
 each side has. Comparing one cluster is an items array of length one.

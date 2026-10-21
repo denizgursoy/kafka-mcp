@@ -13,6 +13,7 @@ import (
 	"github.com/twmb/franz-go/pkg/kgo"
 
 	"github.com/denizgursoy/kafka-mcp/internal/domain/batch"
+	"github.com/denizgursoy/kafka-mcp/internal/domain/outputfile"
 	"github.com/denizgursoy/kafka-mcp/internal/domain/records"
 	"github.com/denizgursoy/kafka-mcp/internal/domain/serde"
 )
@@ -182,7 +183,13 @@ func Run(
 		return Output{}, err
 	}
 
-	windows, err := resolveWindows(ctx, admin, input)
+	windows, err := records.ResolveWindows(ctx, admin, input.Topic, records.Window{
+		Partitions:    input.Partitions,
+		FromOffset:    input.FromOffset,
+		ToOffset:      input.ToOffset,
+		FromTimestamp: input.FromTimestamp,
+		ToTimestamp:   input.ToTimestamp,
+	})
 	if err != nil {
 		return Output{}, err
 	}
@@ -197,10 +204,10 @@ func Run(
 		StoppedReason: reasonExhausted,
 	}
 
-	var export *exporter
+	var export *outputfile.Writer
 
 	if options.outputFile != "" {
-		export, err = newExporter(outputDir, options.outputFile)
+		export, err = outputfile.Create(outputDir, "output_file", options.outputFile)
 		if err != nil {
 			return Output{}, err
 		}
@@ -240,8 +247,8 @@ func Run(
 			return Output{}, fmt.Errorf("close output file: %w", err)
 		}
 
-		out.OutputFile = export.path()
-		out.WrittenMessages = export.written
+		out.OutputFile = export.Path()
+		out.WrittenMessages = export.Written()
 	}
 
 	finish(&out, state.scanned, state.split, state.matches, options)
@@ -253,7 +260,7 @@ func Run(
 // scanState is everything the readers of one search share.
 type scanState struct {
 	options    *options
-	export     *exporter
+	export     *outputfile.Writer
 	out        *Output
 	collecting bool
 	// ordered is true when a round reads a single range, so records arrive in
@@ -428,7 +435,7 @@ func (s *scanState) visit(
 
 		switch {
 		case s.export != nil:
-			if err := s.export.write(
+			if err := s.export.Write(
 				records.RenderDecoded(record, key, value, s.options.maxValueBytes),
 			); err != nil {
 				return false, err
@@ -811,140 +818,6 @@ func (c *scripts) close() {
 	if c.group != nil {
 		c.group.Close()
 	}
-}
-
-// resolveWindows turns the requested partitions, offsets and timestamps into
-// the concrete offset range to scan in each partition.
-func resolveWindows(
-	ctx context.Context,
-	admin *kadm.Client,
-	input Input,
-) ([]records.Range, error) {
-
-	details, err := admin.ListTopics(ctx, input.Topic)
-	if err != nil {
-		return nil, fmt.Errorf("list topic %q: %w", input.Topic, err)
-	}
-
-	detail, ok := details[input.Topic]
-	if !ok {
-		return nil, fmt.Errorf("topic %q does not exist", input.Topic)
-	}
-
-	if detail.Err != nil {
-		return nil, fmt.Errorf("topic %q: %w", input.Topic, detail.Err)
-	}
-
-	wanted := make(map[int32]bool, len(input.Partitions))
-
-	for _, partition := range input.Partitions {
-		if _, ok := detail.Partitions[partition]; !ok {
-			return nil, fmt.Errorf(
-				"topic %q has no partition %d", input.Topic, partition)
-		}
-
-		wanted[partition] = true
-	}
-
-	starts, err := admin.ListStartOffsets(ctx, input.Topic)
-	if err != nil {
-		return nil, fmt.Errorf("list start offsets for %q: %w", input.Topic, err)
-	}
-
-	ends, err := admin.ListEndOffsets(ctx, input.Topic)
-	if err != nil {
-		return nil, fmt.Errorf("list end offsets for %q: %w", input.Topic, err)
-	}
-
-	fromTime, err := offsetsAt(ctx, admin, input.Topic, input.FromTimestamp)
-	if err != nil {
-		return nil, err
-	}
-
-	toTime, err := offsetsAt(ctx, admin, input.Topic, input.ToTimestamp)
-	if err != nil {
-		return nil, err
-	}
-
-	windows := make([]records.Range, 0, len(detail.Partitions))
-
-	for id := range detail.Partitions {
-		if len(wanted) > 0 && !wanted[id] {
-			continue
-		}
-
-		start, hasStart := starts.Lookup(input.Topic, id)
-		end, hasEnd := ends.Lookup(input.Topic, id)
-
-		if !hasStart || !hasEnd {
-			continue
-		}
-
-		window := records.Range{
-			Partition: id,
-			Start:     start.Offset,
-			End:       end.Offset,
-		}
-
-		// Explicit offsets and timestamps both narrow the window; whichever is
-		// tighter wins, so the two can be combined safely.
-		if at, ok := fromTime[id]; ok && at > window.Start {
-			window.Start = at
-		}
-
-		if at, ok := toTime[id]; ok && at < window.End {
-			window.End = at
-		}
-
-		if input.FromOffset != nil && *input.FromOffset > window.Start {
-			window.Start = *input.FromOffset
-		}
-
-		if input.ToOffset != nil && *input.ToOffset < window.End {
-			window.End = *input.ToOffset
-		}
-
-		if window.Empty() {
-			continue
-		}
-
-		windows = append(windows, window)
-	}
-
-	sort.Slice(windows, func(i, j int) bool {
-		return windows[i].Partition < windows[j].Partition
-	})
-
-	return windows, nil
-}
-
-func offsetsAt(
-	ctx context.Context,
-	admin *kadm.Client,
-	topic string,
-	at *time.Time,
-) (map[int32]int64, error) {
-
-	if at == nil {
-		return nil, nil
-	}
-
-	listed, err := admin.ListOffsetsAfterMilli(ctx, at.UnixMilli(), topic)
-	if err != nil {
-		return nil, fmt.Errorf("resolve time %s in %q: %w", at, topic, err)
-	}
-
-	resolved := make(map[int32]int64)
-
-	listed.Each(func(offset kadm.ListedOffset) {
-		if offset.Err != nil || offset.Offset < 0 {
-			return
-		}
-
-		resolved[offset.Partition] = offset.Offset
-	})
-
-	return resolved, nil
 }
 
 // rounds groups the partitions' chunks so that one round reads the same depth

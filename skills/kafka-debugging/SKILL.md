@@ -1,6 +1,6 @@
 ---
 name: kafka-debugging
-description: Use when debugging a Kafka cluster through the kafka-mcp server — finding a message by id, key or field; measuring consumer lag and when a backlog clears; unblocking a stuck consumer; replaying messages since a moment; adding partitions; creating, reconfiguring or deleting a topic; producing a message; purging old messages or abandoned consumer groups; comparing two clusters; checking cluster health; finding why a group keeps rebalancing or one partition lags; diagnosing a schema change; or explaining an authorization error. Use for requests like "find the message for order 12345", "is there lag on orders", "the consumer is stuck", "which pod owns this partition", "reprocess everything since 9 this morning", "add partitions", "we need a dead letter topic", "cut retention on orders", "send a corrected message", "reproduce this in preprod", "delete this topic", "delete the test data but keep the topic", "remove the old consumer groups", "are these two environments the same", "producers fail with NOT_ENOUGH_REPLICAS", "is the cluster healthy", "the consumer keeps rebalancing", "one partition always lags", "producer gets 409 incompatible schema", "is this schema change safe", "the disk is filling up", or "TOPIC_AUTHORIZATION_FAILED". Routes to the guide for the scenario, so read this before calling the tools.
+description: Use when debugging a Kafka cluster through the kafka-mcp server — finding a message by id, key or field; measuring consumer lag and when a backlog clears; unblocking a stuck consumer; replaying messages since a moment; adding partitions; creating, reconfiguring or deleting a topic; producing a message; repairing many messages produced in the wrong shape; purging old messages or abandoned consumer groups; comparing two clusters; checking cluster health; finding why a group keeps rebalancing or one partition lags; diagnosing a schema change; or explaining an authorization error. Use for requests like "find the message for order 12345", "is there lag on orders", "the consumer is stuck", "which pod owns this partition", "reprocess everything since 9 this morning", "add partitions", "we need a dead letter topic", "cut retention on orders", "send a corrected message", "these messages came in wrapped in payload", "fix every message where", "reproduce this in preprod", "delete this topic", "delete the test data but keep the topic", "remove the old consumer groups", "are these two environments the same", "producers fail with NOT_ENOUGH_REPLICAS", "is the cluster healthy", "the consumer keeps rebalancing", "one partition always lags", "producer gets 409 incompatible schema", "is this schema change safe", "the disk is filling up", or "TOPIC_AUTHORIZATION_FAILED". Routes to the guide for the scenario, so read this before calling the tools.
 ---
 
 # Kafka debugging
@@ -19,6 +19,7 @@ wrong in a specific way.
 | Whether to add partitions, and doing it safely | [scale-partitions](references/scale-partitions.md) |
 | For a new topic, with a partition count and retention chosen on purpose | [create-topic](references/create-topic.md) |
 | To write a message: repaired, reproduced elsewhere, or seeded | [produce-message](references/produce-message.md) |
+| To fix many messages produced in the wrong shape and write them again | [repair-messages](references/repair-messages.md) |
 | What differs between two clusters, or to create what one is missing | [compare-clusters](references/compare-clusters.md) |
 | To remove a topic and everything in it | [delete-topic](references/delete-topic.md) |
 | To reprocess messages since a moment, or from the start | [replay-messages](references/replay-messages.md) |
@@ -60,8 +61,8 @@ problem; the other adds capacity to a consumer that is not consuming.
 **One endpoint targets one cluster.** Several endpoints may target the same
 cluster with different paths, purposes and permissions. Every tool is bound to
 the cluster and policy of the endpoint it was called on. No tool takes a cluster
-parameter, except `copy_message` and `produce_message`, which choose a
-destination, `compare_clusters`, which names the cluster to compare against, and
+parameter, except `copy_message`, `produce_message` and `transform_messages`,
+which choose a destination, `compare_clusters`, which names the cluster to compare against, and
 `list_clusters`, which reports the roster. A destination must be one this
 endpoint lists in its `destinations` (reported by `server_config`); a cluster
 another endpoint may write to is not thereby writable from this one.
@@ -93,7 +94,8 @@ partition, offset or group take it only inside `items` — there is no
 single-target form, so one operation is an array of length one and several are
 the same call with more entries. Never make one call per topic when one call
 can carry them all. The exceptions are tools whose one call is already a scan
-or a filter: `search_messages` takes `topic` at the top level, and
+or a filter: `search_messages` and `transform_messages` take `topic` at the top
+level, `produce_message` can take an `input_file` instead of `items`, and
 `list_consumer_groups` takes an optional `topic` filter. Check a tool's schema
 rather than assuming.
 

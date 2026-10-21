@@ -30,7 +30,7 @@ type Item struct {
 
 // Input is the argument set accepted by the delete_records tool.
 type Input struct {
-	Items   []Item `json:"items" jsonschema:"The partitions to truncate, 1 to 100 of them. Truncating one partition is an array of length one. Two items naming the same topic and partition are refused before anything is deleted."`
+	Items   []Item `json:"items" jsonschema:"The partitions to truncate, 1 to 1000 of them. Truncating one partition is an array of length one. Two items naming the same topic and partition are refused before anything is deleted."`
 	Confirm bool   `json:"confirm,omitempty" jsonschema:"Optional. When false or omitted, nothing is deleted and the response shows how many messages each item would remove and which consumer groups have not read them yet. Must be true to delete. One confirm covers the whole batch."`
 }
 
@@ -78,7 +78,7 @@ type Output struct {
 type BatchOutput = batch.Output[Output]
 
 const description = `
-Delete the oldest messages of 1 to 100 partitions in one call through items,
+Delete the oldest messages of 1 to 1000 partitions in one call through items,
 without deleting the topic. Each item removes every message of one partition
 with an offset lower than before_offset; the message at before_offset becomes
 the first readable one. Alternatively give before_timestamp to cut at a moment,

@@ -6,6 +6,9 @@ first messages in an empty topic.
 
 Use this when the user says "put this message back", "send a corrected
 version", "reproduce this in preprod", or "seed the topic with test data".
+When many messages share the same fault and the fix can be written as a rule,
+use [repair-messages](repair-messages.md) instead: `transform_messages` rewrites
+them in one call rather than one item each.
 
 This is the only tool that writes content, rather than moving content the
 cluster already has. Everything below follows from that: a produced message is
@@ -165,7 +168,8 @@ the broker assigned — record both, because that triple is what identifies the
 message for any follow-up call.
 
 Each message is one `items` entry, so several are one call rather than one call
-each. Preview the whole batch first; one top-level `confirm` covers all of them.
+each. Beyond 500, or for a set saved to a file, pass `input_file` instead of
+`items`; every line is validated first and failures come back by line number. Preview the whole batch first; one top-level `confirm` covers all of them.
 The batch is **not** atomic: if a later item fails, the messages already written
 stay, because Kafka cannot retract a produced record. Report per-item errors
 exactly as they come back and never imply a partial batch was rolled back.
