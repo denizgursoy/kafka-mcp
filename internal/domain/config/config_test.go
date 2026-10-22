@@ -23,6 +23,17 @@ func TestConfigSuite(t *testing.T) {
 	suite.Run(t, new(ConfigSuite))
 }
 
+func (s *ConfigSuite) SetupTest() {
+	// UserConfigDir follows the OS convention: XDG on Unix, HOME on macOS,
+	// AppData on Windows and home on Plan 9. Keep every case out of the real
+	// user's configuration, including cases that expect no file to exist.
+	home := s.T().TempDir()
+	s.T().Setenv("HOME", home)
+	s.T().Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+	s.T().Setenv("AppData", filepath.Join(home, "AppData", "Roaming"))
+	s.T().Setenv("home", home)
+}
+
 // write puts a config file in a temp directory and returns its path.
 func (s *ConfigSuite) write(contents string) string {
 	s.T().Helper()
@@ -288,7 +299,9 @@ func (s *ConfigSuite) TestRequiresConfiguration() {
 func (s *ConfigSuite) TestDiscoversConfigurationFiles() {
 	s.Run("user config directory is the fallback", func() {
 		workingDir := s.T().TempDir()
-		userConfigDir := s.T().TempDir()
+		userConfigDir, err := os.UserConfigDir()
+		s.Require().NoError(err,
+			"the isolated environment must provide the operating system's user config directory")
 		configDir := filepath.Join(userConfigDir, "kafka-mcp")
 		s.Require().NoError(os.MkdirAll(configDir, 0o700),
 			"the user configuration directory must exist for the discovery case to be meaningful")
@@ -300,7 +313,6 @@ func (s *ConfigSuite) TestDiscoversConfigurationFiles() {
 
 		s.T().Chdir(workingDir)
 		s.T().Setenv("CONFIG_FILE", "")
-		s.T().Setenv("XDG_CONFIG_HOME", userConfigDir)
 
 		loaded, err := config.Load(s.T().Context())
 
@@ -312,7 +324,9 @@ func (s *ConfigSuite) TestDiscoversConfigurationFiles() {
 
 	s.Run("working directory takes precedence", func() {
 		workingDir := s.T().TempDir()
-		userConfigDir := s.T().TempDir()
+		userConfigDir, err := os.UserConfigDir()
+		s.Require().NoError(err,
+			"the precedence fixture must use the operating system's actual user config directory convention")
 		configDir := filepath.Join(userConfigDir, "kafka-mcp")
 		s.Require().NoError(os.MkdirAll(configDir, 0o700),
 			"the lower-priority user configuration must exist so the case proves precedence")
@@ -329,7 +343,6 @@ func (s *ConfigSuite) TestDiscoversConfigurationFiles() {
 
 		s.T().Chdir(workingDir)
 		s.T().Setenv("CONFIG_FILE", "")
-		s.T().Setenv("XDG_CONFIG_HOME", userConfigDir)
 
 		loaded, err := config.Load(s.T().Context())
 
