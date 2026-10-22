@@ -166,7 +166,7 @@ kafka-mcp_&lt;version&gt;_windows_amd64.mcpb</code></pre>
 cd kafka-mcp
 make env-up   <span class="c"># local Redpanda on :19092, Console on :8080</span>
 make run      <span class="c"># serves kafka-mcp.local.yaml on :8090</span></code></pre>
-                <p class="hint">Requires Go 1.27. Tests need Docker.</p>
+                <p class="hint">Requires Go 1.27 or later. Tests need Docker. CI tests and releases use the latest stable Go, checked on every run rather than selected from go.mod; the module's minimum version still applies.</p>
               </div>
             </div>
           </li>

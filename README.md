@@ -1845,6 +1845,10 @@ GitHub Pages through `.github/workflows/docs.yml`.
 Tests run against real containers started by `internal/domain/testenv` (a Redpanda
 broker plus Console), so Docker must be available for the full suite.
 
+The test and release workflows use the latest stable Go release
+(`go-version: 'stable'`, `check-latest: true`), independently of the version in
+`go.mod`. The module's minimum Go version still applies.
+
 
 ### Start the HTTP server
 
