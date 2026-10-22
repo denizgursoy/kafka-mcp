@@ -475,7 +475,24 @@ http.Handle("/mcp/stage", mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.
 
 - `NewReader` must return a **new** client consuming the topic directly
   (`kgo.ConsumePartitions`) on every call. The tools close those clients; they
-  never close `Kafka`, `Admin`, `ManualProducer` or `SchemaRegistry`.
+  never close `Kafka`, `Admin`, `ManualProducer`, `BulkProducer` or
+  `SchemaRegistry`.
+- `AcquireReader` replaces `NewReader` when the host wants to bound or reuse
+  readers: it lends a client with a `release` function the tools call exactly
+  once instead of closing it, and may wait for a free slot until the call's
+  context ends. Lend clients with `kgo.KeepControlRecords()`; markers are
+  skipped, and without them a scan ending on a transaction marker waits for
+  data that never comes.
+- `BulkProducer` is optional and writes the batches of `produce_message`
+  `input_file` and `transform_messages`, so single writes on `Kafka` do not
+  queue behind them.
+- `ProtoMessage` is optional and names the protobuf message a topic's key or
+  value holds when written without Schema Registry framing, for hosts that
+  already resolve their own `.proto` files. Framed messages still go to the
+  registry first, and `topic_formats` is not needed.
+- `Options.Logger` receives the audit records (default `slog.Default`), and
+  `Options.User` names the person behind a call from its request headers, as
+  the host's authenticating proxy established it.
 - Every cluster passed to `NewClusters` can be read by `compare_clusters` and
   `list_clusters`. `copy_message`, `produce_message` and `transform_messages`
   write to another cluster only when it is in `Options.Destinations`, and a `ReadOnly`

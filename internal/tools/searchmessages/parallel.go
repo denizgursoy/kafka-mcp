@@ -116,7 +116,7 @@ func (s *scanState) scanParallel(
 			defer stop()
 			defer compiled.close()
 
-			session, err := reader.Session(topic)
+			session, err := reader.Session(ctx, topic)
 			if err != nil {
 				fail(fmt.Errorf("search %s: %w", topic, err))
 				return

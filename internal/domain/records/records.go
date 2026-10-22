@@ -138,13 +138,26 @@ type Reader struct {
 	options []kgo.Opt
 	codec   *serde.Codec
 	factory func(topic string) (*kgo.Client, error)
+	acquire Acquire
 }
+
+// Acquire hands out a client consuming topic directly and the function that
+// gives it back. It may wait, for example for a free slot, and must return
+// when ctx is done. release is called exactly once, when the session is
+// finished with the client, and owns closing it.
+type Acquire func(ctx context.Context, topic string) (client *kgo.Client, release func(), err error)
 
 // NewReaderWithFactory reads through clients an embedding application builds,
 // so its authentication is reused. Each call must return a new client that
 // consumes the topic directly; the session closes it.
 func NewReaderWithFactory(factory func(topic string) (*kgo.Client, error)) *Reader {
 	return &Reader{factory: factory}
+}
+
+// NewReaderWithAcquire reads through clients an embedding application lends
+// and takes back, so it can bound how many are open at once.
+func NewReaderWithAcquire(acquire Acquire) *Reader {
+	return &Reader{acquire: acquire}
 }
 
 // NewReader returns a Reader for the given seed brokers.
@@ -161,7 +174,7 @@ func NewReaderWithOptions(options ...kgo.Opt) *Reader {
 // WithCodec returns a reader that decodes messages with codec: Schema
 // Registry framing and the cluster's topic_formats.
 func (r *Reader) WithCodec(codec *serde.Codec) *Reader {
-	return &Reader{options: r.options, codec: codec, factory: r.factory}
+	return &Reader{options: r.options, codec: codec, factory: r.factory, acquire: r.acquire}
 }
 
 // Decode decodes one part of a record with this reader's codec.
@@ -209,15 +222,33 @@ const (
 // would cost one connection per chunk, so callers that scan repeatedly open a
 // Session once and reuse it. Always pair it with Close.
 type Session struct {
-	client *kgo.Client
-	topic  string
+	client  *kgo.Client
+	topic   string
+	release func()
 }
 
 // Session opens a connection for scanning a topic.
 //
 // The partitions to read are chosen per scan, so the session starts consuming
-// nothing. It must be closed by the caller.
-func (r *Reader) Session(topic string) (*Session, error) {
+// nothing. It must be closed by the caller. ctx bounds only the wait for a
+// lent client; the session itself lives until Close.
+func (r *Reader) Session(ctx context.Context, topic string) (*Session, error) {
+	if r.acquire != nil {
+		client, release, err := r.acquire(ctx, topic)
+		if err != nil {
+			return nil, fmt.Errorf("create record reader: %w", err)
+		}
+		if client == nil {
+			if release != nil {
+				release()
+			}
+
+			return nil, fmt.Errorf("create record reader: no client was lent")
+		}
+
+		return &Session{client: client, topic: topic, release: release}, nil
+	}
+
 	if r.factory != nil {
 		client, err := r.factory(topic)
 		if err != nil {
@@ -237,6 +268,10 @@ func (r *Reader) Session(topic string) (*Session, error) {
 		// client is built with one of the consume options.
 		kgo.ConsumePartitions(map[string]map[int32]kgo.Offset{topic: {}}),
 		kgo.FetchMaxWait(fetchMaxWait),
+		// Transaction markers take offsets but carry no data. Without them a
+		// partition whose last offset is a commit marker never delivers its
+		// end, and the scan waits out its empty polls. Scan skips them.
+		kgo.KeepControlRecords(),
 	)
 	client, err := kgo.NewClient(options...)
 	if err != nil {
@@ -246,8 +281,16 @@ func (r *Reader) Session(topic string) (*Session, error) {
 	return &Session{client: client, topic: topic}, nil
 }
 
-// Close releases the session's connection.
+// Close releases the session's connection: gives a lent client back, or
+// closes one the session opened.
 func (s *Session) Close() {
+	if s.release != nil {
+		s.release()
+		s.release = nil
+
+		return
+	}
+
 	s.client.Close()
 }
 
@@ -345,6 +388,12 @@ func (s *Session) Scan(
 				delete(active, record.Partition)
 			}
 
+			// A transaction marker counts toward the range's end but is not
+			// a message.
+			if record.Attrs.IsControl() {
+				return
+			}
+
 			if !visit(record) {
 				stopped = true
 			}
@@ -369,7 +418,7 @@ func (r *Reader) Scan(
 	visit func(*kgo.Record) bool,
 ) error {
 
-	session, err := r.Session(topic)
+	session, err := r.Session(ctx, topic)
 	if err != nil {
 		return err
 	}

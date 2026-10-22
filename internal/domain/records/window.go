@@ -21,6 +21,21 @@ type Window struct {
 	ToTimestamp   *time.Time
 }
 
+// Contains reports whether a record's own timestamp is inside the window's
+// time bounds: at or after FromTimestamp and before ToTimestamp.
+//
+// ResolveWindows can only turn the bounds into offsets, which is exact only
+// when timestamps grow with offsets. Producers set timestamps themselves, so
+// near either bound records from outside the range can sit inside the offsets;
+// a scan skips them with this.
+func (w Window) Contains(timestamp time.Time) bool {
+	if w.FromTimestamp != nil && timestamp.Before(*w.FromTimestamp) {
+		return false
+	}
+
+	return w.ToTimestamp == nil || timestamp.Before(*w.ToTimestamp)
+}
+
 // ResolveWindows turns the requested partitions, offsets and timestamps into
 // the concrete offset range to scan in each partition, sorted by partition.
 //

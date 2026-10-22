@@ -8,13 +8,17 @@
 package kafkamcp
 
 import (
+	"context"
 	"fmt"
+	"log/slog"
+	"net/http"
 	"slices"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/twmb/franz-go/pkg/kadm"
 	"github.com/twmb/franz-go/pkg/kgo"
 	"github.com/twmb/franz-go/pkg/sr"
+	"google.golang.org/protobuf/reflect/protoreflect"
 
 	"github.com/denizgursoy/kafka-mcp/internal/domain/config"
 	"github.com/denizgursoy/kafka-mcp/internal/domain/kafkaclient"
@@ -35,13 +39,30 @@ type Connection struct {
 	Admin *kadm.Client
 	// NewReader must return a new client consuming topic directly
 	// (kgo.ConsumePartitions). Consuming is client-wide state, so sharing
-	// Kafka here would disturb concurrent calls.
+	// Kafka here would disturb concurrent calls. The tools close it.
 	NewReader func(topic string) (*kgo.Client, error)
+	// AcquireReader replaces NewReader when set: it lends a client for
+	// topic and the release function the tools call once they are done
+	// with it, instead of closing it. It may wait for a free slot until ctx
+	// ends, so the host can bound how many readers MCP keeps open. A lent
+	// client should keep control records (kgo.KeepControlRecords); they are
+	// skipped, and without them a scan ending on a transaction marker waits
+	// for data that never comes.
+	AcquireReader func(ctx context.Context, topic string) (client *kgo.Client, release func(), err error)
 	// ManualProducer is optional and returns a producer honouring
 	// Record.Partition. Without it, writes that name a partition fail.
 	ManualProducer func() (*kgo.Client, error)
+	// BulkProducer is optional and returns the producer for batch writes
+	// (produce_message input_file, transform_messages), with manual
+	// partitioning when manual is set. Without it they use Kafka and
+	// ManualProducer, where single writes queue behind their batches.
+	BulkProducer func(manual bool) (*kgo.Client, error)
 	// SchemaRegistry is optional.
 	SchemaRegistry *sr.Client
+	// ProtoMessage is optional and names the protobuf message the key or
+	// value of a topic holds when it is written without Schema Registry
+	// framing; nil for none. It is consulted after registry framing.
+	ProtoMessage func(topic string, key bool) protoreflect.MessageDescriptor
 
 	// ReadOnly protects the cluster from every server, including writes
 	// arriving from another cluster's server as a destination.
@@ -68,6 +89,13 @@ type Options struct {
 	// OutputDir is where search_messages and transform_messages write
 	// output_file, and where produce_message reads input_file.
 	OutputDir string
+	// Logger receives the audit records of tool calls. Nil means
+	// slog.Default.
+	Logger *slog.Logger
+	// User names the person behind a call from its HTTP request headers,
+	// for audit records, as established by something the host trusts (an
+	// authenticating proxy). Nil or an empty name records none.
+	User func(header http.Header) string
 }
 
 // Clusters holds the lent connections. Tools registered for one cluster can
@@ -103,13 +131,22 @@ func NewClusters(connections ...Connection) (*Clusters, error) {
 			SASL: []*config.SASL{{Mechanism: "host-managed", User: conn.Principal}},
 		}
 
-		client, err := kafkaclient.Borrow(cluster, kafkaclient.Borrowed{
+		borrowed := kafkaclient.Borrowed{
 			Kafka:          conn.Kafka,
 			Admin:          conn.Admin,
 			NewReader:      conn.NewReader,
 			ManualProducer: conn.ManualProducer,
+			BulkProducer:   conn.BulkProducer,
 			SchemaRegistry: conn.SchemaRegistry,
-		})
+		}
+		if conn.AcquireReader != nil {
+			borrowed.AcquireReader = conn.AcquireReader
+		}
+		if conn.ProtoMessage != nil {
+			borrowed.ProtoMessage = conn.ProtoMessage
+		}
+
+		client, err := kafkaclient.Borrow(cluster, borrowed)
 		if err != nil {
 			return nil, fmt.Errorf("kafkamcp: %w", err)
 		}
@@ -161,5 +198,10 @@ func (c *Clusters) Register(server *mcp.Server, name string, opts Options) error
 		Destinations: destinations,
 	}
 
-	return tools.Register(server, cfg, kafkaclient.BorrowRegistry(cfg, c.clients), name)
+	auditing := tools.Audit{Logger: opts.Logger}
+	if opts.User != nil {
+		auditing.User = opts.User
+	}
+
+	return tools.Register(server, cfg, kafkaclient.BorrowRegistry(cfg, c.clients), name, auditing)
 }

@@ -1,16 +1,24 @@
 package kafkamcp_test
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/stretchr/testify/suite"
 	"github.com/twmb/franz-go/pkg/kgo"
 	"github.com/twmb/franz-go/pkg/sr"
+	"google.golang.org/protobuf/reflect/protodesc"
+	"google.golang.org/protobuf/reflect/protoreflect"
+	"google.golang.org/protobuf/types/descriptorpb"
 
 	"github.com/denizgursoy/kafka-mcp/internal/domain/testenv"
 	"github.com/denizgursoy/kafka-mcp/pkg/kafkamcp"
@@ -239,4 +247,140 @@ func (s *RegisterSuite) TestRejectsInvalidRegistrations() {
 		s.Require().ErrorContains(err, "twice", "one name must mean one cluster")
 	})
 	s.Require().NoError(s.env.Kafka().Ping(s.T().Context()), "a failed registration must not close the host's client")
+}
+
+func (s *RegisterSuite) TestLendsAndTakesBackReaders() {
+	topic := s.env.CreateTopic(s.T(), "lent")
+	s.env.Produce(s.T(), topic, testenv.Message{Key: "k", Value: `{"status":"LENT"}`})
+
+	var lent, released atomic.Int32
+	conn := s.lend("local", false)
+	conn.NewReader = nil
+	conn.AcquireReader = func(ctx context.Context, topic string) (*kgo.Client, func(), error) {
+		client, err := kgo.NewClient(kgo.SeedBrokers(s.env.Broker()), kgo.KeepControlRecords(),
+			kgo.ConsumePartitions(map[string]map[int32]kgo.Offset{topic: {}}))
+		if err != nil {
+			return nil, nil, err
+		}
+		lent.Add(1)
+
+		return client, func() { released.Add(1); client.Close() }, nil
+	}
+	session := s.connect(conn, kafkamcp.Options{})
+
+	found := s.call(session, "search_messages", map[string]any{"topic": topic, "script": "return value.status === 'LENT'"})
+	s.Require().Contains(found, `"match_count":1`, "a search must read through the lent reader")
+	s.Require().Positive(lent.Load(), "the host's reader must have been used")
+	s.Require().Equal(lent.Load(), released.Load(), "every lent reader must be given back exactly once, or the host's bound leaks")
+}
+
+func (s *RegisterSuite) TestRefusesAReaderTheHostCannotLend() {
+	topic := s.env.CreateTopic(s.T(), "busy")
+	s.env.Produce(s.T(), topic, testenv.Message{Value: "x"})
+
+	conn := s.lend("local", false)
+	conn.AcquireReader = func(ctx context.Context, topic string) (*kgo.Client, func(), error) {
+		<-ctx.Done()
+
+		return nil, nil, ctx.Err()
+	}
+	session := s.connect(conn, kafkamcp.Options{})
+
+	out, err := session.CallTool(s.T().Context(), &mcp.CallToolParams{Name: "search_messages",
+		Arguments: map[string]any{"topic": topic, "timeout_seconds": 1}})
+	s.Require().NoError(err, "a refusal must be a tool error, not a protocol failure")
+	s.Require().True(out.IsError, "a search that cannot get a reader must fail rather than hang")
+}
+
+func (s *RegisterSuite) TestBatchWritesUseTheBulkProducer() {
+	topic := s.env.CreateTopic(s.T(), "bulk")
+	s.env.Produce(s.T(), topic, testenv.Message{Key: "a", Value: `{"payload":{"n":1}}`})
+
+	var bulk atomic.Int32
+	conn := s.lend("local", false)
+	conn.BulkProducer = func(manual bool) (*kgo.Client, error) {
+		bulk.Add(1)
+
+		return s.env.Kafka(), nil
+	}
+	session := s.connect(conn, kafkamcp.Options{})
+
+	out := s.call(session, "transform_messages", map[string]any{
+		"topic": topic, "transform": "return { value: value.payload }", "confirm": true})
+	s.Require().Contains(out, `"written":1`, "the transform must be written")
+	s.Require().Positive(bulk.Load(), "batch writes must go through the host's bulk producer")
+}
+
+func (s *RegisterSuite) TestDecodesWithTheHostsProtoMessages() {
+	topic := s.env.CreateTopic(s.T(), "proto")
+
+	file, err := protodesc.NewFile(&descriptorpb.FileDescriptorProto{
+		Name: new("note.proto"), Package: new("test"), Syntax: new("proto3"),
+		MessageType: []*descriptorpb.DescriptorProto{{
+			Name: new("Note"),
+			Field: []*descriptorpb.FieldDescriptorProto{{
+				Name: new("text"), Number: new(int32(1)), JsonName: new("text"),
+				Type:  descriptorpb.FieldDescriptorProto_TYPE_STRING.Enum(),
+				Label: descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL.Enum(),
+			}},
+		}},
+	}, nil)
+	s.Require().NoError(err, "the fixture descriptor must build")
+	note := file.Messages().ByName("Note")
+
+	// Field 1, length-delimited, "lent".
+	s.env.Produce(s.T(), topic, testenv.Message{Value: string([]byte{0x0a, 4, 'l', 'e', 'n', 't'})})
+
+	conn := s.lend("local", false)
+	conn.ProtoMessage = func(t string, key bool) protoreflect.MessageDescriptor {
+		if t == topic && !key {
+			return note
+		}
+
+		return nil
+	}
+	session := s.connect(conn, kafkamcp.Options{})
+
+	found := s.call(session, "search_messages", map[string]any{"topic": topic})
+	s.Require().Contains(found, `"message_type":"test.Note"`, "the host's message type must decode the topic")
+	s.Require().Contains(found, `lent`, "the decoded field must be shown")
+}
+
+func (s *RegisterSuite) TestAuditsThroughTheHostsLoggerAndUser() {
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	clusters, err := kafkamcp.NewClusters(s.lend("local", false))
+	s.Require().NoError(err)
+
+	server := mcp.NewServer(&mcp.Implementation{Name: "host", Version: "1"}, nil)
+	s.Require().NoError(clusters.Register(server, "local", kafkamcp.Options{
+		Logger: logger,
+		User:   func(header http.Header) string { return header.Get("X-User") },
+	}))
+
+	host := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return server }, nil))
+	s.T().Cleanup(host.Close)
+
+	client := mcp.NewClient(&mcp.Implementation{Name: "test", Version: "1"}, nil)
+	session, err := client.Connect(s.T().Context(), &mcp.StreamableClientTransport{
+		Endpoint:   host.URL,
+		HTTPClient: &http.Client{Transport: userTransport{user: "ada@example.com"}, Timeout: 30 * time.Second},
+	}, nil)
+	s.Require().NoError(err)
+	s.T().Cleanup(func() { _ = session.Close() })
+
+	s.call(session, "list_topics", map[string]any{})
+
+	s.Require().True(strings.Contains(buf.String(), `"user":"ada@example.com"`),
+		"the audit record must go to the host's logger and name the user it vouches for: %s", buf.String())
+}
+
+type userTransport struct{ user string }
+
+func (u userTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	r = r.Clone(r.Context())
+	r.Header.Set("X-User", u.user)
+
+	return http.DefaultTransport.RoundTrip(r)
 }

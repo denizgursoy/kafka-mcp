@@ -25,6 +25,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/twmb/franz-go/pkg/sr"
+	"google.golang.org/protobuf/reflect/protoreflect"
 
 	"github.com/denizgursoy/kafka-mcp/internal/domain/config"
 )
@@ -79,6 +80,26 @@ type Codec struct {
 	cluster  *config.Cluster
 	registry *registry
 	fixed    map[*config.PartFormat]fixedCodec
+	protos   ProtoLookup
+}
+
+// ProtoLookup names the protobuf message one part of a topic holds, for
+// messages written without Schema Registry framing; nil when it holds none.
+// An embedding application that already resolves its own .proto files lends
+// it instead of repeating them in topic_formats.
+type ProtoLookup func(topic string, key bool) protoreflect.MessageDescriptor
+
+// WithProtoLookup returns the codec consulting lookup after topic_formats.
+// A nil lookup leaves it as it is.
+func (c *Codec) WithProtoLookup(lookup ProtoLookup) *Codec {
+	if c == nil || lookup == nil {
+		return c
+	}
+
+	copied := *c
+	copied.protos = lookup
+
+	return &copied
 }
 
 // New prepares a codec for a cluster, loading every schema topic_formats
@@ -165,6 +186,17 @@ func (c *Codec) Decode(ctx context.Context, topic string, part Part, data []byte
 		return decoded
 	}
 
+	// After framing, as the embedding application decodes it: a producer
+	// may move a topic to the registry while old messages stay plain.
+	if lent := c.lentFor(topic, part); lent != nil {
+		decoded, err := lent.decode(data)
+		if err != nil {
+			return failed(data, fmt.Sprintf("does not decode as the configured %s format: %v", lent.format(), err))
+		}
+
+		return decoded
+	}
+
 	return detect(data)
 }
 
@@ -189,6 +221,20 @@ func (c *Codec) fixedFor(topic string, part Part) fixedCodec {
 	}
 
 	return c.fixed[settings]
+}
+
+// lentFor returns the protobuf codec a lent ProtoLookup names for one part of
+// a topic, or nil.
+func (c *Codec) lentFor(topic string, part Part) fixedCodec {
+	if c == nil || c.protos == nil {
+		return nil
+	}
+
+	if message := c.protos(topic, part == Key); message != nil {
+		return fixedProto{message: message}
+	}
+
+	return nil
 }
 
 // framed reports whether data starts with a Schema Registry header.

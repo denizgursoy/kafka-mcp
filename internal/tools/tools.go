@@ -93,6 +93,13 @@ func Names() []string {
 	}
 }
 
+// Audit is how tool calls are recorded. The zero value logs to slog.Default
+// and names no user.
+type Audit struct {
+	Logger *slog.Logger
+	User   audit.Identity
+}
+
 // Register adds every tool the named endpoint exposes.
 //
 // Each tool is bound to that cluster here, so nothing a caller sends can
@@ -107,6 +114,7 @@ func Register(
 	cfg *config.Config,
 	clusters *kafkaclient.Registry,
 	name string,
+	auditing Audit,
 ) error {
 
 	endpointConfig := cfg.Endpoints[name]
@@ -130,7 +138,7 @@ func Register(
 	// already decided, so no caller can make a record name a cluster it did not
 	// touch.
 	server.AddReceivingMiddleware(
-		audit.Middleware(slog.Default(), endpointConfig, audit.Principal(kafka.Config())),
+		audit.Middleware(auditing.Logger, endpointConfig, audit.Principal(kafka.Config()), auditing.User),
 	)
 
 	endpoint := &endpoint{config: endpointConfig}

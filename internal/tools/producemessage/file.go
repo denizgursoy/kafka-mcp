@@ -245,15 +245,10 @@ func (s *fileSender) flush() error {
 	}
 
 	first := s.pending[0]
-	producer := first.destination.Kafka()
 
-	if first.manual {
-		manual, err := first.destination.ManualProducer()
-		if err != nil {
-			return err
-		}
-
-		producer = manual
+	producer, err := first.destination.BulkProducer(first.manual)
+	if err != nil {
+		return err
 	}
 
 	batch := make([]*kgo.Record, len(s.pending))

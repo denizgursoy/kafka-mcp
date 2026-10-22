@@ -35,6 +35,7 @@ type fileItem struct {
 // runState is everything one run shares while it reads.
 type runState struct {
 	input       Input
+	window      records.Window
 	source      *kafkaclient.Client
 	destination *kafkaclient.Client
 	destTopic   string
@@ -81,7 +82,7 @@ func (s *runState) scan(ctx context.Context, windows []records.Range) error {
 }
 
 func (s *runState) scanPartition(ctx context.Context, window records.Range) error {
-	session, err := s.source.Reader().Session(s.input.Topic)
+	session, err := s.source.Reader().Session(ctx, s.input.Topic)
 	if err != nil {
 		return err
 	}
@@ -144,6 +145,10 @@ func (s *runState) stop(reason string) {
 
 // visit handles one record and reports whether reading should go on.
 func (s *runState) visit(ctx context.Context, record *kgo.Record) bool {
+	if !s.window.Contains(record.Timestamp) {
+		return true
+	}
+
 	s.out.Scanned++
 
 	address := Address{Partition: record.Partition, Offset: record.Offset}
@@ -289,18 +294,7 @@ func (s *runState) flushFailed() (int64, bool) {
 		batch[index] = pending.record
 	}
 
-	producer := s.destination.Kafka()
-
-	var err error
-
-	if s.input.KeepPartition {
-		var manual *kgo.Client
-
-		manual, err = s.destination.ManualProducer()
-		if err == nil {
-			producer = manual
-		}
-	}
+	producer, err := s.destination.BulkProducer(s.input.KeepPartition)
 
 	var results kgo.ProduceResults
 

@@ -56,7 +56,7 @@ func (s *AuthenticationSuite) TestAuthenticatedConnections() {
 			"the shared production-shaped test client must carry the environment's SCRAM credentials rather than connecting anonymously")
 	})
 	s.Run("reader authenticates independently", func() {
-		session, err := client.Reader().Session(topic)
+		session, err := client.Reader().Session(context.Background(), topic)
 		s.Require().NoError(err, "the independent reading session must build")
 		defer session.Close()
 		ctx, cancel := context.WithTimeout(s.T().Context(), 10*time.Second)

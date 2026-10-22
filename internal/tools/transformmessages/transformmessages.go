@@ -67,8 +67,8 @@ type Input struct {
 	Partitions         []int32    `json:"partitions,omitempty" jsonschema:"Optional partitions to read. Defaults to every partition. Partitions are processed one after another in ascending order."`
 	FromOffset         *int64     `json:"from_offset,omitempty" jsonschema:"Optional inclusive offset to start at, applied to every partition read. Use it with partitions to resume a run that stopped."`
 	ToOffset           *int64     `json:"to_offset,omitempty" jsonschema:"Optional exclusive offset to stop at, applied to every partition read."`
-	FromTimestamp      *time.Time `json:"from_timestamp,omitempty" jsonschema:"Optional inclusive start time (RFC3339)."`
-	ToTimestamp        *time.Time `json:"to_timestamp,omitempty" jsonschema:"Optional exclusive end time (RFC3339)."`
+	FromTimestamp      *time.Time `json:"from_timestamp,omitempty" jsonschema:"Optional inclusive start time (RFC3339). Messages whose own timestamp is earlier are skipped and not counted as scanned."`
+	ToTimestamp        *time.Time `json:"to_timestamp,omitempty" jsonschema:"Optional exclusive end time (RFC3339). Messages whose own timestamp is at or after it are skipped and not counted as scanned."`
 	DestinationTopic   string     `json:"destination_topic,omitempty" jsonschema:"Optional topic to write the new messages to. Defaults to the source topic, where the new messages are appended after the originals; the originals stay. It must already exist."`
 	DestinationCluster string     `json:"destination_cluster,omitempty" jsonschema:"Optional cluster to write to. Defaults to the cluster this endpoint serves. Use list_clusters to see which names are valid. It must be writable when confirm is true."`
 	KeepPartition      bool       `json:"keep_partition,omitempty" jsonschema:"Optional. Write each message to the partition number it was read from, instead of letting its key decide. The destination needs at least as many partitions. Use it when the source producer chose partitions explicitly."`
@@ -304,13 +304,15 @@ func run(
 		defer filter.Close()
 	}
 
-	windows, err := records.ResolveWindows(ctx, source.Admin(), input.Topic, records.Window{
+	window := records.Window{
 		Partitions:    input.Partitions,
 		FromOffset:    input.FromOffset,
 		ToOffset:      input.ToOffset,
 		FromTimestamp: input.FromTimestamp,
 		ToTimestamp:   input.ToTimestamp,
-	})
+	}
+
+	windows, err := records.ResolveWindows(ctx, source.Admin(), input.Topic, window)
 	if err != nil {
 		return Output{}, err
 	}
@@ -375,6 +377,7 @@ func run(
 
 	state := &runState{
 		input:       input,
+		window:      window,
 		source:      source,
 		destination: destination,
 		destTopic:   destinationTopic,

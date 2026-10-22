@@ -509,3 +509,50 @@ func (s *SerdeSuite) TestEncodesConfiguredTopicFormats() {
 		s.Require().False(ok, "the caller must know to write the value as given")
 	})
 }
+
+func (s *SerdeSuite) TestDecodesWithALentProtoLookup() {
+	files := map[string]string{"common.proto": commonProto, "order.proto": orderProto}
+	order := s.compileProto(files, "order.proto", "shop.Order")
+
+	codec := s.codec(nil).WithProtoLookup(func(topic string, key bool) protoreflect.MessageDescriptor {
+		if topic == "plain-orders" && !key {
+			return order
+		}
+
+		return nil
+	})
+
+	s.Run("an unframed value of a named topic decodes as its message", func() {
+		payload := s.protoBytes(order, `{"id":"o-9","status":"PAID"}`)
+
+		decoded := codec.Decode(s.T().Context(), "plain-orders", serde.Value, payload)
+		s.Require().Empty(decoded.Error, "a host that knows the topic's message type must be able to lend it")
+		s.Require().Equal(serde.FormatProtobuf, decoded.Format, "the format must say protobuf")
+		s.Require().Equal("shop.Order", decoded.MessageType, "the lent message type must be reported")
+		s.Require().Equal("o-9", s.object(decoded.Text)["id"], "fields must decode")
+	})
+
+	s.Run("a framed value still goes to the registry first", func() {
+		_, orderID := s.registerProto()
+		payload := s.protoBytes(order, `{"id":"o-10"}`)
+
+		decoded := codec.Decode(s.T().Context(), "plain-orders", serde.Value,
+			[]byte(testenv.WireFormat(s.T(), orderID, []int{1}, payload)))
+		s.Require().Empty(decoded.Error, "a producer that moved to the registry must still be read through it")
+		s.Require().NotZero(decoded.SchemaID, "the registry decoded it, so the schema id is known")
+	})
+
+	s.Run("another topic or the key is left to detection", func() {
+		decoded := codec.Decode(s.T().Context(), "plain-orders", serde.Key, []byte("k-1"))
+		s.Require().Equal(serde.FormatText, decoded.Format, "the lookup named no key message")
+	})
+
+	s.Run("writes are encoded to the lent message", func() {
+		data, encoded, ok, err := codec.EncodeConfigured("plain-orders", serde.Value, `{"id":"o-11"}`)
+		s.Require().True(ok, "a lent message type configures the topic")
+		s.Require().NoError(err, "a fitting document must encode")
+		s.Require().Equal("shop.Order", encoded.MessageType, "the message used must be reported")
+		s.Require().Equal("o-11", s.object(codec.Decode(s.T().Context(), "plain-orders", serde.Value, data).Text)["id"],
+			"what was written must read back")
+	})
+}

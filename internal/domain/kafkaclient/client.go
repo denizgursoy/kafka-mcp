@@ -32,6 +32,7 @@ type Client struct {
 	reader   *records.Reader
 	codec    *serde.Codec
 	manual   *manualProducer
+	bulk     func(manual bool) (*kgo.Client, error)
 	cfg      *config.Cluster
 	endpoint *config.Endpoint
 
@@ -42,23 +43,39 @@ type Client struct {
 // Borrowed is what an embedding application lends: clients it built and
 // keeps closing itself. Only the clients NewReader returns are closed here.
 type Borrowed struct {
-	Kafka          *kgo.Client
-	Admin          *kadm.Client
+	Kafka *kgo.Client
+	Admin *kadm.Client
+	// NewReader or AcquireReader supplies scan clients. AcquireReader wins
+	// when both are set; it lets the application bound and reuse them.
 	NewReader      func(topic string) (*kgo.Client, error)
+	AcquireReader  records.Acquire
 	ManualProducer func() (*kgo.Client, error)
+	// BulkProducer, when set, writes the batches of file and transform
+	// runs, so they do not queue ahead of single writes on Kafka.
+	BulkProducer   func(manual bool) (*kgo.Client, error)
 	SchemaRegistry *sr.Client
+	// ProtoMessage, when set, names the protobuf message a topic's key or
+	// value holds when it carries no Schema Registry framing.
+	ProtoMessage serde.ProtoLookup
 }
 
 // Borrow wraps clients an embedding application already holds. cfg carries
 // only the name, policy and reporting fields; nothing in it is dialled.
 func Borrow(cfg *config.Cluster, lent Borrowed) (*Client, error) {
-	if lent.Kafka == nil || lent.NewReader == nil {
+	if lent.Kafka == nil || (lent.NewReader == nil && lent.AcquireReader == nil) {
 		return nil, fmt.Errorf("cluster %q: a Kafka client and a reader factory are required", cfg.Name)
 	}
 
 	codec, err := serde.NewWithRegistry(cfg, lent.SchemaRegistry)
 	if err != nil {
 		return nil, err
+	}
+
+	codec = codec.WithProtoLookup(lent.ProtoMessage)
+
+	reader := records.NewReaderWithFactory(lent.NewReader)
+	if lent.AcquireReader != nil {
+		reader = records.NewReaderWithAcquire(lent.AcquireReader)
 	}
 
 	admin := lent.Admin
@@ -76,9 +93,10 @@ func Borrow(cfg *config.Cluster, lent Borrowed) (*Client, error) {
 	return &Client{
 		client:   lent.Kafka,
 		admin:    admin,
-		reader:   records.NewReaderWithFactory(lent.NewReader).WithCodec(codec),
+		reader:   reader.WithCodec(codec),
 		codec:    codec,
 		manual:   &manualProducer{factory: manual},
+		bulk:     lent.BulkProducer,
 		cfg:      cfg,
 		borrowed: true,
 	}, nil
@@ -146,6 +164,7 @@ func (c *Client) ForEndpoint(endpoint *config.Endpoint) *Client {
 		reader:   c.reader,
 		codec:    c.codec,
 		manual:   c.manual,
+		bulk:     c.bulk,
 		cfg:      c.cfg,
 		endpoint: endpoint,
 		borrowed: c.borrowed,
@@ -314,6 +333,26 @@ func (c *Client) ManualProducer() (*kgo.Client, error) {
 	}
 
 	return c.manual.get()
+}
+
+// BulkProducer returns the producer for writing many records at once: the
+// embedding application's own when it lent one, otherwise Kafka() or, with
+// manual, ManualProducer().
+func (c *Client) BulkProducer(manual bool) (*kgo.Client, error) {
+	if c.bulk != nil {
+		client, err := c.bulk(manual)
+		if err == nil && client == nil {
+			err = fmt.Errorf("bulk producer factory returned no client")
+		}
+
+		return client, err
+	}
+
+	if manual {
+		return c.ManualProducer()
+	}
+
+	return c.client, nil
 }
 
 // Reader returns the reader used by tools that read message content.

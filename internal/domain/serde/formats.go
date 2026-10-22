@@ -80,6 +80,10 @@ func newFixed(settings *config.PartFormat) (fixedCodec, error) {
 func (c *Codec) EncodeConfigured(topic string, part Part, document string) ([]byte, Encoded, bool, error) {
 	fixed := c.fixedFor(topic, part)
 	if fixed == nil {
+		fixed = c.lentFor(topic, part)
+	}
+
+	if fixed == nil {
 		return nil, Encoded{}, false, nil
 	}
 

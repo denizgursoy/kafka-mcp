@@ -250,7 +250,7 @@ func newServer(
 		nil,
 	)
 
-	if err := tools.Register(server, cfg, clusters, name); err != nil {
+	if err := tools.Register(server, cfg, clusters, name, tools.Audit{}); err != nil {
 		return nil, err
 	}
 

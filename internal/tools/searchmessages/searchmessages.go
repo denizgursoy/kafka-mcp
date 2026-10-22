@@ -26,8 +26,8 @@ type Input struct {
 	Partitions    []int32    `json:"partitions,omitempty" jsonschema:"Optional partitions to restrict the search to. Defaults to every partition. Do not guess a partition from a message key: producers may set the partition explicitly, so the key does not determine it."`
 	FromOffset    *int64     `json:"from_offset,omitempty" jsonschema:"Optional inclusive offset to start scanning from, applied to every searched partition."`
 	ToOffset      *int64     `json:"to_offset,omitempty" jsonschema:"Optional exclusive offset to stop scanning at, applied to every searched partition."`
-	FromTimestamp *time.Time `json:"from_timestamp,omitempty" jsonschema:"Optional inclusive start time (RFC3339). Resolved to the first offset at or after this time."`
-	ToTimestamp   *time.Time `json:"to_timestamp,omitempty" jsonschema:"Optional exclusive end time (RFC3339). Resolved to the first offset at or after this time."`
+	FromTimestamp *time.Time `json:"from_timestamp,omitempty" jsonschema:"Optional inclusive start time (RFC3339). Resolved to the first offset at or after this time; messages whose own timestamp is earlier are skipped and not counted as scanned."`
+	ToTimestamp   *time.Time `json:"to_timestamp,omitempty" jsonschema:"Optional exclusive end time (RFC3339). Resolved to the first offset at or after this time; messages whose own timestamp is at or after it are skipped and not counted as scanned."`
 	Direction     string     `json:"direction,omitempty" jsonschema:"Optional scan direction: newest_first (default) or oldest_first. Decides which matches are kept when max_matches cuts the search short. Every partition is read together, so newest_first means newest in the topic, ordered by timestamp, rather than newest in one partition."`
 	MaxMatches    int        `json:"max_matches,omitempty" jsonschema:"Optional maximum number of matches to return. Defaults to 10, at most 1000. Use output_file to export more."`
 	MaxScanned    int        `json:"max_messages_scanned,omitempty" jsonschema:"Optional maximum number of messages to read before giving up. Defaults to 10000, at most 100000000."`
@@ -183,13 +183,15 @@ func Run(
 		return Output{}, err
 	}
 
-	windows, err := records.ResolveWindows(ctx, admin, input.Topic, records.Window{
+	window := records.Window{
 		Partitions:    input.Partitions,
 		FromOffset:    input.FromOffset,
 		ToOffset:      input.ToOffset,
 		FromTimestamp: input.FromTimestamp,
 		ToTimestamp:   input.ToTimestamp,
-	})
+	}
+
+	windows, err := records.ResolveWindows(ctx, admin, input.Topic, window)
 	if err != nil {
 		return Output{}, err
 	}
@@ -216,6 +218,7 @@ func Run(
 	}
 
 	state := &scanState{
+		window:  window,
 		options: options,
 		export:  export,
 		out:     &out,
@@ -259,6 +262,7 @@ func Run(
 
 // scanState is everything the readers of one search share.
 type scanState struct {
+	window     records.Window
 	options    *options
 	export     *outputfile.Writer
 	out        *Output
@@ -327,7 +331,7 @@ func (s *scanState) scan(
 	defer stop()
 	defer compiled.close()
 
-	session, err := reader.Session(topic)
+	session, err := reader.Session(ctx, topic)
 	if err != nil {
 		return fmt.Errorf("search %s: %w", topic, err)
 	}
@@ -393,6 +397,16 @@ func (s *scanState) visit(
 	compiled *scripts,
 	found *[]records.Message,
 ) (bool, error) {
+
+	if !s.window.Contains(record.Timestamp) {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+
+		// Read, so the range covers it, but not a message of the window.
+		track(s.scanned, record)
+
+		return true, nil
+	}
 
 	value := reader.Decode(ctx, record, serde.Value)
 	key := reader.Decode(ctx, record, serde.Key)

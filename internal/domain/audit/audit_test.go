@@ -91,7 +91,7 @@ func (s *AuditSuite) call(
 ) []entry {
 	s.T().Helper()
 
-	middleware := audit.Middleware(s.logger, endpoint, principal)
+	middleware := audit.Middleware(s.logger, endpoint, principal, nil)
 
 	handler := middleware(func(context.Context, string, mcp.Request) (mcp.Result, error) {
 		if handlerErr != nil {
@@ -323,7 +323,7 @@ func (s *AuditSuite) TestSurvivesUnparseableArguments() {
 }
 
 func (s *AuditSuite) TestIgnoresMethodsThatAreNotToolCalls() {
-	middleware := audit.Middleware(s.logger, s.endpoint(), "p")
+	middleware := audit.Middleware(s.logger, s.endpoint(), "p", nil)
 
 	handler := middleware(func(context.Context, string, mcp.Request) (mcp.Result, error) {
 		return &mcp.ListToolsResult{}, nil
@@ -353,7 +353,7 @@ func (s *AuditSuite) TestRecordsAnAuthenticatedUserWhenOneExists() {
 	// which this server does not do today. The field must therefore appear the
 	// moment inbound auth exists, and stay absent until then, rather than being
 	// logged as an empty promise of per-user attribution.
-	middleware := audit.Middleware(s.logger, s.endpoint(), "p")
+	middleware := audit.Middleware(s.logger, s.endpoint(), "p", nil)
 
 	handler := middleware(func(context.Context, string, mcp.Request) (mcp.Result, error) {
 		return &mcp.CallToolResult{}, nil
@@ -380,4 +380,58 @@ func (s *AuditSuite) TestRecordsAnAuthenticatedUserWhenOneExists() {
 		s.Require().Equal("req-77", logged.attrs["request_id"].String(),
 			"the HTTP layer already logs a request id, and carrying it here is what joins an audit line to that access log")
 	})
+}
+
+func (s *AuditSuite) TestRecordsTheUserTheHostNames() {
+	identify := func(header http.Header) string { return header.Get("X-User") }
+
+	run := func(extra *mcp.RequestExtra) entry {
+		s.records.entries = nil
+
+		handler := audit.Middleware(s.logger, s.endpoint(), "p", identify)(
+			func(context.Context, string, mcp.Request) (mcp.Result, error) { return &mcp.CallToolResult{}, nil })
+
+		_, _ = handler(s.T().Context(), "tools/call", &mcp.CallToolRequest{
+			Params: &mcp.CallToolParamsRaw{Name: "describe_topic", Arguments: json.RawMessage(`{"items":[]}`)},
+			Extra:  extra,
+		})
+
+		return s.records.only()
+	}
+
+	s.Run("a user the host names from the request is recorded", func() {
+		logged := run(&mcp.RequestExtra{Header: http.Header{"X-User": []string{"ada@example.com"}}})
+		s.Require().Equal("ada@example.com", logged.attrs["user"].String(),
+			"an embedding application that authenticates people must be able to attribute calls to them")
+	})
+
+	s.Run("a verified bearer identity still wins", func() {
+		logged := run(&mcp.RequestExtra{
+			TokenInfo: &auth.TokenInfo{UserID: "token-user"},
+			Header:    http.Header{"X-User": []string{"header-user"}},
+		})
+		s.Require().Equal("token-user", logged.attrs["user"].String(),
+			"a verified token is stronger evidence than a header and must not be overridden by it")
+	})
+
+	s.Run("an empty name records no user", func() {
+		logged := run(&mcp.RequestExtra{Header: http.Header{}})
+		_, present := logged.attrs["user"]
+		s.Require().False(present, "no name must be omitted rather than logged as blank")
+	})
+}
+
+func (s *AuditSuite) TestFallsBackToTheDefaultLogger() {
+	previous := slog.Default()
+	slog.SetDefault(s.logger)
+	s.T().Cleanup(func() { slog.SetDefault(previous) })
+
+	handler := audit.Middleware(nil, s.endpoint(), "p", nil)(
+		func(context.Context, string, mcp.Request) (mcp.Result, error) { return &mcp.CallToolResult{}, nil })
+
+	_, _ = handler(s.T().Context(), "tools/call", &mcp.CallToolRequest{
+		Params: &mcp.CallToolParamsRaw{Name: "describe_topic", Arguments: json.RawMessage(`{"items":[]}`)},
+	})
+
+	s.Require().Len(s.records.entries, 1, "a nil logger must record to slog.Default, not panic or drop the record")
 }

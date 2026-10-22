@@ -16,6 +16,7 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"net/http"
 	"strconv"
 	"strings"
 	"time"
@@ -109,17 +110,27 @@ func Principal(cluster *config.Cluster) string {
 	return "anonymous"
 }
 
+// Identity names the person behind a call from its HTTP request headers, as
+// established by something the host trusts (an authenticating proxy). An
+// empty name is left out of the record.
+type Identity func(header http.Header) string
+
 // Middleware returns an MCP receiving middleware that records every tool call
 // made through it.
 //
 // The endpoint and principal are fixed at registration because a tool is bound
 // to one cluster there, so no caller can make a record name a cluster it did
-// not touch.
+// not touch. user may be nil.
 func Middleware(
 	logger *slog.Logger,
 	endpoint *config.Endpoint,
 	principal string,
+	user Identity,
 ) mcp.Middleware {
+
+	if logger == nil {
+		logger = slog.Default()
+	}
 
 	return func(next mcp.MethodHandler) mcp.MethodHandler {
 		return func(
@@ -141,7 +152,7 @@ func Middleware(
 
 			result, err := next(ctx, method, request)
 
-			log(logger, endpoint, principal, call, result, err, time.Since(started))
+			log(logger, endpoint, principal, user, call, result, err, time.Since(started))
 
 			return result, err
 		}
@@ -152,6 +163,7 @@ func log(
 	logger *slog.Logger,
 	endpoint *config.Endpoint,
 	principal string,
+	user Identity,
 	call *mcp.CallToolRequest,
 	result mcp.Result,
 	err error,
@@ -178,7 +190,7 @@ func log(
 		attrs = append(attrs, slog.String("principal", principal))
 	}
 
-	attrs = append(attrs, identity(call)...)
+	attrs = append(attrs, identity(call, user)...)
 	attrs = append(attrs, describeArguments(call.Params.Arguments)...)
 
 	level := slog.LevelDebug
@@ -196,10 +208,10 @@ func log(
 //
 // None of these is a person. The session id groups one investigation, the
 // client is the program that connected, and the user appears only when an
-// inbound token verifier established it, which this server does not install
-// today. Each is omitted when absent, so a reader can tell "not reported" from
+// inbound token verifier established it or the embedding application names
+// it from the request. Each is omitted when absent, so a reader can tell "not reported" from
 // "reported as blank".
-func identity(call *mcp.CallToolRequest) []any {
+func identity(call *mcp.CallToolRequest, user Identity) []any {
 	attrs := make([]any, 0, 4)
 
 	// The session is read through the concrete type rather than the Session
@@ -227,9 +239,15 @@ func identity(call *mcp.CallToolRequest) []any {
 		return attrs
 	}
 
-	// A verified bearer identity is the only per-person attribution available.
-	if extra.TokenInfo != nil && extra.TokenInfo.UserID != "" {
+	// A verified bearer identity, or one the host vouches for from the
+	// request, is the only per-person attribution available.
+	switch {
+	case extra.TokenInfo != nil && extra.TokenInfo.UserID != "":
 		attrs = append(attrs, slog.String("user", extra.TokenInfo.UserID))
+	case user != nil && extra.Header != nil:
+		if name := user(extra.Header); name != "" {
+			attrs = append(attrs, slog.String("user", name))
+		}
 	}
 
 	// The HTTP layer already assigns a request id, and carrying it here is what
