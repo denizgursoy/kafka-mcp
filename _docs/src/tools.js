@@ -498,7 +498,7 @@ export const tools = [
     write: 'destination',
     summary: 'Writes a new message into an existing topic, marked so it is never mistaken for a real one.',
     detail:
-      'Omit partition unless the exact partition is the point: the key decides placement, and a named partition breaks ordering for that key. For a schema-encoded topic give the value as JSON with value_schema; it is validated and encoded before anything is written. For more than 500 messages, or a set saved by transform_messages, pass upload instead of items: a one-time link for a file on the user\u2019s machine, one item per line, read as it uploads and never stored. Without confirm the upload only checks the file; failures are reported by line number. A produced message cannot be deleted.',
+      'Omit partition unless the exact partition is the point: the key decides placement, and a named partition breaks ordering for that key. For a schema-encoded topic give the value as JSON with value_schema; it is validated and encoded before anything is written. For more than 500 messages, or a set saved by transform_messages, pass upload instead of items: a file on the user\u2019s machine, one item per line, read directly over stdio or through a link over HTTP, and never stored. Without confirm the upload only checks the file; failures are reported by line number. A produced message cannot be deleted.',
     params: [
       ['topic', 'string', true, 'Existing topic'],
       ['value', 'string', true, 'The message body'],

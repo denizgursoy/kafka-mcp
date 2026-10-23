@@ -83,14 +83,14 @@ type Input struct {
 	MaxMessages        int        `json:"max_messages,omitempty" jsonschema:"Optional maximum number of messages to transform, counting only those the script selects. Defaults to 100000, at most 10000000. complete is false when the limit stops the run."`
 	TimeoutSeconds     int        `json:"timeout_seconds,omitempty" jsonschema:"Optional wall-clock limit in seconds. Defaults to 300, at most 3600. Messages already written when it fires stay written; scanned_ranges says how far each partition got."`
 	MaxValueBytes      int        `json:"max_value_bytes,omitempty" jsonschema:"Optional maximum number of value bytes to show in each example. Defaults to 4096. Affects the response only."`
-	Download           *Download  `json:"download,omitempty" jsonschema:"Optional. Instead of running now, return a one-time link that runs the transform when fetched and streams every new message to a file on the user's own machine, one produce_message item per line, so the set can be inspected and later sent with produce_message upload. Nothing is stored on the server and nothing is written to Kafka, so it works on a read-only cluster; it cannot be combined with confirm. Run the returned command, e.g. curl, on the user's machine."`
+	Download           *Download  `json:"download,omitempty" jsonschema:"Optional. Instead of writing to Kafka, save every new message to a file on the user's own machine, one produce_message item per line, so the set can be inspected and later sent with produce_message upload. Over stdio the file is saved right away and download.path names it; over HTTP the response is a link and a command, e.g. curl, to run on the user's machine, and the transform runs when it is fetched. Nothing is stored on the server and nothing is written to Kafka, so it works on a read-only cluster; it cannot be combined with confirm."`
 	Confirm            bool       `json:"confirm,omitempty" jsonschema:"Optional. When false or omitted, nothing is written to Kafka: the response counts what would be written, shows examples and groups the failures. Must be true to produce the new messages."`
 }
 
 // Download asks for the transformed messages as a file on the caller's
 // machine.
 type Download struct {
-	Filename string `json:"filename,omitempty" jsonschema:"Optional name to save the file as on the user's machine, in the suggested command. Defaults to <destination_topic>.jsonl."`
+	Filename string `json:"filename,omitempty" jsonschema:"Optional name to save the file as on the user's machine. Over stdio it may be a path, relative to the server's working directory or absolute, and an existing file is never replaced; over HTTP it is a plain file name used in the command. Defaults to <destination_topic>.jsonl."`
 }
 
 // SchemaRef names the registry schema to encode against. Every field is
@@ -181,11 +181,11 @@ offset.
 
 Nothing is written to Kafka unless confirm is true. Without it the response
 counts what would be written, shows before/after examples and groups failures
-by reason with example addresses. download returns a one-time link instead: the
-transform runs when the link is fetched and streams the new messages to the
-user's machine as produce_message items, one per line, so the set can be
-inspected and later sent with produce_message upload. Nothing is stored on the
-server, and downloading works on a read-only cluster.
+by reason with example addresses. download saves the new messages on the
+user's machine instead, as produce_message items, one per line, so the set can
+be inspected and later sent with produce_message upload: over stdio at once,
+over HTTP through a link and command the transform runs behind when fetched.
+Nothing is stored on the server, and downloading works on a read-only cluster.
 
 Partitions are processed in ascending order and writing is not atomic:
 messages written before a timeout or failure stay. complete, stopped_reason and
@@ -359,7 +359,7 @@ func downloadWork(ctx context.Context, clusters *kafkaclient.Registry, own strin
 		if !out.Complete || out.Failed > 0 {
 			return nil, fmt.Errorf(
 				"the transform did not finish cleanly (%s, %d failed) after saving %d messages, so the file is incomplete: "+
-					"fix the failures or raise the limits, and ask for a new link",
+					"fix the failures or raise the limits, and download again",
 				out.StoppedReason, out.Failed, out.FileWritten)
 		}
 

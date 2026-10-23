@@ -422,7 +422,7 @@ func Load(ctx context.Context) (*Config, error) {
 
 	if parsed.OutputDir != "" {
 		return nil, fmt.Errorf(
-			"config: output_dir is no longer supported: search_messages and transform_messages download, and produce_message uploads, straight to and from the user's machine through one-time links, and nothing is stored on the server. Remove output_dir")
+			"config: output_dir is no longer supported: search_messages and transform_messages download, and produce_message uploads, straight to and from the user's machine directly over stdio or through links over HTTP, and nothing is stored on the server. Remove output_dir")
 	}
 
 	for name, parsedCluster := range parsed.Clusters {

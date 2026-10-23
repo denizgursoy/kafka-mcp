@@ -38,13 +38,13 @@ type Input struct {
 	CountOnly     bool       `json:"count_only,omitempty" jsonschema:"Optional. When true, scan the whole range and return only how many messages matched, with a per-partition breakdown and no message bodies. Use this first when a query may match a great many messages, then ask the user how they want them before fetching any."`
 	GroupBy       string     `json:"group_by,omitempty" jsonschema:"Optional JavaScript expression, with the same variables as script, that returns a bucket name for each matching message, e.g. return headers['error-reason'] or return key or return schema_id. Every match in the range is counted per bucket, like count_only, and no message bodies are returned. null and undefined form the bucket null. Cannot be combined with download."`
 	MaxGroups     int        `json:"max_groups,omitempty" jsonschema:"Optional number of largest buckets to return with group_by. Defaults to 20, at most 1000. groups_truncated says whether more existed."`
-	Download      *Download  `json:"download,omitempty" jsonschema:"Optional. Instead of returning matches, return a one-time link that streams every match to a file on the user's own machine. Nothing is written on the server: the search runs when the link is fetched. Run the returned command, e.g. curl, on the user's machine. Use it instead of returning thousands of messages, or whenever the user wants the messages in a file."`
+	Download      *Download  `json:"download,omitempty" jsonschema:"Optional. Instead of returning matches, save every match to a file on the user's own machine. Over stdio the file is saved right away and download.path names it. Over HTTP the response is a link and a command, e.g. curl, to run on the user's machine; the search runs when the link is fetched. Nothing is stored on the server. Use it instead of returning thousands of messages, or whenever the user wants the messages in a file."`
 }
 
 // Download asks for the matches as a file on the caller's machine.
 type Download struct {
 	Format   string `json:"format,omitempty" jsonschema:"Optional file format: jsonl (default, one JSON message per line) or csv. Both are kafka-console's export layout, so the file can be imported there: values are never cut (max_value_bytes does not apply), null keys and values stay null, and payloads are exact bytes (key_encoding, value_encoding utf8 or base64) or, with a Schema Registry schema id, the decoded document with that id."`
-	Filename string `json:"filename,omitempty" jsonschema:"Optional name to save the file as on the user's machine, in the suggested command. Defaults to <topic>.jsonl or <topic>.csv."`
+	Filename string `json:"filename,omitempty" jsonschema:"Optional name to save the file as on the user's machine. Over stdio it may be a path, relative to the server's working directory or absolute, and an existing file is never replaced; over HTTP it is a plain file name used in the command. Defaults to <topic>.jsonl or <topic>.csv."`
 }
 
 // ScannedRange reports the offsets actually covered in one partition.
@@ -146,9 +146,10 @@ the topic uses LogAppendTime.
 
 Kafka has no server-side search, so scans are bounded. Check complete,
 stopped_reason and scanned_ranges before treating no matches as conclusive.
-Use count_only for large result sets, and download to save them: the response
-is then a one-time link, and the search runs and streams every match to the
-user's machine when the link is fetched, without storing anything on the server. A script that runs past
+Use count_only for large result sets, and download to save them to a file on
+the user's machine without storing anything on the server: over stdio the file
+is saved at once, and over HTTP the response is a link and a command to run
+there, the search streaming every match when it is fetched. A script that runs past
 timeout_seconds is interrupted and counted in script_errors; scripts are not
 memory-sandboxed, so keep predicates simple.
 `
@@ -301,7 +302,7 @@ func downloadWork(ctx context.Context, admin *kadm.Client, reader *records.Reade
 		if !out.Complete {
 			return nil, fmt.Errorf(
 				"the search stopped early (%s) after writing %d matches, so the file is incomplete: "+
-					"raise max_messages_scanned or timeout_seconds, or narrow the range, and ask for a new link",
+					"raise max_messages_scanned or timeout_seconds, or narrow the range, and download again",
 				out.StoppedReason, out.WrittenMessages)
 		}
 

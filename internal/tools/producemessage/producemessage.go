@@ -71,13 +71,13 @@ type SchemaRef struct {
 // distinguishable from a genuine one.
 type Input struct {
 	Items   []Item  `json:"items,omitempty" jsonschema:"The messages to write, 1 to 500 of them. Writing one message is an array of length one. Two identical items mean two messages, which is allowed: appending the same payload twice is a real request. Give either items or upload, not both."`
-	Upload  *Upload `json:"upload,omitempty" jsonschema:"Optional. Instead of items, send messages from a file on the user's own machine: the response is a one-time link and a command, e.g. curl -T, to run there. The file holds one item per line as JSON, with the same fields as an entry of items, such as the file transform_messages download saves. It is read as it uploads and never stored on the server. Use it for more messages than items allows, or for a set saved and inspected first. Without confirm the upload writes nothing and its response counts the valid lines and reports the invalid ones by line number; upload again with a new link and confirm to send. Give either items or upload, not both."`
+	Upload  *Upload `json:"upload,omitempty" jsonschema:"Optional. Instead of items, send messages from a file on the user's own machine. Over stdio the file is read right away and the response carries its summary in file; over HTTP the response is a link and a command, e.g. curl -T, to run there, which prints the summary. Run an upload command once: each run sends the file again. The file holds one item per line as JSON, with the same fields as an entry of items, such as the file transform_messages download saves. It is read as it uploads and never stored on the server. Use it for more messages than items allows, or for a set saved and inspected first. Without confirm the upload writes nothing and its response counts the valid lines and reports the invalid ones by line number; call again with confirm to send. Give either items or upload, not both."`
 	Confirm bool    `json:"confirm,omitempty" jsonschema:"Optional. When false or omitted, nothing is written and the response shows the messages that would be produced. Must be true to actually write them. One confirm covers the whole batch."`
 }
 
 // Upload asks for a link that takes a file from the caller's machine.
 type Upload struct {
-	Filename string `json:"filename,omitempty" jsonschema:"Optional name of the file on the user's machine, used in the suggested command. Defaults to messages.jsonl."`
+	Filename string `json:"filename,omitempty" jsonschema:"Optional name of the file on the user's machine. Over stdio it may be a path, relative to the server's working directory or absolute; over HTTP it is a plain file name used in the command. Defaults to messages.jsonl."`
 }
 
 // Output is the result returned by the produce_message tool.
@@ -147,11 +147,12 @@ message is an items array of length one.
 Every message carries provenance headers naming this tool, the time and the
 principal, so a fabricated message stays distinguishable from a genuine one.
 
-upload returns a one-time link for a file on the user's own machine, one item
-per line as JSON, such as the file a transform_messages download saves. Run the
-returned command there; the file is read as it uploads and never stored on the
-server, and the command prints counts, a few examples and the failing lines by
-number. Without confirm the upload only checks the file.
+upload sends a file on the user's own machine, one item per line as JSON, such
+as the file a transform_messages download saves. Over stdio the file is read at
+once; over HTTP the response is a link and a command to run there, once, as
+each run sends the file again. The file is never stored on the server, and the
+summary counts lines, shows a few examples and the failing lines by number.
+Without confirm the upload only checks the file.
 
 Nothing is written unless confirm is true; one confirm covers the whole batch,
 and writing is not atomic because Kafka cannot retract a record produced before
