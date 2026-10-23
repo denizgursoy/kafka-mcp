@@ -106,6 +106,14 @@ own result rather than assuming the call succeeded or failed as a whole.
 A write batch is never atomic: preview it first, explain every valid change, and
 set the one top-level `confirm` only after the user approves the whole set.
 
+**Files live on the user's machine.** `download` and `upload` never store
+anything on the server. Over stdio the file is saved or read at once and the
+response gives its `path`; tell the user where it is. Over HTTP the response
+carries a `command` (`curl`): run it on the user's machine, in the directory
+they want the file in, and report what it printed. The link in it expires
+after ten minutes and is a secret until then; run an upload command once,
+because running it again sends the file again.
+
 **Say what was not measured.** An incomplete scan, an unsampled rate, a
 partition returning an error — each is a different answer from "nothing there",
 and reporting it as absence is how these investigations produce confident wrong

@@ -119,6 +119,13 @@ type HTTP struct {
 	// arrived at.
 	PublicURL string `cfg:"public_url"`
 
+	// LinkKey seals download and upload links, which carry the request they
+	// run. Every instance behind one address must share it, so a link made
+	// on one opens on another. Accepts {env:VAR}. Empty uses auth_token, and
+	// without either each process makes a random key, so links open only on
+	// the instance that made them.
+	LinkKey string `cfg:"link_key" log:"false"`
+
 	// CORS is ada's own CORS configuration, filled straight from the config
 	// file. Its `cfg` tags are the config keys, so the middleware gains an
 	// option and this server gains it with it, without a mapping in between
@@ -400,6 +407,12 @@ func Load(ctx context.Context) (*Config, error) {
 		return nil, fmt.Errorf("http.auth_token: %w", err)
 	}
 	cfg.HTTP.AuthToken = token
+
+	linkKey, err := interpolate(cfg.HTTP.LinkKey, "http")
+	if err != nil {
+		return nil, fmt.Errorf("http.link_key: %w", err)
+	}
+	cfg.HTTP.LinkKey = linkKey
 
 	basePath, err := normalizeBasePath(cfg.HTTP.BasePath)
 	if err != nil {

@@ -141,8 +141,8 @@ Call `transform_messages` with the `script` from step 2 and **without**
 
 When the user wants to look at the whole repaired set before it reaches Kafka,
 or the repair needs a sign-off from someone else, call it with
-`download: {"filename": "orders-fixed.jsonl"}` instead of `confirm`, and run the
-returned command on the user's machine. The file lands there, never on the
+`download: {"filename": "orders-fixed.jsonl"}` instead of `confirm` (over HTTP,
+run the returned command on the user's machine). The file lands there, never on the
 server, and each line is a `produce_message` item, so it can be checked and
 then sent later from that machine:
 
@@ -150,9 +150,9 @@ then sent later from that machine:
 {"name": "produce_message", "arguments": {"upload": {"filename": "orders-fixed.jsonl"}}}
 ```
 
-Run the returned `curl -T` command where the file is. Without `confirm` the
-upload validates every line and reports the bad ones by line number; ask for a
-new link with `confirm: true` to send the valid lines in file order.
+Over HTTP, run the returned `curl -T` command where the file is. Without
+`confirm` the upload validates every line and reports the bad ones by line
+number; call again with `confirm: true` to send the valid lines in file order.
 Downloading works on a read-only endpoint, so the repair can be prepared there
 and sent from a session that may write.
 

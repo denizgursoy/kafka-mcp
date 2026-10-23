@@ -169,7 +169,8 @@ message for any follow-up call.
 
 Each message is one `items` entry, so several are one call rather than one call
 each. Beyond 500, or for a set saved to a file on the user's machine, pass
-`upload` instead of `items` and run the returned `curl -T` command there; an
+`upload` instead of `items` (over HTTP, run the returned `curl -T` command
+there); an
 upload without `confirm` validates every line and reports failures by line
 number. Preview the whole batch first; one top-level `confirm` covers all of them.
 The batch is **not** atomic: if a later item fails, the messages already written

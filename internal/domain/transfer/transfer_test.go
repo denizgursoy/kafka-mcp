@@ -2,15 +2,40 @@ package transfer
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/tls"
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 )
+
+// echoArgs is a download that writes the arguments its link carried, so a
+// test sees exactly what came back out of the link.
+func echoArgs(_ context.Context, args json.RawMessage) (any, error) {
+	return Download(func(_ context.Context, w io.Writer) (any, error) {
+		_, err := w.Write(args)
+		return nil, err
+	}), nil
+}
+
+func hub(t *testing.T, secret string) *Hub {
+	t.Helper()
+
+	h, err := NewHub("/mcp/x/files", []byte(secret))
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.Register("echo", echoArgs)
+
+	return h
+}
 
 func serve(t *testing.T, h *Hub) string {
 	t.Helper()
@@ -40,72 +65,130 @@ func do(t *testing.T, method, url, body string) (int, string, error) {
 	return response.StatusCode, string(reply), err
 }
 
-func TestADownloadRunsWhenFetchedAndOnlyOnce(t *testing.T) {
-	h := NewHub("/mcp/x/files")
-	base := serve(t, h)
-	runs := 0
+func TestALinkOpensOnEveryInstanceSharingTheKey(t *testing.T) {
+	maker, other := hub(t, "shared"), hub(t, "shared")
+	makerURL, otherURL := serve(t, maker), serve(t, other)
 
-	ticket, err := h.Offer(base, "it's.csv", "text/csv", func(_ context.Context, w io.Writer) (any, error) {
-		runs++
-		_, err := io.WriteString(w, "a,b\n")
-		return map[string]int{"rows": 1}, err
-	})
+	ticket, err := maker.Offer(t.Context(), makerURL, "echo", map[string]string{"topic": "orders"}, "it's.csv", "text/csv")
 	if err != nil {
 		t.Fatal(err)
-	}
-	if runs != 0 {
-		t.Fatal("the work must not run before the link is fetched: nothing may be prepared or stored ahead")
-	}
-	if !strings.HasPrefix(ticket.URL, base+"/mcp/x/files/") || len(strings.TrimPrefix(ticket.URL, base+"/mcp/x/files/")) != 43 {
-		t.Fatalf("the link must be the base, the hub's path and a 256-bit token: %s", ticket.URL)
 	}
 	if want := `-o 'it'\''s.csv.part'`; !strings.Contains(ticket.Command, want) {
 		t.Fatalf("the file name must be shell-quoted in the command, got %s", ticket.Command)
 	}
+	if strings.Contains(ticket.URL, "orders") {
+		t.Fatalf("a link must not show what it runs, or scripts end up in proxy logs: %s", ticket.URL)
+	}
 
-	if code, body, _ := do(t, http.MethodPut, ticket.URL, "x"); code != http.StatusMethodNotAllowed || runs != 0 {
-		t.Fatalf("a wrong method must be refused without spending the link: %d %s", code, body)
-	}
-	if code, body, _ := do(t, http.MethodGet, ticket.URL, ""); code != http.StatusOK || body != "a,b\n" || runs != 1 {
-		t.Fatalf("the first fetch must run the work and return it: %d %q", code, body)
-	}
-	if code, _, _ := do(t, http.MethodGet, ticket.URL, ""); code != http.StatusNotFound || runs != 1 {
-		t.Fatalf("a second fetch must be refused, because the link is a one-time credential: %d", code)
-	}
-	if code, body, _ := do(t, http.MethodGet, ticket.StatusURL, ""); code != http.StatusOK || !strings.Contains(body, `"state":"done"`) || !strings.Contains(body, `"rows":1`) {
-		t.Fatalf("the status link must report the outcome: %d %s", code, body)
+	// The load balancer sends the fetch to the other instance.
+	elsewhere := otherURL + strings.TrimPrefix(ticket.URL, makerURL)
+	code, body, _ := do(t, http.MethodGet, elsewhere, "")
+	if code != http.StatusOK || body != `{"topic":"orders"}` {
+		t.Fatalf("an instance sharing the key must run a link another made, with its arguments intact: %d %q", code, body)
 	}
 }
 
-func TestAFailedDownloadBreaksTheTransfer(t *testing.T) {
-	h := NewHub("/f")
-	base := serve(t, h)
-	ticket, err := h.Offer(base, "x.jsonl", "application/x-ndjson", func(_ context.Context, w io.Writer) (any, error) {
-		_, _ = io.WriteString(w, strings.Repeat("partial\n", 10000))
-		return nil, errors.New("the broker went away")
-	})
+func TestALinkDoesNotOpenWithAnotherKeyOrEndpointOrWhenChanged(t *testing.T) {
+	maker := hub(t, "shared")
+	ticket, err := maker.Offer(t.Context(), "http://x", "echo", "a", "f", "text/plain")
 	if err != nil {
 		t.Fatal(err)
 	}
+	token := ticket.URL[strings.LastIndex(ticket.URL, "/")+1:]
 
+	stranger := hub(t, "different")
+	if _, err := stranger.open(token); !errors.Is(err, errBadLink) {
+		t.Fatalf("a link sealed with another key must not open: %v", err)
+	}
+
+	otherEndpoint, _ := NewHub("/mcp/y/files", []byte("shared"))
+	if _, err := otherEndpoint.open(token); !errors.Is(err, errBadLink) {
+		t.Fatalf("a link made for one endpoint must not open on another sharing the secret: %v", err)
+	}
+
+	changed := []byte(token)
+	changed[len(changed)/2] ^= 1
+	if _, err := maker.open(string(changed)); !errors.Is(err, errBadLink) {
+		t.Fatalf("a changed link must not open, or a caller could run a search nobody offered: %v", err)
+	}
+}
+
+func TestLinksExpire(t *testing.T) {
+	h := hub(t, "k")
+	base := serve(t, h)
+	now := time.Now()
+	h.now = func() time.Time { return now }
+
+	ticket, _ := h.Offer(t.Context(), base, "echo", "a", "f", "text/plain")
+	now = now.Add(TTL)
+	if code, body, _ := do(t, http.MethodGet, ticket.URL, ""); code != http.StatusGone || !strings.Contains(body, "expired") {
+		t.Fatalf("an expired link must be refused as expired: %d %s", code, body)
+	}
+}
+
+func TestAWrongMethodIsRefusedBeforeAnyWork(t *testing.T) {
+	h := hub(t, "k")
+	base := serve(t, h)
+	runs := 0
+	h.Register("count", func(context.Context, json.RawMessage) (any, error) {
+		runs++
+		return Download(func(context.Context, io.Writer) (any, error) { return nil, nil }), nil
+	})
+
+	ticket, _ := h.Offer(t.Context(), base, "count", nil, "f", "text/plain")
+	if code, _, _ := do(t, http.MethodPut, ticket.URL, "x"); code != http.StatusMethodNotAllowed || runs != 0 {
+		t.Fatalf("a download link must refuse an upload without running anything: %d, runs %d", code, runs)
+	}
+}
+
+func TestAFailureBeforeTheFirstByteIsAPlainError(t *testing.T) {
+	h := hub(t, "k")
+	base := serve(t, h)
+	h.Register("refused", func(context.Context, json.RawMessage) (any, error) {
+		return nil, errors.New("the endpoint is read-only now")
+	})
+	h.Register("empty-fail", func(context.Context, json.RawMessage) (any, error) {
+		return Download(func(context.Context, io.Writer) (any, error) { return nil, errors.New("no such topic") }), nil
+	})
+
+	for kind, want := range map[string]string{"refused": "read-only now", "empty-fail": "no such topic"} {
+		ticket, _ := h.Offer(t.Context(), base, kind, nil, "f", "text/plain")
+		if code, body, _ := do(t, http.MethodGet, ticket.URL, ""); code != http.StatusUnprocessableEntity || !strings.Contains(body, want) {
+			t.Fatalf("%s: a failure before any data must answer with the reason, so curl -f shows it: %d %s", kind, code, body)
+		}
+	}
+}
+
+func TestAFailureAfterDataBreaksTheTransfer(t *testing.T) {
+	h := hub(t, "k")
+	base := serve(t, h)
+	h.Register("partial", func(context.Context, json.RawMessage) (any, error) {
+		return Download(func(_ context.Context, w io.Writer) (any, error) {
+			_, _ = io.WriteString(w, strings.Repeat("partial\n", 10000))
+			return nil, errors.New("the broker went away")
+		}), nil
+	})
+
+	ticket, _ := h.Offer(t.Context(), base, "partial", nil, "f", "text/plain")
 	if _, _, err := do(t, http.MethodGet, ticket.URL, ""); err == nil {
 		t.Fatal("a download that fails after sending data must break the connection, so curl -f fails instead of keeping a cut-short file")
-	}
-	if _, body, _ := do(t, http.MethodGet, ticket.StatusURL, ""); !strings.Contains(body, "the broker went away") {
-		t.Fatalf("the status link must say why the download failed: %s", body)
 	}
 }
 
 func TestAnUploadReadsTheBodyAndAnswersWithTheResult(t *testing.T) {
-	h := NewHub("/f")
+	h := hub(t, "k")
 	base := serve(t, h)
-	ticket, err := h.Accept(base, "send.jsonl", func(_ context.Context, r io.Reader) (any, error) {
-		body, _ := io.ReadAll(r)
-		if string(body) == "bad" {
-			return nil, errors.New("line 1 is not JSON")
-		}
-		return map[string]int{"bytes": len(body)}, nil
+	h.Register("up", func(_ context.Context, args json.RawMessage) (any, error) {
+		return Upload(func(_ context.Context, r io.Reader) (any, error) {
+			body, _ := io.ReadAll(r)
+			if string(body) == "bad" {
+				return nil, errors.New("line 1 is not JSON")
+			}
+			return map[string]any{"bytes": len(body), "args": json.RawMessage(args)}, nil
+		}), nil
 	})
+
+	ticket, err := h.Accept(t.Context(), base, "up", map[string]bool{"confirm": true}, "send.jsonl")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -113,55 +196,105 @@ func TestAnUploadReadsTheBodyAndAnswersWithTheResult(t *testing.T) {
 		t.Fatalf("the upload command must send the user's file: %s", ticket.Command)
 	}
 	if code, _, _ := do(t, http.MethodGet, ticket.URL, ""); code != http.StatusMethodNotAllowed {
-		t.Fatalf("a GET must not spend an upload link: %d", code)
+		t.Fatalf("a GET must be refused on an upload link: %d", code)
 	}
-	if code, body, _ := do(t, http.MethodPut, ticket.URL, "hello"); code != http.StatusOK || !strings.Contains(body, `"bytes":5`) {
-		t.Fatalf("the upload must be read and its result returned: %d %s", code, body)
+	if code, body, _ := do(t, http.MethodPut, ticket.URL, "hello"); code != http.StatusOK || !strings.Contains(body, `"bytes":5`) || !strings.Contains(body, `"confirm":true`) {
+		t.Fatalf("the upload must be read with the link's arguments and its result returned: %d %s", code, body)
 	}
-
-	failing, _ := h.Accept(base, "send.jsonl", func(_ context.Context, r io.Reader) (any, error) {
-		_, _ = io.ReadAll(r)
-		return nil, errors.New("line 1 is not JSON")
-	})
-	if code, body, _ := do(t, http.MethodPost, failing.URL, "bad"); code != http.StatusUnprocessableEntity || !strings.Contains(body, "line 1") {
-		t.Fatalf("a refused upload must answer 422 with the reason, so curl -f fails and shows it: %d %s", code, body)
+	if code, body, _ := do(t, http.MethodPost, ticket.URL, "bad"); code != http.StatusUnprocessableEntity || !strings.Contains(body, "line 1") {
+		t.Fatalf("a refused upload must answer 422 with the reason: %d %s", code, body)
 	}
 }
 
-func TestLinksExpireAndAreBounded(t *testing.T) {
-	h := NewHub("/f")
-	base := serve(t, h)
-	now := time.Now()
-	h.now = func() time.Time { return now }
-	noop := func(context.Context, io.Writer) (any, error) { return nil, nil }
-
-	ticket, _ := h.Offer(base, "x", "text/plain", noop)
-	now = now.Add(TTL)
-	if code, _, _ := do(t, http.MethodGet, ticket.URL, ""); code != http.StatusNotFound {
-		t.Fatalf("an expired link must be refused: %d", code)
-	}
-
-	for range maxPending {
-		if _, err := h.Offer(base, "x", "text/plain", noop); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if _, err := h.Offer(base, "x", "text/plain", noop); err == nil {
-		t.Fatal("pending links must be bounded, so unused ones cannot grow memory without end")
-	}
-	now = now.Add(TTL)
-	if _, err := h.Offer(base, "x", "text/plain", noop); err != nil {
-		t.Fatalf("expired links must free their slots: %v", err)
+func TestALinkTooLongForProxiesIsRefusedWhenMade(t *testing.T) {
+	h := hub(t, "k")
+	random := make([]byte, 8<<10)
+	_, _ = rand.Read(random)
+	if _, err := h.Offer(t.Context(), "http://x", "echo", random, "f", "text/plain"); err == nil || !strings.Contains(err.Error(), "too large") {
+		t.Fatalf("a request that cannot fit in a link must be refused at once, not as a proxy error later: %v", err)
 	}
 }
 
 func TestWithoutAnAddressThereIsNoLink(t *testing.T) {
 	var h *Hub
-	if _, err := h.Offer("http://x", "f", "text/plain", nil); !errors.Is(err, ErrUnavailable) {
-		t.Fatalf("a server with no hub, as over stdio, must refuse with the reason: %v", err)
+	if _, err := h.Offer(t.Context(), "http://x", "echo", nil, "f", "text/plain"); !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("a server with no hub must refuse with the reason: %v", err)
 	}
-	if _, err := NewHub("/f").Offer("", "f", "text/plain", nil); !errors.Is(err, ErrUnavailable) {
+	if _, err := hub(t, "k").Offer(t.Context(), "", "echo", nil, "f", "text/plain"); !errors.Is(err, ErrUnavailable) {
 		t.Fatalf("a call that arrived without an address must refuse: %v", err)
+	}
+}
+
+func TestALocalHubSavesAndReadsOnThisMachine(t *testing.T) {
+	dir := t.TempDir()
+	h := NewLocalHub(dir)
+	h.Register("echo", echoArgs)
+	h.Register("fail", func(context.Context, json.RawMessage) (any, error) {
+		return Download(func(_ context.Context, w io.Writer) (any, error) {
+			_, _ = io.WriteString(w, "half")
+			return nil, errors.New("cut short")
+		}), nil
+	})
+	h.Register("up", func(context.Context, json.RawMessage) (any, error) {
+		return Upload(func(_ context.Context, r io.Reader) (any, error) {
+			body, _ := io.ReadAll(r)
+			return string(body), nil
+		}), nil
+	})
+
+	ticket, err := h.Offer(t.Context(), "", "echo", "data", "out/sub.json", "")
+	if err == nil || !strings.Contains(err.Error(), "out") {
+		// A missing subdirectory is the caller's to create.
+		t.Fatalf("saving into a directory that does not exist must fail with its name: %v", err)
+	}
+
+	ticket, err = h.Offer(t.Context(), "", "echo", "data", "saved.json", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ticket.Method != MethodLocal || ticket.Path != filepath.Join(dir, "saved.json") || ticket.URL != "" {
+		t.Fatalf("over stdio the file must be saved right away, with no link: %+v", ticket)
+	}
+	if body, _ := os.ReadFile(ticket.Path); string(body) != `"data"` {
+		t.Fatalf("the saved file must hold the download: %q", body)
+	}
+
+	if _, err := h.Offer(t.Context(), "", "echo", "again", "saved.json", ""); err == nil || !strings.Contains(err.Error(), "already exists") {
+		t.Fatalf("an existing file must never be replaced: %v", err)
+	}
+	if body, _ := os.ReadFile(ticket.Path); string(body) != `"data"` {
+		t.Fatalf("the refused save must leave the existing file alone: %q", body)
+	}
+
+	if _, err := h.Offer(t.Context(), "", "fail", nil, "broken.json", ""); err == nil {
+		t.Fatal("a failed download must be reported")
+	}
+	if _, err := os.Stat(filepath.Join(dir, "broken.json")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("a failed download must leave no file that looks complete")
+	}
+	if leftovers, _ := filepath.Glob(filepath.Join(dir, ".*.part")); len(leftovers) != 0 {
+		t.Fatalf("a failed download must clean up its partial file: %v", leftovers)
+	}
+
+	read, err := h.Accept(t.Context(), "", "up", nil, "saved.json")
+	if err != nil || read.Result != `"data"` || read.Path != filepath.Join(dir, "saved.json") {
+		t.Fatalf("an upload over stdio must read the local file now: %+v %v", read, err)
+	}
+	if _, err := h.Accept(t.Context(), "", "up", nil, "missing.json"); err == nil {
+		t.Fatal("a missing local file must be reported")
+	}
+}
+
+func TestCheckFilename(t *testing.T) {
+	for name, local := range map[string]bool{"a.csv": false, "dir/a.csv": true, "/tmp/a.csv": true} {
+		if err := CheckFilename(name, local); err != nil {
+			t.Fatalf("%q (local %v) must be accepted: %v", name, local, err)
+		}
+	}
+	for name, local := range map[string]bool{"dir/a.csv": false, "..": false, "": true, "a\x00b": true} {
+		if err := CheckFilename(name, local); err == nil {
+			t.Fatalf("%q (local %v) must be refused", name, local)
+		}
 	}
 }
 

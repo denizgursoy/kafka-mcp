@@ -119,9 +119,9 @@ func run(ctx context.Context, opts options) error {
 	defer clusters.Close()
 
 	if !opts.server {
-		// Over stdio there is no address a link could point at, so the
-		// download and upload modes refuse.
-		server, err := newServer(cfg, clusters, endpointName, nil)
+		// Over stdio the server is the user's own process, so files are
+		// saved and read in its working directory, with no link at all.
+		server, err := newServer(cfg, clusters, endpointName, transfer.NewLocalHub("."))
 		if err != nil {
 			return fmt.Errorf("initialize stdio endpoint %q: %w", endpointName, err)
 		}
@@ -159,7 +159,11 @@ func runHTTP(ctx context.Context, cfg *config.Config, clusters *kafkaclient.Regi
 
 	for _, name := range cfg.EndpointNames() {
 		endpoint := cfg.Endpoints[name]
-		files[name] = transfer.NewHub(cfg.HTTP.BasePath + endpoint.Path + tools.FilesPath)
+		hub, err := transfer.NewHub(cfg.HTTP.BasePath+endpoint.Path+tools.FilesPath, linkSecret(cfg.HTTP))
+		if err != nil {
+			return fmt.Errorf("serve endpoint %q: %w", name, err)
+		}
+		files[name] = hub
 
 		server, err := newServer(cfg, clusters, name, files[name])
 		if err != nil {
@@ -181,6 +185,17 @@ func runHTTP(ctx context.Context, cfg *config.Config, clusters *kafkaclient.Regi
 	server := newHTTPServer(cfg, servers, files)
 
 	return server.StartWithContext(ctx, cfg.HTTP.Address)
+}
+
+// linkSecret is what links are sealed with: link_key, else the bearer token,
+// which every instance behind one address shares already. Without either
+// the hub makes a random key.
+func linkSecret(settings config.HTTP) []byte {
+	if settings.LinkKey != "" {
+		return []byte(settings.LinkKey)
+	}
+
+	return []byte(settings.AuthToken)
 }
 
 // checkFilePaths refuses an endpoint whose path is another endpoint's link
@@ -244,8 +259,8 @@ func newHTTPServer(cfg *config.Config, servers map[string]*mcp.Server, files map
 
 	// Download and upload links sit below each endpoint and behind the same
 	// origin check. They take no bearer token: the agent's curl does not
-	// carry the MCP client's headers, and each link is its own one-time
-	// 256-bit credential, like a presigned URL.
+	// carry the MCP client's headers, and each link is sealed with the link
+	// key and expires, like a presigned URL.
 	for name, hub := range files {
 		if servers[name] != nil {
 			server.HandleWildcard(hub.Path()+"/", guard(config.HTTP{CORS: cfg.HTTP.CORS}, hub.Handler()))

@@ -118,8 +118,8 @@ to choose**:
   preview warns about the schema id; set `translate_schema` so the copy stays
   decodable there.
 - **`search_messages` with `download`** — saves the messages to a file on the
-  user's machine as JSON lines, or CSV with `format: "csv"`, through a
-  one-time link the agent fetches there. Best for several messages at once, or
+  user's machine as JSON lines, or CSV with `format: "csv"`, directly over
+  stdio, or through a link the agent fetches there over HTTP. Best for several messages at once, or
   for inspecting them outside Kafka. Nothing needs to exist first, and nothing
   is stored on the server.
 - **Show it in the conversation** — best for a single small message the user

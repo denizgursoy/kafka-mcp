@@ -167,8 +167,8 @@ example address each, largest first. Then **ask the user how they want them**:
 - the oldest few (`direction: "oldest_first"`)
 - a narrower filter to cut the number down
 - everything saved to a file on their machine (`download: {}`, or
-  `download: {"format": "csv"}` for a spreadsheet), which returns a one-time
-  link and a `curl` command to run there instead of flooding the conversation.
+  `download: {"format": "csv"}` for a spreadsheet), which saves the file on the user's machine; over HTTP it returns a link
+  and a `curl` command to run there instead of flooding the conversation.
   Run the command in the directory the user wants the file in; nothing is
   stored on the server
 

@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/stretchr/testify/suite"
 
 	"github.com/denizgursoy/kafka-mcp/internal/domain/records"
@@ -335,6 +336,7 @@ func (s *HighVolumeSuite) TestScanCeilingReportsAnIncompleteSearch() {
 
 func (s *HighVolumeSuite) TestDownloadsEveryMatch() {
 	files, base := testenv.Files(s.T())
+	searchmessages.Register(mcp.NewServer(&mcp.Implementation{Name: "t", Version: "test"}, nil), s.env.Admin(), s.env.Reader(), files)
 
 	out, err := searchmessages.Run(
 		s.T().Context(),

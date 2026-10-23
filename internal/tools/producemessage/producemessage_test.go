@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/stretchr/testify/suite"
 	"github.com/twmb/avro"
 	"github.com/twmb/franz-go/pkg/kgo"
@@ -756,6 +757,7 @@ func (s *ProduceMessageSuite) upload(clusters *kafkaclient.Registry, confirm boo
 	s.T().Helper()
 
 	files, base := testenv.Files(s.T())
+	producemessage.Register(mcp.NewServer(&mcp.Implementation{Name: "t", Version: "test"}, nil), clusters, "here", files)
 	offered, err := producemessage.Run(s.T().Context(), clusters, "here", files, base, producemessage.Input{
 		Upload:  &producemessage.Upload{Filename: "send.jsonl"},
 		Confirm: confirm,
@@ -854,6 +856,29 @@ func (s *ProduceMessageSuite) TestUploadRefusesAReadOnlyDestination() {
 	s.Require().Zero(s.endOffset(topic), "a refused upload must leave the topic untouched")
 }
 
+func (s *ProduceMessageSuite) TestALinkIsCheckedAgainstThePolicyWhenUsed() {
+	topic := s.env.CreateTopic(s.T(), "produce-file-policy")
+
+	maker, base := testenv.Files(s.T())
+	producemessage.Register(mcp.NewServer(&mcp.Implementation{Name: "t", Version: "test"}, nil), s.client(false), "here", maker)
+	offered, err := producemessage.Run(s.T().Context(), s.client(false), "here", maker, base, producemessage.Input{
+		Upload: &producemessage.Upload{}, Confirm: true,
+	})
+	s.Require().NoError(err, "a writable endpoint must hand out an upload link")
+
+	// The same link reaches an instance where the cluster is read-only now.
+	readOnly, readOnlyBase := testenv.Files(s.T())
+	producemessage.Register(mcp.NewServer(&mcp.Implementation{Name: "t", Version: "test"}, nil), s.client(true), "here", readOnly)
+	moved := *offered.Upload
+	moved.URL = readOnlyBase + strings.TrimPrefix(moved.URL, base)
+
+	code, reply := testenv.Send(s.T(), moved, `{"topic":"`+topic+`","value":"x"}`+"\n")
+	s.Require().Equal(http.StatusUnprocessableEntity, code,
+		"a link carries the request, not a permission: the policy where it is used decides, so a cluster turned read-only stays protected")
+	s.Require().Contains(string(reply), "read-only", "the refusal must say why")
+	s.Require().Zero(s.endOffset(topic), "nothing may be written")
+}
+
 func (s *ProduceMessageSuite) TestUploadRefusals() {
 	s.Run("items and upload together", func() {
 		files, base := testenv.Files(s.T())
@@ -865,12 +890,12 @@ func (s *ProduceMessageSuite) TestUploadRefusals() {
 			"giving both leaves which messages to write ambiguous, so it must be refused")
 	})
 
-	s.Run("no HTTP transport", func() {
+	s.Run("no transfer set up", func() {
 		_, err := producemessage.Run(s.T().Context(), s.client(false), "here", nil, "", producemessage.Input{
 			Upload: &producemessage.Upload{},
 		})
-		s.Require().ErrorContains(err, "HTTP transport",
-			"over stdio there is no address for a link, so an upload must be refused with the reason")
+		s.Require().ErrorContains(err, "not set up",
+			"a server without a hub must say uploads are unavailable")
 	})
 
 	s.Run("an empty file", func() {

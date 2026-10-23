@@ -14,6 +14,7 @@ import (
 	"github.com/twmb/franz-go/pkg/kgo"
 
 	"github.com/denizgursoy/kafka-mcp/internal/domain/serde"
+	"github.com/denizgursoy/kafka-mcp/internal/domain/transfer"
 )
 
 // ExportedMessage is one line of a download. It is the record layout
@@ -260,7 +261,7 @@ type downloadOptions struct {
 	filename string
 }
 
-func newDownload(topic string, d *Download) (*downloadOptions, error) {
+func newDownload(topic string, d *Download, local bool) (*downloadOptions, error) {
 	if d == nil {
 		return nil, nil
 	}
@@ -278,10 +279,8 @@ func newDownload(topic string, d *Download) (*downloadOptions, error) {
 	if filename == "" {
 		filename = topic + "." + format
 	}
-	// The name is only a suggestion for the caller's own command, but a path
-	// there would save somewhere other than where the user is working.
-	if strings.ContainsAny(filename, "/\\\x00") || filename == "." || filename == ".." {
-		return nil, fmt.Errorf("download filename %q must be a file name, not a path", d.Filename)
+	if err := transfer.CheckFilename(filename, local); err != nil {
+		return nil, fmt.Errorf("download filename: %w", err)
 	}
 
 	return &downloadOptions{format: format, filename: filename}, nil

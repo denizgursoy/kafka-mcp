@@ -66,8 +66,8 @@ If `message_count` is not zero, ask what should happen to the data **before**
 asking whether to delete:
 
 - **`search_messages` with `download`** — saves every message to a file on
-  the user's machine as JSON lines, or CSV with `format: "csv"`: run the
-  returned command there. The practical option for a whole topic; nothing is
+  the user's machine as JSON lines, or CSV with `format: "csv"` (over HTTP,
+  run the returned command there). The practical option for a whole topic; nothing is
   stored on the server, and kafka-console can import the file back. Raise
   `max_messages_scanned` to cover the whole topic, or the download fails as
   incomplete.

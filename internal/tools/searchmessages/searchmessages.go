@@ -3,6 +3,7 @@ package searchmessages
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"sort"
@@ -152,13 +153,26 @@ timeout_seconds is interrupted and counted in script_errors; scripts are not
 memory-sandboxed, so keep predicates simple.
 `
 
-// Register adds the search_messages tool to the MCP server.
+// linkKind names search_messages downloads in a link.
+const linkKind = "search_messages"
+
+// Register adds the search_messages tool to the MCP server, and opens its
+// download links on files.
 func Register(
 	server *mcp.Server,
 	admin *kadm.Client,
 	reader *records.Reader,
 	files *transfer.Hub,
 ) {
+	files.Register(linkKind, func(ctx context.Context, args json.RawMessage) (any, error) {
+		var input Input
+		if err := json.Unmarshal(args, &input); err != nil {
+			return nil, fmt.Errorf("read the link: %w", err)
+		}
+
+		return downloadWork(ctx, admin, reader, input)
+	})
+
 	mcp.AddTool(
 		server,
 		&mcp.Tool{
@@ -184,8 +198,10 @@ func Register(
 // Run scans a bounded part of a topic and returns the messages that match.
 //
 // With download it scans nothing yet: it checks the search would start, then
-// returns a link from files whose fetch runs the search and streams every
-// match. base is the address the caller reached the server at.
+// returns a link whose fetch runs the search and streams every match. The
+// link carries the search itself, so any instance sharing files' key can run
+// it. base is the address the caller reached the server at. A local hub, over
+// stdio, runs the search now and saves the file.
 func Run(
 	ctx context.Context,
 	admin *kadm.Client,
@@ -195,32 +211,64 @@ func Run(
 	input Input,
 ) (Output, error) {
 
-	options, err := newOptions(input)
+	options, err := newOptions(input, files.Local())
 	if err != nil {
 		return Output{}, err
 	}
 
-	if options.download != nil {
-		return offer(ctx, admin, reader, files, base, input, options)
+	if options.download == nil {
+		return search(ctx, admin, reader, input, options, nil)
 	}
 
-	return search(ctx, admin, reader, input, options, nil)
+	// Checked now, so a mistake is reported to the caller rather than as a
+	// failed curl, and checked again when the link is used.
+	if _, err := downloadWork(ctx, admin, reader, input); err != nil {
+		return Output{}, err
+	}
+
+	contentType := "application/x-ndjson"
+	if options.download.format == formatCSV {
+		contentType = "text/csv; charset=utf-8"
+	}
+
+	ticket, err := files.Offer(ctx, base, linkKind, input, options.download.filename, contentType)
+	if err != nil {
+		return Output{}, err
+	}
+
+	// Over stdio the search already ran and saved the file: report it as a
+	// search, with the ticket saying where the file is.
+	if done, ok := ticket.Result.(Output); ok {
+		ticket.Result = nil
+		done.Download = &ticket
+
+		return done, nil
+	}
+
+	return Output{
+		Topic:         input.Topic,
+		Matches:       []records.Message{},
+		ScannedRanges: []ScannedRange{},
+		StoppedReason: reasonNotStarted,
+		Download:      &ticket,
+	}, nil
 }
 
-// offer validates a download now, so a mistake is reported to the caller
-// rather than as a failed curl, and returns its link.
-func offer(
-	ctx context.Context,
-	admin *kadm.Client,
-	reader *records.Reader,
-	files *transfer.Hub,
-	base string,
-	input Input,
-	options *options,
-) (Output, error) {
+// downloadWork checks a search with download and returns the work its link
+// runs.
+// It runs when the link is made and again when it is used, so a topic
+// deleted or a script broken in between is refused before any byte is sent.
+func downloadWork(ctx context.Context, admin *kadm.Client, reader *records.Reader, input Input) (transfer.Download, error) {
+	options, err := newOptions(input, true)
+	if err != nil {
+		return nil, err
+	}
+	if options.download == nil {
+		return nil, fmt.Errorf("the link is not a download")
+	}
 
 	if _, err := options.newScripts(); err != nil {
-		return Output{}, err
+		return nil, err
 	}
 
 	window := records.Window{
@@ -231,15 +279,10 @@ func offer(
 		ToTimestamp:   input.ToTimestamp,
 	}
 	if _, err := records.ResolveWindows(ctx, admin, input.Topic, window); err != nil {
-		return Output{}, err
+		return nil, err
 	}
 
-	contentType := "application/x-ndjson"
-	if options.download.format == formatCSV {
-		contentType = "text/csv; charset=utf-8"
-	}
-
-	ticket, err := files.Offer(base, options.download.filename, contentType, func(ctx context.Context, w io.Writer) (any, error) {
+	return func(ctx context.Context, w io.Writer) (any, error) {
 		export, err := newExporter(w, options.download.format)
 		if err != nil {
 			return nil, err
@@ -256,24 +299,13 @@ func offer(
 		// A file is a copy of the range asked for, so one cut short by a
 		// limit is a failure rather than a smaller file that looks whole.
 		if !out.Complete {
-			return out, fmt.Errorf(
+			return nil, fmt.Errorf(
 				"the search stopped early (%s) after writing %d matches, so the file is incomplete: "+
 					"raise max_messages_scanned or timeout_seconds, or narrow the range, and ask for a new link",
 				out.StoppedReason, out.WrittenMessages)
 		}
 
 		return out, nil
-	})
-	if err != nil {
-		return Output{}, err
-	}
-
-	return Output{
-		Topic:         input.Topic,
-		Matches:       []records.Message{},
-		ScannedRanges: []ScannedRange{},
-		StoppedReason: reasonNotStarted,
-		Download:      &ticket,
 	}, nil
 }
 
@@ -776,7 +808,9 @@ type options struct {
 // broker's connection budget.
 const maxParallelism = 16
 
-func newOptions(input Input) (*options, error) {
+// newOptions validates input. local allows a download filename with a path,
+// for a server saving on the caller's own machine.
+func newOptions(input Input, local bool) (*options, error) {
 	if input.Topic == "" {
 		return nil, fmt.Errorf("topic is required")
 	}
@@ -811,7 +845,7 @@ func newOptions(input Input) (*options, error) {
 			"count_only and download cannot be combined: counting returns no messages to save")
 	}
 
-	download, err := newDownload(input.Topic, input.Download)
+	download, err := newDownload(input.Topic, input.Download, local)
 	if err != nil {
 		return nil, err
 	}

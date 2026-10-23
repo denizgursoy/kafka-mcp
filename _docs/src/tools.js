@@ -142,7 +142,7 @@ export const tools = [
       ['max_messages_scanned', 'int', false, 'Read at most this many. Default 10000, at most 100000000'],
       ['parallelism', 'int', false, 'Readers for one partition, 1 to 16. Default 1'],
       ['count_only', 'bool', false, 'Counts only, no bodies'],
-      ['download', 'object', false, '{format, filename}: a one-time link that streams every match to the user\u2019s machine as jsonl or csv, in kafka-console\u2019s import layout. Nothing is stored on the server. Values are never cut'],
+      ['download', 'object', false, '{format, filename}: saves every match on the user\u2019s machine (a link over HTTP, directly over stdio) as jsonl or csv, in kafka-console\u2019s import layout. Nothing is stored on the server. Values are never cut'],
       ['timeout_seconds', 'int', false, 'Wall-clock limit. Default 30, at most 3600'],
       ['group_by', 'string', false, 'Expression returning a bucket per match. Counts per bucket, no bodies'],
       ['max_groups', 'int', false, 'Largest buckets returned with group_by. Default 20, at most 1000'],
@@ -509,7 +509,7 @@ export const tools = [
       ['value_schema', 'object', false, 'Encode value to a registry schema. {} = latest <topic>-value'],
       ['key_schema', 'object', false, 'Encode key to a registry schema. {} = latest <topic>-key'],
       ['destination_cluster', 'string', false, 'Defaults to this endpoint\u2019s cluster. Another must be in this endpoint\u2019s destinations'],
-      ['upload', 'object', false, 'Top level, instead of items. {filename}: a one-time link for a file on the user\u2019s machine'],
+      ['upload', 'object', false, 'Top level, instead of items. {filename}: a file on the user\u2019s machine, read through a link over HTTP or directly over stdio'],
     ],
     call: { items: [{ topic: 'orders', key: 'ORD-12345', value: '{"status":"NEW"}', value_schema: {} }], confirm: false },
     result: {
@@ -541,7 +541,7 @@ export const tools = [
       ['value_schema / key_schema', 'object', false, 'Encode to this registry schema instead of the one read'],
       ['max_messages', 'int', false, 'Selected messages to process. Default 100000, at most 10000000'],
       ['timeout_seconds', 'int', false, 'Wall-clock limit. Default 300, at most 3600'],
-      ['download', 'object', false, '{filename}: a one-time link that saves the new messages on the user\u2019s machine as produce_message items. Not with confirm'],
+      ['download', 'object', false, '{filename}: saves the new messages on the user\u2019s machine as produce_message items. Not with confirm'],
       ['confirm', 'bool', false, 'Default false: nothing is written to Kafka'],
     ],
     call: {

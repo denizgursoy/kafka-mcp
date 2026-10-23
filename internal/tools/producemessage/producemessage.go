@@ -4,6 +4,7 @@ package producemessage
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -100,6 +101,8 @@ type BatchOutput struct {
 	batch.Output[Output]
 
 	Upload *transfer.Ticket `json:"upload,omitempty"`
+	// File is the summary of an upload a local server read already.
+	File *FileOutput `json:"file,omitempty"`
 }
 
 // FileOutput summarises an upload, returned to the command that sent it. A
@@ -172,13 +175,33 @@ get_message or sample_messages first: a schema_id on the existing messages means
 the topic needs value_schema, and writing plain JSON there breaks its consumers.
 `
 
-// Register adds the produce_message tool to the MCP server.
+// linkKind names produce_message uploads in a link.
+const linkKind = "produce_message"
+
+// uploadLink is what an upload link carries: whether it sends, and the MCP
+// client that asked, for provenance.
+type uploadLink struct {
+	Confirm bool   `json:"confirm"`
+	Client  string `json:"client,omitempty"`
+}
+
+// Register adds the produce_message tool to the MCP server, and opens its
+// upload links on files.
 func Register(
 	server *mcp.Server,
 	clusters *kafkaclient.Registry,
 	own string,
 	files *transfer.Hub,
 ) {
+	files.Register(linkKind, func(_ context.Context, args json.RawMessage) (any, error) {
+		var link uploadLink
+		if err := json.Unmarshal(args, &link); err != nil {
+			return nil, fmt.Errorf("read the link: %w", err)
+		}
+
+		return uploadWork(clusters, own, link), nil
+	})
+
 	mcp.AddTool(
 		server,
 		&mcp.Tool{
@@ -242,7 +265,7 @@ func run(
 				"give either items or upload, not both: which messages to write must be unambiguous")
 		}
 
-		return offerUpload(clusters, own, files, base, input.Upload, input.Confirm, client)
+		return offerUpload(ctx, files, base, input.Upload, input.Confirm, client)
 	}
 
 	out, err := runBatch(ctx, clusters, own, input.Items, input.Confirm, client)
@@ -304,10 +327,24 @@ func runBatch(
 	return out, nil
 }
 
-// offerUpload returns the link an upload is sent to.
+// uploadWork is what an upload link runs. Every line is checked as it is
+// read, against the destination's policy at that moment, so a link made
+// before a cluster turned read-only cannot write after it.
+func uploadWork(clusters *kafkaclient.Registry, own string, link uploadLink) transfer.Upload {
+	return func(ctx context.Context, r io.Reader) (any, error) {
+		out, err := runUpload(ctx, clusters, own, r, link.Confirm, link.Client)
+		if out != nil {
+			out.Confirm = link.Confirm
+		}
+
+		return out, err
+	}
+}
+
+// offerUpload returns the link an upload is sent to, or, from a local hub,
+// the summary of the file it already read.
 func offerUpload(
-	clusters *kafkaclient.Registry,
-	own string,
+	ctx context.Context,
 	files *transfer.Hub,
 	base string,
 	upload *Upload,
@@ -319,24 +356,30 @@ func offerUpload(
 	if filename == "" {
 		filename = "messages.jsonl"
 	}
+	if err := transfer.CheckFilename(filename, files.Local()); err != nil {
+		return BatchOutput{}, fmt.Errorf("upload filename: %w", err)
+	}
 
-	ticket, err := files.Accept(base, filename, func(ctx context.Context, r io.Reader) (any, error) {
-		out, err := runUpload(ctx, clusters, own, r, confirm, client)
-		if out != nil {
-			out.Confirm = confirm
-		}
-
-		return out, err
-	})
+	ticket, err := files.Accept(ctx, base, linkKind, uploadLink{Confirm: confirm, Client: client}, filename)
 	if err != nil {
 		return BatchOutput{}, err
+	}
+
+	out := BatchOutput{Output: batch.Output[Output]{Results: []batch.Result[Output]{}}, Upload: &ticket}
+
+	// Over stdio the file was read already: its summary is the answer.
+	if sent, ok := ticket.Result.(*FileOutput); ok {
+		ticket.Result = nil
+		out.File = sent
+
+		return out, nil
 	}
 
 	if !confirm {
 		ticket.Note += " This link only checks the file and writes nothing; ask for one with confirm true to send it."
 	}
 
-	return BatchOutput{Output: batch.Output[Output]{Results: []batch.Result[Output]{}}, Upload: &ticket}, nil
+	return out, nil
 }
 
 // runItem previews or performs one write.

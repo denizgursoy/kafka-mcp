@@ -182,21 +182,30 @@ At least one cluster with a broker is required. `http.address` defaults to
 `:8090` and `http.base_path` to the HTTP root.
 
 The server never stores files. `search_messages` and `transform_messages` with
-`download`, and `produce_message` with `upload`, return a one-time link and a
-`curl` command that the agent runs on the user's own machine; the data streams
-between that machine and Kafka while the command runs. See
-[Files on the user's machine](#files-on-the-users-machine). Links are built on
-the address each request reached, honouring `X-Forwarded-Proto` and
-`X-Forwarded-Host`; set `http.public_url` when a proxy hides the real address.
-The old `output_dir` setting is refused at startup.
+`download`, and `produce_message` with `upload`, work with files on the user's
+own machine. See [Files on the user's machine](#files-on-the-users-machine).
+Over HTTP, set `http.link_key` (or `http.auth_token`) to the same value on
+every instance behind one address. Links are built on the address each request
+reached, honouring `X-Forwarded-Proto` and `X-Forwarded-Host`; set
+`http.public_url` when a proxy hides the real address. The old `output_dir`
+setting is refused at startup.
 
 ### Files on the user's machine
 
 Tools that save or send many messages work with files on the user's own
-machine, never on the server. A tool cannot write there itself: its result goes
-to the model, not to disk. So `search_messages` and `transform_messages` with
-`download`, and `produce_message` with `upload`, return a one-time link and a
-`curl` command, and the agent runs the command on the user's machine:
+machine, never on the server.
+
+**Over stdio** the server is a process the agent started on that machine, so
+`download` saves the file and `upload` reads it right away, relative to the
+process's working directory (usually the project) or at an absolute path. The
+response names the file in `download.path` or `upload.path`; a download writes
+to a hidden partial file and only then takes its name, and never replaces an
+existing file. Running the image over stdio needs the directory mounted, e.g.
+`docker run -i --rm -v "$PWD:/work" -w /work …`.
+
+**Over HTTP** a tool cannot write there itself: its result goes to the model,
+not to disk. So the tools return a link and a `curl` command, and the agent
+runs the command on the user's machine:
 
 ```sh
 curl -fsS -o 'orders.csv.part' 'https://kafka.example.com/mcp/prod/files/Q2x…' && mv 'orders.csv.part' 'orders.csv'
@@ -205,13 +214,28 @@ curl -fsS -T 'orders-fixed.jsonl' 'https://kafka.example.com/mcp/prod/files/Zk9�
 
 Nothing is prepared ahead and nothing is stored: the data streams between that
 machine and Kafka while the command runs, so the message bodies never pass
-through the model either. A link works once and expires after 10 minutes; a
-download's `status_url` reports how it ended. Links are served below the
-endpoint at `<endpoint path>/files/` and checked for origin like the endpoint.
-They need no bearer token, because the agent's `curl` does not carry the MCP
-client's headers: each link is its own 256-bit, single-use credential, like a
-presigned URL, so treat it as a secret until it is used. Over stdio there is no
-address to link to, and these modes are refused.
+through the model either.
+
+The link carries the request itself, sealed with AES-GCM under a key derived
+from `http.link_key`, or `http.auth_token` when that is unset. The server keeps
+nothing between handing a link out and its use, so **any instance** behind a
+load balancer can serve a link another made, as long as they share the key.
+Without either setting each process makes a random key and links open only
+where they were made. Sealing means a link shows nothing of its script in
+proxy logs, and cannot be changed or made up. When used, the request is checked
+again with that instance's policy: a cluster turned read-only refuses an upload
+made before.
+
+A link expires after 10 minutes. Treat it as a secret until then: it needs no
+bearer token, because the agent's `curl` does not carry the MCP client's
+headers, and it can be used more than once until it expires. Running an upload
+link twice sends the file twice. A failure before any data, such as a deleted
+topic, is an HTTP error with the reason, which `curl -f` reports; a failure
+after the first byte breaks the transfer, so `curl -f` fails instead of keeping
+a short file. Links are served below the endpoint at `<endpoint path>/files/`
+and checked for origin like the endpoint. A request too large to fit in a link
+(about 6 KiB sealed, e.g. a very long script) is refused when the link is
+made.
 
 `brokers` accepts either one address as a scalar or several addresses as a YAML
 list. Each address is passed to Kafka as a separate seed broker.
@@ -968,7 +992,7 @@ them client-side; the result reports what was covered.
 | `max_value_bytes` | int | no | Value bytes per match. Default 512, at most 1 MiB |
 | `timeout_seconds` | int | no | Wall-clock limit. Default 30, at most 3600 |
 | `count_only` | bool | no | Return counts only, no message bodies |
-| `download` | object | no | `{format, filename}`: a one-time link that streams every match to the user's machine as `jsonl` (default) or `csv` |
+| `download` | object | no | `{format, filename}`: saves every match on the user's machine as `jsonl` (default) or `csv`, through a link over HTTP |
 | `group_by` | string | no | Expression returning a bucket per match; counts per bucket |
 | `max_groups` | int | no | Largest buckets returned with `group_by`. Default 20, at most 1000 |
 
@@ -1063,7 +1087,7 @@ For large result sets, use `count_only` to learn how many matches exist, then
 #### Downloads
 
 `download` scans nothing yet. It checks the topic, the window and the script,
-then returns a one-time link and the command to run on the user's machine (see
+then returns a link and the command to run on the user's machine (see
 [Files on the user's machine](#files-on-the-users-machine)). The search runs
 while the link is fetched and streams every match into the file; a search cut
 short by `max_messages_scanned` or `timeout_seconds` breaks the transfer
@@ -1079,7 +1103,7 @@ instead of leaving a file that looks complete.
 {"topic": "orders-dlq", "matches": [], "stopped_reason": "not_started",
  "download": {"url": "https://kafka.example.com/mcp/prod/files/Q2x…", "method": "GET",
    "command": "curl -fsS -o 'orders.csv.part' 'https://…/files/Q2x…' && mv 'orders.csv.part' 'orders.csv'",
-   "status_url": "https://…/files/Q2x…/status", "expires_at": "2026-10-23T10:10:00Z", "note": "…"}}
+   "expires_at": "2026-10-23T10:10:00Z", "note": "…"}}
 ```
 
 The file is JSON lines, or CSV with `format: "csv"`. Both use
@@ -1718,7 +1742,7 @@ ever sent.
 | Parameter    | Type     | Required | Meaning                                                  |
 | ------------ | -------- | -------- | -------------------------------------------------------- |
 | `items`      | object[] | one of   | 1 to 500 messages to write                               |
-| `upload`     | object   | one of   | `{filename}`: a one-time link for a file on the user's machine |
+| `upload`     | object   | one of   | `{filename}`: sends a file on the user's machine, through a link over HTTP |
 | `confirm`    | bool     | no       | Default false: preview only, nothing is written          |
 
 Item fields:
@@ -1759,8 +1783,9 @@ key does not hash to, which breaks ordering for that key. The response warns
 whenever an explicit partition is used.
 
 `upload` sends any number of messages from a file on the user's machine, such
-as the one a `transform_messages` download saves. The call returns a one-time
-link and a `curl -T` command to run there (see
+as the one a `transform_messages` download saves. Over stdio the file is read
+right away; over HTTP the call returns a link and a `curl -T` command to run
+there (see
 [Files on the user's machine](#files-on-the-users-machine)). Each line is one
 item as JSON with the item fields above; a misspelt field is refused rather
 than ignored. The file is read as it uploads and never stored, and the command
@@ -1813,7 +1838,7 @@ such as a document that was wrapped in a field it should not be in:
 | `max_messages`        | int      | no       | Selected messages to process. Default 100000, at most 10000000       |
 | `timeout_seconds`     | int      | no       | Default 300, at most 3600                                            |
 | `max_value_bytes`     | int      | no       | Example value limit. The whole value is always written               |
-| `download`            | object   | no       | `{filename}`: a one-time link that saves the new messages on the user's machine as `produce_message` items |
+| `download`            | object   | no       | `{filename}`: saves the new messages on the user's machine as `produce_message` items, through a link over HTTP |
 | `confirm`             | bool     | no       | Default false: nothing is written to Kafka                           |
 
 The transform is JavaScript (ES2020: arrow functions, spread, destructuring,
@@ -1852,7 +1877,8 @@ ascending order. A run cut short by `max_messages` or the timeout reports
 `partitions` and `from_offset`. Writing is not atomic, and what was written
 before a stop stays.
 
-`download` returns a one-time link instead of running: the transform runs while
+`download` saves the new messages on the user's machine instead: over stdio at
+once, and over HTTP through a link, the transform running while
 the link is fetched and streams the new messages to the user's machine as
 `produce_message` items, so the set can be inspected and then sent with a
 `produce_message` `upload`. The first message is transformed before the link is

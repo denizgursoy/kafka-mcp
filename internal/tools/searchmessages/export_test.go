@@ -6,9 +6,11 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strings"
 	"testing"
 
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/stretchr/testify/suite"
 	"github.com/twmb/avro"
 	"github.com/twmb/franz-go/pkg/kgo"
@@ -71,7 +73,7 @@ func (s *ExportSuite) TearDownSuite() {
 func (s *ExportSuite) export(format string) []byte {
 	s.T().Helper()
 
-	files, base := testenv.Files(s.T())
+	files, base := s.files()
 	out, err := searchmessages.Run(s.T().Context(), s.env.Admin(), s.env.Reader(), files, base, searchmessages.Input{
 		Topic: s.topic, Direction: "oldest_first", Download: &searchmessages.Download{Format: format},
 	})
@@ -190,7 +192,7 @@ func (s *ExportSuite) TestCSVUsesKafkaConsoleColumns() {
 }
 
 func (s *ExportSuite) TestDownloadRunsOnlyWhenFetchedAndOnlyOnce() {
-	files, base := testenv.Files(s.T())
+	files, base := s.files()
 	out, err := searchmessages.Run(s.T().Context(), s.env.Admin(), s.env.Reader(), files, base, searchmessages.Input{
 		Topic: s.topic, Download: &searchmessages.Download{Format: "csv", Filename: "orders.csv"},
 	})
@@ -210,30 +212,38 @@ func (s *ExportSuite) TestDownloadRunsOnlyWhenFetchedAndOnlyOnce() {
 			"the file gets its name only once the download succeeded")
 	})
 
+	s.Run("the link shows nothing of the search", func() {
+		s.Require().NotContains(out.Download.URL, s.topic,
+			"a link carries the search sealed, so the topic and script never reach proxy logs")
+	})
+
 	body := testenv.Fetch(s.T(), *out.Download)
 	s.Require().True(strings.HasPrefix(string(body), "partition,offset,"), "the download must be the CSV asked for")
+	rows, err := csv.NewReader(strings.NewReader(string(body))).ReadAll()
+	s.Require().NoError(err, "the download must be valid CSV")
+	s.Require().Len(rows, 7, "every record of the topic must be in the file, after the header")
+}
 
-	s.Run("the status link reports the finished search", func() {
-		code, reply := testenv.Send(s.T(), transfer.Ticket{Method: http.MethodGet, URL: out.Download.StatusURL}, "")
-		s.Require().Equal(http.StatusOK, code, "the status of a used link must be readable")
-		var status struct {
-			State  string
-			Result searchmessages.Output
-		}
-		s.Require().NoError(json.Unmarshal(reply, &status), "the status must be JSON")
-		s.Require().Equal("done", status.State, "a finished download must report done")
-		s.Require().Equal(6, status.Result.WrittenMessages, "the status must count what the file holds")
-		s.Require().True(status.Result.Complete, "the whole range was read")
+func (s *ExportSuite) TestALinkOpensOnAnotherInstance() {
+	maker, makerBase := s.files()
+	out, err := searchmessages.Run(s.T().Context(), s.env.Admin(), s.env.Reader(), maker, makerBase, searchmessages.Input{
+		Topic: s.topic, Direction: "oldest_first", Download: &searchmessages.Download{},
 	})
+	s.Require().NoError(err, "asking for a download must succeed")
 
-	s.Run("a second fetch is refused", func() {
-		code, _ := testenv.Send(s.T(), transfer.Ticket{Method: http.MethodGet, URL: out.Download.URL}, "")
-		s.Require().Equal(http.StatusNotFound, code, "a link is a one-time credential")
-	})
+	// Another instance behind the same address: its own hub, the same key,
+	// the same tools, and nothing shared with the one that made the link.
+	_, otherBase := s.files()
+
+	moved := *out.Download
+	moved.URL = otherBase + strings.TrimPrefix(moved.URL, makerBase)
+	lines := strings.Split(strings.TrimSpace(string(testenv.Fetch(s.T(), moved))), "\n")
+	s.Require().Len(lines, 6,
+		"the link carries the search, so an instance that never saw it must still run it in full")
 }
 
 func (s *ExportSuite) TestADownloadCutShortFailsInsteadOfLookingComplete() {
-	files, base := testenv.Files(s.T())
+	files, base := s.files()
 	out, err := searchmessages.Run(s.T().Context(), s.env.Admin(), s.env.Reader(), files, base, searchmessages.Input{
 		Topic: s.topic, MaxScanned: 2, Download: &searchmessages.Download{},
 	})
@@ -246,14 +256,10 @@ func (s *ExportSuite) TestADownloadCutShortFailsInsteadOfLookingComplete() {
 	}
 	s.Require().Error(err,
 		"a download stopped by max_messages_scanned must break the transfer, so curl -f fails rather than keeping part of the topic")
-
-	code, reply := testenv.Send(s.T(), transfer.Ticket{Method: http.MethodGet, URL: out.Download.StatusURL}, "")
-	s.Require().Equal(http.StatusOK, code, "the status must explain the failure")
-	s.Require().Contains(string(reply), "incomplete", "the status must say the file is incomplete and why")
 }
 
 func (s *ExportSuite) TestDownloadMistakesAreReportedAtOnce() {
-	files, base := testenv.Files(s.T())
+	files, base := s.files()
 	run := func(input searchmessages.Input) error {
 		_, err := searchmessages.Run(s.T().Context(), s.env.Admin(), s.env.Reader(), files, base, input)
 		return err
@@ -275,10 +281,58 @@ func (s *ExportSuite) TestDownloadMistakesAreReportedAtOnce() {
 		s.Require().ErrorContains(run(searchmessages.Input{Topic: s.topic, Download: &searchmessages.Download{Filename: "../x.csv"}}),
 			"not a path", "the suggested command must save where the user is working")
 	})
-	s.Run("no HTTP transport", func() {
+	s.Run("no transfer set up", func() {
 		_, err := searchmessages.Run(s.T().Context(), s.env.Admin(), s.env.Reader(), nil, "", searchmessages.Input{
 			Topic: s.topic, Download: &searchmessages.Download{},
 		})
-		s.Require().ErrorContains(err, "HTTP transport", "over stdio there is no address for a link")
+		s.Require().ErrorContains(err, "not set up", "a server without a hub must say downloads are unavailable")
 	})
+}
+
+func (s *ExportSuite) TestOverStdioTheFileIsSavedRightAway() {
+	dir := s.T().TempDir()
+	files := transfer.NewLocalHub(dir)
+	searchmessages.Register(mcp.NewServer(&mcp.Implementation{Name: "stdio", Version: "test"}, nil), s.env.Admin(), s.env.Reader(), files)
+
+	out, err := searchmessages.Run(s.T().Context(), s.env.Admin(), s.env.Reader(), files, "", searchmessages.Input{
+		Topic: s.topic, Download: &searchmessages.Download{Format: "csv", Filename: "exports/orders.csv"},
+	})
+	s.Require().Error(err, "a directory that does not exist is the user's to create, not the server's")
+
+	out, err = searchmessages.Run(s.T().Context(), s.env.Admin(), s.env.Reader(), files, "", searchmessages.Input{
+		Topic: s.topic, Download: &searchmessages.Download{Format: "csv", Filename: "orders.csv"},
+	})
+	s.Require().NoError(err, "a download over stdio must save the file")
+	s.Require().Equal("local", out.Download.Method, "there is no link: the server is on the user's machine")
+	s.Require().Empty(out.Download.URL, "no link may be handed out over stdio")
+	s.Require().Equal(6, out.WrittenMessages, "the response must count what the file holds")
+	s.Require().True(out.Complete, "the whole range was read")
+
+	rows, err := csv.NewReader(strings.NewReader(string(s.read(out.Download.Path)))).ReadAll()
+	s.Require().NoError(err, "the saved file must be valid CSV")
+	s.Require().Len(rows, 7, "every record must be saved, after the header")
+
+	_, err = searchmessages.Run(s.T().Context(), s.env.Admin(), s.env.Reader(), files, "", searchmessages.Input{
+		Topic: s.topic, Download: &searchmessages.Download{Filename: "orders.csv"},
+	})
+	s.Require().ErrorContains(err, "already exists", "a file the user has must never be replaced")
+}
+
+func (s *ExportSuite) read(path string) []byte {
+	s.T().Helper()
+
+	body, err := os.ReadFile(path)
+	s.Require().NoError(err, "the saved file must be readable")
+
+	return body
+}
+
+// files is a hub with search_messages registered on it, as the server does.
+func (s *ExportSuite) files() (*transfer.Hub, string) {
+	s.T().Helper()
+
+	files, base := testenv.Files(s.T())
+	searchmessages.Register(mcp.NewServer(&mcp.Implementation{Name: "t", Version: "test"}, nil), s.env.Admin(), s.env.Reader(), files)
+
+	return files, base
 }

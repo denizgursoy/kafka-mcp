@@ -5,19 +5,30 @@
 // and transform_messages hand out downloads, and produce_message an upload.
 //
 // A tool cannot write to the caller's machine: an MCP result goes to the
-// model, not to a file. So a tool registers the work and returns a link, and
-// the caller's agent fetches it there, e.g. with curl. The work runs when the
-// link is used, streaming from Kafka into the response or from the request
-// into Kafka, so the server keeps nothing but the pending entry in memory.
+// model, not to a file. So a tool returns a link, and the caller's agent
+// fetches it there, e.g. with curl. The work runs when the link is used,
+// streaming from Kafka into the response or from the request into Kafka.
 //
-// A link works once and expires. Its token is 256 random bits, so it is a
-// bearer credential for that one transfer, like a presigned URL: an agent's
-// curl does not carry the MCP client's authorization header.
+// The link carries the work itself, sealed with AES-GCM: which tool, with
+// which arguments, until when. The server keeps nothing between handing a
+// link out and its use, so any instance behind a load balancer can open a
+// link another made, as long as they share the key. Sealing means a link can
+// be neither read, which would show its script in proxy logs, nor changed or
+// made up, which would run a search the caller was never offered.
+//
+// Over stdio the server runs on the caller's machine, so a local hub skips
+// the link and reads or writes the file there directly.
 package transfer
 
 import (
+	"bytes"
+	"compress/flate"
 	"context"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/hkdf"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -32,14 +43,13 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
-// TTL is how long an unused link stays valid, and how long the outcome of a
-// used one can be read. Long enough for an agent to run the command it was
-// given, short enough that a link seen later is useless.
+// TTL is how long a link stays valid. Long enough for an agent to run the
+// command it was given, short enough that a link seen later is useless.
 const TTL = 10 * time.Minute
 
-// maxPending bounds how many links may wait at once, so a caller that never
-// uses them cannot grow the server's memory without end.
-const maxPending = 256
+// maxLink bounds a link's length. Many proxies refuse request lines much
+// past 8 KiB, and a link that is refused there fails far from its cause.
+const maxLink = 6 << 10
 
 // BaseHeader carries the address a caller reached the server at from the
 // HTTP handler to the tools, which see request headers but not the request.
@@ -48,67 +58,122 @@ const BaseHeader = "X-Kafka-Mcp-Transfer-Base"
 
 // Download writes a file to w. It runs when the link is fetched, with the
 // request's context, so a client that hangs up stops the read. Its result is
-// what the status link reports afterwards.
+// returned to the tool when a local hub ran it; a link has nowhere to put it.
 type Download func(ctx context.Context, w io.Writer) (any, error)
 
 // Upload reads a file from r. It runs when the link receives the file, with
 // the request's context. Its result is returned to the uploader as JSON.
 type Upload func(ctx context.Context, r io.Reader) (any, error)
 
-// Ticket is a registered transfer as a caller sees it.
+// Opener turns a link's sealed arguments back into the work, re-checking
+// them as a fresh call would, because the endpoint's policy may have changed
+// since the link was made. It returns a Download or an Upload.
+type Opener func(ctx context.Context, args json.RawMessage) (any, error)
+
+// Ticket is a transfer as a caller sees it: a link to fetch, or, from a
+// local hub, the file that was already written or read.
 type Ticket struct {
-	URL       string    `json:"url"`
-	Method    string    `json:"method"`
-	Command   string    `json:"command"`
-	StatusURL string    `json:"status_url,omitempty"`
-	ExpiresAt time.Time `json:"expires_at"`
-	Note      string    `json:"note"`
-}
-
-type entry struct {
-	filename    string
-	contentType string
-	download    Download
-	upload      Upload
-	expires     time.Time
-}
-
-// Status is the outcome of a used download link.
-type Status struct {
-	State  string `json:"state"`
-	Error  string `json:"error,omitempty"`
+	URL       string     `json:"url,omitempty"`
+	Method    string     `json:"method"`
+	Command   string     `json:"command,omitempty"`
+	ExpiresAt *time.Time `json:"expires_at,omitempty"`
+	// Path is the file a local hub wrote or read.
+	Path string `json:"path,omitempty"`
+	// Result is what a local transfer returned; tools lift it into their
+	// own output.
 	Result any    `json:"result,omitempty"`
-
-	expires time.Time
+	Note   string `json:"note"`
 }
 
-// Hub holds the pending transfers of one server.
+// MethodLocal marks a ticket whose file was handled on this machine.
+const MethodLocal = "local"
+
+// sealed is what a link carries.
+type sealed struct {
+	// Kind names the Opener; Args are its arguments.
+	Kind string          `json:"k"`
+	Args json.RawMessage `json:"a"`
+	// Filename and ContentType shape a download's response.
+	Filename    string `json:"f,omitempty"`
+	ContentType string `json:"c,omitempty"`
+	Upload      bool   `json:"u,omitempty"`
+	// Expires is Unix seconds.
+	Expires int64 `json:"e"`
+}
+
+// Hub hands out and serves the links of one endpoint.
 type Hub struct {
 	path string
+	aead cipher.AEAD
+	// dir, when set, makes this a local hub: files are written and read
+	// there instead of through links.
+	dir string
 
-	mu      sync.Mutex
-	pending map[string]*entry
-	status  map[string]*Status
-	now     func() time.Time
+	mu      sync.RWMutex
+	openers map[string]Opener
+
+	now func() time.Time
 }
 
 // NewHub returns a hub whose links are served under path, e.g.
-// /kafka/mcp-files. Mount Handler at path + "/" and below.
-func NewHub(path string) *Hub {
-	return &Hub{
-		path:    strings.TrimRight(path, "/"),
-		pending: map[string]*entry{},
-		status:  map[string]*Status{},
-		now:     time.Now,
+// /kafka/mcp-files, sealed with a key derived from secret. Every instance
+// serving the same links must use the same secret; an empty one makes a
+// random key, so links work only on this process. Mount Handler at path + "/"
+// and below.
+func NewHub(path string, secret []byte) (*Hub, error) {
+	if len(secret) == 0 {
+		secret = make([]byte, 32)
+		if _, err := rand.Read(secret); err != nil {
+			return nil, fmt.Errorf("transfer: make a link key: %w", err)
+		}
 	}
+
+	path = strings.TrimRight(path, "/")
+	// The path is in the derivation, so a link made for one endpoint does
+	// not open on another that shares the secret.
+	key, err := hkdf.Key(sha256.New, secret, nil, "kafka-mcp transfer link "+path, 32)
+	if err != nil {
+		return nil, fmt.Errorf("transfer: derive the link key: %w", err)
+	}
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, fmt.Errorf("transfer: %w", err)
+	}
+	aead, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, fmt.Errorf("transfer: %w", err)
+	}
+
+	return &Hub{path: path, aead: aead, openers: map[string]Opener{}, now: time.Now}, nil
+}
+
+// NewLocalHub returns a hub for a server on the caller's own machine, such
+// as over stdio: downloads are saved in dir and uploads read from it.
+func NewLocalHub(dir string) *Hub {
+	return &Hub{dir: dir, openers: map[string]Opener{}, now: time.Now}
 }
 
 // Path is where the hub's links live.
 func (h *Hub) Path() string { return h.path }
 
-// ErrUnavailable is returned when the server has no way to hand out links,
-// such as over stdio.
-var ErrUnavailable = errors.New("file transfer needs the HTTP transport: over stdio the server has no address the caller can fetch a link from")
+// Local reports whether the hub handles files on this machine.
+func (h *Hub) Local() bool { return h != nil && h.dir != "" }
+
+// Register names the Opener a tool's links are opened with. A tool
+// registers once, when it is added to the server.
+func (h *Hub) Register(kind string, open Opener) {
+	if h == nil {
+		return
+	}
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	h.openers[kind] = open
+}
+
+// ErrUnavailable is returned when the server has no way to hand out links.
+var ErrUnavailable = errors.New("file transfer is not set up for this server: it needs the HTTP transport, or stdio on the user's own machine")
 
 // Base returns the address the caller reached the server at, as stamped by
 // Middleware, or "" when it is unknown.
@@ -157,31 +222,41 @@ func first(list string) string {
 	return strings.TrimSpace(value)
 }
 
-// Offer registers a download and returns its ticket. base is Base(req).
-// filename is the name the command saves to on the caller's machine.
-func (h *Hub) Offer(base string, filename string, contentType string, download Download) (Ticket, error) {
-	ticket, err := h.add(base, &entry{filename: filename, contentType: contentType, download: download})
+// Offer returns a download link for kind's work with args. base is
+// Base(req); filename is the name the command saves to on the caller's
+// machine. A local hub opens and runs the work now, with ctx, and saves the
+// file itself.
+func (h *Hub) Offer(ctx context.Context, base, kind string, args any, filename, contentType string) (Ticket, error) {
+	if h.Local() {
+		return h.saveNow(ctx, kind, args, filename)
+	}
+
+	ticket, err := h.seal(base, kind, args, sealed{Filename: filename, ContentType: contentType})
 	if err != nil {
 		return Ticket{}, err
 	}
 
 	partial := shellQuote(filename + ".part")
 	ticket.Method = http.MethodGet
-	ticket.StatusURL = ticket.URL + "/status"
 	// Saving to .part and renaming keeps a cut-short download from looking
 	// like a finished file.
 	ticket.Command = "curl -fsS -o " + partial + " " + shellQuote(ticket.URL) + " && mv " + partial + " " + shellQuote(filename)
 	ticket.Note = "Run the command on the user's machine, in the directory the user wants the file in. " +
 		"The data is read from Kafka while it downloads and is never stored on the server. " +
-		"The link works once and expires at expires_at. If the command fails, fetch status_url for the reason."
+		"The link expires at expires_at; treat it as a secret until then. If curl fails, its output says why."
 
 	return ticket, nil
 }
 
-// Accept registers an upload and returns its ticket. filename names the
-// caller's file in the suggested command.
-func (h *Hub) Accept(base string, filename string, upload Upload) (Ticket, error) {
-	ticket, err := h.add(base, &entry{filename: filename, upload: upload})
+// Accept returns an upload link for kind's work with args. filename names
+// the caller's file in the suggested command. A local hub opens the work and
+// reads the file now, with ctx.
+func (h *Hub) Accept(ctx context.Context, base, kind string, args any, filename string) (Ticket, error) {
+	if h.Local() {
+		return h.readNow(ctx, kind, args, filename)
+	}
+
+	ticket, err := h.seal(base, kind, args, sealed{Filename: filename, Upload: true})
 	if err != nil {
 		return Ticket{}, err
 	}
@@ -190,152 +265,219 @@ func (h *Hub) Accept(base string, filename string, upload Upload) (Ticket, error
 	ticket.Command = "curl -fsS -T " + shellQuote(filename) + " " + shellQuote(ticket.URL)
 	ticket.Note = "Run the command on the user's machine, where the file is. " +
 		"The file is read as it uploads and is never stored on the server; the command prints the result. " +
-		"The link works once and expires at expires_at."
+		"The link expires at expires_at; treat it as a secret until then, and run it once: each use sends the file again."
 
 	return ticket, nil
 }
 
-func (h *Hub) add(base string, e *entry) (Ticket, error) {
-	if h == nil || base == "" {
+func (h *Hub) seal(base, kind string, args any, s sealed) (Ticket, error) {
+	if h == nil || h.aead == nil || base == "" {
 		return Ticket{}, ErrUnavailable
 	}
 
-	raw := make([]byte, 32)
-	if _, err := rand.Read(raw); err != nil {
-		return Ticket{}, fmt.Errorf("create a link: %w", err)
-	}
-	token := base64.RawURLEncoding.EncodeToString(raw)
-
-	h.mu.Lock()
-	defer h.mu.Unlock()
-
-	now := h.now()
-	h.sweep(now)
-	if len(h.pending) >= maxPending {
-		return Ticket{}, fmt.Errorf("%d links are already waiting to be used; use them or let them expire (%s) first", maxPending, TTL)
+	// A link nobody here can open would only fail later, as a curl error.
+	h.mu.RLock()
+	_, known := h.openers[kind]
+	h.mu.RUnlock()
+	if !known {
+		return Ticket{}, fmt.Errorf("transfer: %s links are not registered on this hub", kind)
 	}
 
-	e.expires = now.Add(TTL)
-	h.pending[token] = e
-
-	return Ticket{URL: strings.TrimRight(base, "/") + h.path + "/" + token, ExpiresAt: e.expires.UTC()}, nil
-}
-
-// sweep drops expired links and outcomes. The caller holds h.mu.
-func (h *Hub) sweep(now time.Time) {
-	for token, e := range h.pending {
-		if !now.Before(e.expires) {
-			delete(h.pending, token)
-		}
-	}
-	for token, s := range h.status {
-		if !now.Before(s.expires) {
-			delete(h.status, token)
-		}
-	}
-}
-
-// claim removes the transfer for token if method may use it, so a link works
-// once and a wrong method does not spend it.
-func (h *Hub) claim(token string, method string) (*entry, int, string) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-
-	h.sweep(h.now())
-
-	e := h.pending[token]
-	switch {
-	case e == nil:
-		return nil, http.StatusNotFound, "this link is unknown, already used or expired: ask for a new one"
-	case e.download != nil && method != http.MethodGet:
-		return nil, http.StatusMethodNotAllowed, "this link is a download: use GET"
-	case e.upload != nil && method != http.MethodPut && method != http.MethodPost:
-		return nil, http.StatusMethodNotAllowed, "this link takes an upload: send the file with PUT, e.g. curl -T"
-	}
-
-	delete(h.pending, token)
-	if e.download != nil {
-		h.status[token] = &Status{State: "running", expires: h.now().Add(TTL)}
-	}
-
-	return e, 0, ""
-}
-
-func (h *Hub) finish(token string, result any, err error) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-
-	s := &Status{State: "done", Result: result, expires: h.now().Add(TTL)}
+	raw, err := json.Marshal(args)
 	if err != nil {
-		s.State, s.Error = "failed", err.Error()
+		return Ticket{}, fmt.Errorf("transfer: encode the link: %w", err)
 	}
-	h.status[token] = s
+
+	expires := h.now().Add(TTL).UTC().Truncate(time.Second)
+	s.Kind, s.Args, s.Expires = kind, raw, expires.Unix()
+
+	plain, err := json.Marshal(s)
+	if err != nil {
+		return Ticket{}, fmt.Errorf("transfer: encode the link: %w", err)
+	}
+
+	var packed bytes.Buffer
+	zw, _ := flate.NewWriter(&packed, flate.BestCompression)
+	_, _ = zw.Write(plain)
+	_ = zw.Close()
+
+	nonce := make([]byte, h.aead.NonceSize())
+	if _, err := rand.Read(nonce); err != nil {
+		return Ticket{}, fmt.Errorf("transfer: make a link: %w", err)
+	}
+	box := h.aead.Seal(nonce, nonce, packed.Bytes(), nil)
+
+	link := strings.TrimRight(base, "/") + h.path + "/" + base64.RawURLEncoding.EncodeToString(box)
+	if len(link) > maxLink {
+		return Ticket{}, fmt.Errorf("the request is too large to fit in a link (%d bytes, at most %d): shorten the script or transform", len(link), maxLink)
+	}
+
+	return Ticket{URL: link, ExpiresAt: &expires}, nil
 }
 
-// Handler serves the links: GET for downloads, PUT or POST for uploads, and
-// GET <link>/status for how a download ended.
+// open reads a link back. It fails alike for a link that is malformed,
+// forged, sealed with another key or for another endpoint, so a caller
+// learns nothing about why.
+func (h *Hub) open(token string) (*sealed, error) {
+	box, err := base64.RawURLEncoding.DecodeString(token)
+	if err != nil || len(box) < h.aead.NonceSize() {
+		return nil, errBadLink
+	}
+
+	packed, err := h.aead.Open(nil, box[:h.aead.NonceSize()], box[h.aead.NonceSize():], nil)
+	if err != nil {
+		return nil, errBadLink
+	}
+
+	plain, err := io.ReadAll(io.LimitReader(flate.NewReader(bytes.NewReader(packed)), 1<<20))
+	if err != nil {
+		return nil, errBadLink
+	}
+
+	var s sealed
+	if err := json.Unmarshal(plain, &s); err != nil {
+		return nil, errBadLink
+	}
+
+	if !h.now().Before(time.Unix(s.Expires, 0)) {
+		return nil, errExpired
+	}
+
+	return &s, nil
+}
+
+var (
+	errBadLink = errors.New("this link is not valid here: ask for a new one")
+	errExpired = errors.New("this link has expired: ask for a new one")
+)
+
+// work resolves what a link runs.
+func (h *Hub) work(ctx context.Context, kind string, args json.RawMessage) (any, error) {
+	h.mu.RLock()
+	open := h.openers[kind]
+	h.mu.RUnlock()
+
+	if open == nil {
+		return nil, fmt.Errorf("this server does not offer %s links", kind)
+	}
+
+	return open(ctx, args)
+}
+
+// Handler serves the links: GET for downloads, PUT or POST for uploads.
 func (h *Hub) Handler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Cache-Control", "no-store")
 		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("Referrer-Policy", "no-referrer")
 
-		rest, ok := strings.CutPrefix(r.URL.Path, h.path+"/")
-		token, sub, _ := strings.Cut(rest, "/")
-		if !ok || token == "" {
+		token, ok := strings.CutPrefix(r.URL.Path, h.path+"/")
+		if !ok || token == "" || strings.Contains(token, "/") || h.aead == nil {
 			http.NotFound(w, r)
 			return
 		}
 
-		if sub == "status" && r.Method == http.MethodGet {
-			h.mu.Lock()
-			h.sweep(h.now())
-			status := h.status[token]
-			h.mu.Unlock()
-			if status == nil {
-				http.Error(w, "no download has used this link, or its outcome expired", http.StatusNotFound)
+		link, err := h.open(token)
+		if err != nil {
+			code := http.StatusNotFound
+			if errors.Is(err, errExpired) {
+				code = http.StatusGone
+			}
+			http.Error(w, err.Error(), code)
+			return
+		}
+
+		switch {
+		case !link.Upload && r.Method != http.MethodGet:
+			w.Header().Set("Allow", http.MethodGet)
+			http.Error(w, "this link is a download: use GET", http.StatusMethodNotAllowed)
+			return
+		case link.Upload && r.Method != http.MethodPut && r.Method != http.MethodPost:
+			w.Header().Set("Allow", "PUT, POST")
+			http.Error(w, "this link takes an upload: send the file with PUT, e.g. curl -T", http.StatusMethodNotAllowed)
+			return
+		}
+
+		// The policy is checked again now, so a link made before an
+		// endpoint turned read-only cannot write after it.
+		work, err := h.work(r.Context(), link.Kind, link.Args)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusUnprocessableEntity)
+			return
+		}
+
+		switch run := work.(type) {
+		case Download:
+			if link.Upload {
+				http.Error(w, "this link takes an upload", http.StatusMethodNotAllowed)
 				return
 			}
+			serveDownload(w, r, link, run)
+		case Upload:
+			if !link.Upload {
+				http.Error(w, "this link is a download: use GET", http.StatusMethodNotAllowed)
+				return
+			}
+			result, err := run(r.Context(), r.Body)
 			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode(status)
-			return
-		}
-		if sub != "" {
-			http.NotFound(w, r)
-			return
-		}
-
-		e, code, message := h.claim(token, r.Method)
-		if e == nil {
-			if code == http.StatusMethodNotAllowed {
-				w.Header().Set("Allow", "GET, PUT, POST")
-			}
-			http.Error(w, message, code)
-			return
-		}
-
-		if e.download != nil {
-			w.Header().Set("Content-Type", e.contentType)
-			w.Header().Set("Content-Disposition", "attachment; filename*=UTF-8''"+url.PathEscape(e.filename))
-			result, err := e.download(r.Context(), w)
-			h.finish(token, result, err)
 			if err != nil {
-				// Headers go out with the first byte, so a failure after that
-				// can only cut the body short. Aborting the connection makes
-				// the client report an error instead of keeping the file.
-				panic(http.ErrAbortHandler)
+				w.WriteHeader(http.StatusUnprocessableEntity)
+				_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+				return
 			}
-			return
+			_ = json.NewEncoder(w).Encode(result)
+		default:
+			http.Error(w, "this link has no work to run", http.StatusInternalServerError)
 		}
-
-		result, err := e.upload(r.Context(), r.Body)
-		w.Header().Set("Content-Type", "application/json")
-		if err != nil {
-			w.WriteHeader(http.StatusUnprocessableEntity)
-			_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
-			return
-		}
-		_ = json.NewEncoder(w).Encode(result)
 	})
+}
+
+// serveDownload holds the status until the first byte, so a failure before
+// any data, the common case of a bad topic or a refused policy, is a plain
+// HTTP error curl -f reports with its reason. After the first byte a failure
+// can only break the connection, which curl -f reports too.
+func serveDownload(w http.ResponseWriter, r *http.Request, link *sealed, run Download) {
+	out := &lazyWriter{w: w, start: func() {
+		w.Header().Set("Content-Type", link.ContentType)
+		w.Header().Set("Content-Disposition", "attachment; filename*=UTF-8''"+url.PathEscape(link.Filename))
+		w.WriteHeader(http.StatusOK)
+	}}
+
+	_, err := run(r.Context(), out)
+	if err == nil {
+		out.begin()
+		return
+	}
+
+	if !out.started {
+		http.Error(w, err.Error(), http.StatusUnprocessableEntity)
+		return
+	}
+
+	panic(http.ErrAbortHandler)
+}
+
+// lazyWriter writes the response head with its first byte.
+type lazyWriter struct {
+	w       http.ResponseWriter
+	start   func()
+	started bool
+}
+
+func (l *lazyWriter) begin() {
+	if !l.started {
+		l.started = true
+		l.start()
+	}
+}
+
+func (l *lazyWriter) Write(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	l.begin()
+
+	return l.w.Write(p)
 }
 
 // shellQuote quotes s for a POSIX shell.

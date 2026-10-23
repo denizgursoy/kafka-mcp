@@ -103,7 +103,9 @@ type Options struct {
 }
 
 // Files is where one endpoint's download and upload links are served. Files
-// pass straight between the caller and Kafka and are never stored.
+// pass straight between the caller and Kafka and are never stored. A link
+// carries the request it runs, sealed with a key, so any instance sharing
+// the key can serve a link another made.
 type Files struct{ hub *transfer.Hub }
 
 // FilesPath is where an endpoint at path serves its links, e.g. /mcp/prod
@@ -111,15 +113,29 @@ type Files struct{ hub *transfer.Hub }
 func FilesPath(path string) string { return strings.TrimRight(path, "/") + tools.FilesPath }
 
 // NewFiles returns the links for an endpoint served at path, the path the
-// host routes, including any base path.
-func NewFiles(path string) *Files { return &Files{hub: transfer.NewHub(FilesPath(path))} }
+// host routes, including any base path. Every instance behind one address
+// must pass the same key; an empty one makes a random key, so links open
+// only on this process.
+func NewFiles(path string, key []byte) (*Files, error) {
+	hub, err := transfer.NewHub(FilesPath(path), key)
+	if err != nil {
+		return nil, err
+	}
+
+	return &Files{hub: hub}, nil
+}
+
+// NewLocalFiles saves downloads in dir and reads uploads from it, for a host
+// running on the user's own machine, such as over stdio. It serves no links.
+func NewLocalFiles(dir string) *Files { return &Files{hub: transfer.NewLocalHub(dir)} }
 
 // Path is where Handler must be mounted, with everything below it.
 func (f *Files) Path() string { return f.hub.Path() }
 
 // Handler serves the links. Mount it at Path() and below, behind the same
-// authentication and origin checks as the MCP endpoint. A link carries its
-// own one-time token; the agent's command fetching it does not carry the MCP
+// authentication and origin checks as the MCP endpoint, but without the
+// bearer token: a link is sealed and expires; the agent's command fetching
+// it does not carry the MCP
 // client's headers.
 func (f *Files) Handler() http.Handler { return f.hub.Handler() }
 

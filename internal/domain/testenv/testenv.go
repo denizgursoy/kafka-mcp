@@ -1074,10 +1074,15 @@ func (e *Environment) TruncateBefore(t *testing.T, topic string, partition int32
 // Files serves a transfer hub the way the HTTP server does, so a test fetches
 // a download or sends an upload as the caller's curl would. It returns the hub
 // and the base address to pass as a tool's base; the server stops when t ends.
+// Every hub it makes shares one key, as the instances behind one address do,
+// so a link made on one opens on another.
 func Files(t *testing.T) (*transfer.Hub, string) {
 	t.Helper()
 
-	hub := transfer.NewHub("/mcp/test/files")
+	hub, err := transfer.NewHub("/mcp/test/files", []byte("testenv link key"))
+	if err != nil {
+		t.Fatalf("create the transfer hub: %v", err)
+	}
 	mux := http.NewServeMux()
 	mux.Handle(hub.Path()+"/", hub.Handler())
 	server := httptest.NewServer(mux)

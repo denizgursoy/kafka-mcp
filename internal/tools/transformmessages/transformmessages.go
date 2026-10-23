@@ -192,13 +192,32 @@ messages written before a timeout or failure stay. complete, stopped_reason and
 scanned_ranges say how far the run got; resume with partitions and from_offset.
 `
 
-// Register adds the transform_messages tool to the MCP server.
+// linkKind names transform_messages downloads in a link.
+const linkKind = "transform_messages"
+
+// downloadLink is what a download link carries.
+type downloadLink struct {
+	Input  Input  `json:"input"`
+	Client string `json:"client,omitempty"`
+}
+
+// Register adds the transform_messages tool to the MCP server, and opens
+// its download links on files.
 func Register(
 	server *mcp.Server,
 	clusters *kafkaclient.Registry,
 	own string,
 	files *transfer.Hub,
 ) {
+	files.Register(linkKind, func(ctx context.Context, args json.RawMessage) (any, error) {
+		var link downloadLink
+		if err := json.Unmarshal(args, &link); err != nil {
+			return nil, fmt.Errorf("read the link: %w", err)
+		}
+
+		return downloadWork(ctx, clusters, own, link.Input, link.Client)
+	})
+
 	mcp.AddTool(
 		server,
 		&mcp.Tool{
@@ -228,8 +247,10 @@ func Register(
 }
 
 // Run transforms the messages of a topic and, with confirm, writes the
-// results. With download it runs nothing yet and returns a link from files
-// whose fetch runs it; base is the address the caller reached the server at.
+// results. With download it runs nothing yet and returns a link whose fetch
+// runs it; the link carries the request, so any instance sharing files' key
+// can serve it. base is the address the caller reached the server at. A
+// local hub, over stdio, runs it now and saves the file.
 func Run(
 	ctx context.Context,
 	clusters *kafkaclient.Registry,
@@ -256,24 +277,6 @@ func run(
 		return transform(ctx, clusters, own, input, client, nil)
 	}
 
-	if input.Confirm {
-		return Output{}, fmt.Errorf(
-			"download and confirm cannot be combined: a download saves the new messages to a file for the user to inspect, and sending them is a separate produce_message upload")
-	}
-
-	// A dry run of one message checks everything the download would need,
-	// so a mistake is reported now rather than as a failed curl.
-	check := input
-	check.MaxMessages = 1
-	check.TimeoutSeconds = 0
-	tried, err := transform(ctx, clusters, own, check, client, io.Discard)
-	if err != nil {
-		return Output{}, err
-	}
-	if len(tried.Errors) > 0 {
-		return Output{}, fmt.Errorf("the first message to transform fails: %s; fix the transform before downloading", tried.Errors[0].Reason)
-	}
-
 	filename := strings.TrimSpace(input.Download.Filename)
 	if filename == "" {
 		destination := input.DestinationTopic
@@ -282,29 +285,29 @@ func run(
 		}
 		filename = destination + ".jsonl"
 	}
-	if strings.ContainsAny(filename, "/\\\x00") || filename == "." || filename == ".." {
-		return Output{}, fmt.Errorf("download filename %q must be a file name, not a path", input.Download.Filename)
+	if err := transfer.CheckFilename(filename, files.Local()); err != nil {
+		return Output{}, fmt.Errorf("download filename: %w", err)
 	}
 
-	ticket, err := files.Offer(base, filename, "application/x-ndjson", func(ctx context.Context, w io.Writer) (any, error) {
-		out, err := transform(ctx, clusters, own, input, client, w)
-		if err != nil {
-			return nil, err
-		}
+	// Checked now, so a mistake is reported to the caller rather than as a
+	// failed curl, and checked again when the link is used.
+	if _, err := downloadWork(ctx, clusters, own, input, client); err != nil {
+		return Output{}, err
+	}
 
-		// A saved set is meant to be sent as a whole, so one cut short is a
-		// failure rather than a smaller file that looks complete.
-		if !out.Complete || out.Failed > 0 {
-			return out, fmt.Errorf(
-				"the transform did not finish cleanly (%s, %d failed) after saving %d messages, so the file is incomplete: "+
-					"fix the failures or raise the limits, and ask for a new link",
-				out.StoppedReason, out.Failed, out.FileWritten)
-		}
-
-		return out, nil
-	})
+	ticket, err := files.Offer(ctx, base, linkKind, downloadLink{Input: input, Client: client}, filename, "application/x-ndjson")
 	if err != nil {
 		return Output{}, err
+	}
+
+	// Over stdio the transform already ran and saved the file.
+	if done, ok := ticket.Result.(Output); ok {
+		ticket.Result = nil
+		done.Download = &ticket
+		done.Note = "saved " + strconv.Itoa(done.FileWritten) + " message(s) to " + ticket.Path +
+			" as produce_message items, and wrote nothing to Kafka."
+
+		return done, nil
 	}
 
 	return Output{
@@ -318,6 +321,49 @@ func run(
 		StoppedReason:      reasonNotStarted,
 		Download:           &ticket,
 		Note:               "nothing has run yet: the transform runs when the download link is fetched, and writes nothing to Kafka.",
+	}, nil
+}
+
+// downloadWork checks a transform with download and returns the work its
+// link runs. A dry run of one message checks everything the download needs,
+// and runs both when the link is made and when it is used.
+func downloadWork(ctx context.Context, clusters *kafkaclient.Registry, own string, input Input, client string) (transfer.Download, error) {
+	if input.Download == nil {
+		return nil, fmt.Errorf("the link is not a download")
+	}
+
+	if input.Confirm {
+		return nil, fmt.Errorf(
+			"download and confirm cannot be combined: a download saves the new messages to a file for the user to inspect, and sending them is a separate produce_message upload")
+	}
+
+	check := input
+	check.MaxMessages = 1
+	check.TimeoutSeconds = 0
+	tried, err := transform(ctx, clusters, own, check, client, io.Discard)
+	if err != nil {
+		return nil, err
+	}
+	if len(tried.Errors) > 0 {
+		return nil, fmt.Errorf("the first message to transform fails: %s; fix the transform before downloading", tried.Errors[0].Reason)
+	}
+
+	return func(ctx context.Context, w io.Writer) (any, error) {
+		out, err := transform(ctx, clusters, own, input, client, w)
+		if err != nil {
+			return nil, err
+		}
+
+		// A saved set is meant to be sent as a whole, so one cut short is a
+		// failure rather than a smaller file that looks complete.
+		if !out.Complete || out.Failed > 0 {
+			return nil, fmt.Errorf(
+				"the transform did not finish cleanly (%s, %d failed) after saving %d messages, so the file is incomplete: "+
+					"fix the failures or raise the limits, and ask for a new link",
+				out.StoppedReason, out.Failed, out.FileWritten)
+		}
+
+		return out, nil
 	}, nil
 }
 

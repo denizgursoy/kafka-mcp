@@ -6,9 +6,11 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"net/http"
+	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/stretchr/testify/suite"
 	"github.com/twmb/avro"
 	"github.com/twmb/franz-go/pkg/kgo"
@@ -73,6 +75,7 @@ func (s *TransformMessagesSuite) run(registry *kafkaclient.Registry, input trans
 	s.T().Helper()
 
 	files, base := testenv.Files(s.T())
+	transformmessages.Register(mcp.NewServer(&mcp.Implementation{Name: "t", Version: "test"}, nil), registry, "here", files)
 
 	return transformmessages.Run(s.T().Context(), registry, "here", files, base, input)
 }
@@ -453,17 +456,9 @@ func (s *TransformMessagesSuite) TestDownloadIsSentWithAProduceMessageUpload() {
 		s.Require().Equal(3, lines, "every transformed message must be one line")
 	})
 
-	s.Run("the link works once", func() {
-		_, status := s.status(*out.Download)
-		s.Require().Equal("done", status["state"], "a finished download must report done at its status link")
-
-		code, _ := testenv.Send(s.T(), transfer.Ticket{Method: http.MethodGet, URL: out.Download.URL}, "")
-		s.Require().Equal(http.StatusNotFound, code,
-			"a link is a one-time credential, so a second fetch must be refused")
-	})
-
 	s.Run("produce_message sends the file from an upload", func() {
 		files, base := testenv.Files(s.T())
+		producemessage.Register(mcp.NewServer(&mcp.Implementation{Name: "t", Version: "test"}, nil), registry, "here", files)
 		offered, err := producemessage.Run(s.T().Context(), registry, "here", files, base, producemessage.Input{
 			Upload:  &producemessage.Upload{Filename: "repaired.jsonl"},
 			Confirm: true,
@@ -523,14 +518,34 @@ func (s *TransformMessagesSuite) TestDownloadRefusesConfirmAndReportsMistakesAtO
 	})
 }
 
-func (s *TransformMessagesSuite) status(ticket transfer.Ticket) (int, map[string]any) {
-	s.T().Helper()
+func (s *TransformMessagesSuite) TestOverStdioTheRepairIsSavedAndSentLocally() {
+	source := s.env.CreateTopic(s.T(), "transform-stdio-src")
+	destination := s.env.CreateTopic(s.T(), "transform-stdio-dst")
+	s.wrapped(source)
+	registry := s.clusters(false, false)
 
-	code, body := testenv.Send(s.T(), transfer.Ticket{Method: http.MethodGet, URL: ticket.StatusURL}, "")
-	var status map[string]any
-	s.Require().NoError(json.Unmarshal(body, &status), "the status link must answer JSON: %s", body)
+	dir := s.T().TempDir()
+	files := transfer.NewLocalHub(dir)
+	server := mcp.NewServer(&mcp.Implementation{Name: "stdio", Version: "test"}, nil)
+	transformmessages.Register(server, registry, "here", files)
+	producemessage.Register(server, registry, "here", files)
 
-	return code, status
+	saved, err := transformmessages.Run(s.T().Context(), registry, "here", files, "", transformmessages.Input{
+		Topic: source, Transform: `return { value: value.payload }`, DestinationTopic: destination,
+		Download: &transformmessages.Download{Filename: "repaired.jsonl"},
+	})
+	s.Require().NoError(err, "saving the repair over stdio must succeed")
+	s.Require().Equal(filepath.Join(dir, "repaired.jsonl"), saved.Download.Path, "the repair must be saved in the working directory")
+	s.Require().Equal(3, saved.FileWritten, "every transformed message must be saved")
+	s.Require().Zero(s.endOffsetOn(s.env, destination), "saving must write nothing to Kafka")
+
+	sent, err := producemessage.Run(s.T().Context(), registry, "here", files, "", producemessage.Input{
+		Upload: &producemessage.Upload{Filename: "repaired.jsonl"}, Confirm: true,
+	})
+	s.Require().NoError(err, "sending the saved repair over stdio must succeed")
+	s.Require().NotNil(sent.File, "the response must carry the upload's summary, as no command runs later")
+	s.Require().Equal(3, sent.File.Written, "every saved line must be written")
+	s.Require().Len(s.readAllOn(s.env, destination), 3, "the destination must hold exactly the saved messages")
 }
 
 func (s *TransformMessagesSuite) TestStopsAtMaxMessages() {

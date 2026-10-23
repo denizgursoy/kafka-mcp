@@ -22,6 +22,7 @@ export const configSections = [
       ['address', 'string', ':8090', 'Listen address'],
       ['base_path', 'string', '/', 'Prefix for every endpoint path and /healthz, e.g. /kafka-mcp'],
       ['auth_token', 'string', '', 'Require Authorization: Bearer <token> on every MCP request. Set with KAFKA_MCP_HTTP_AUTH_TOKEN or "{env:VAR}". /healthz is exempt'],
+      ['link_key', 'string', 'auth_token', 'Seals download and upload links. Set the same value on every instance behind one address, so a link made on one opens on another. Accepts "{env:VAR}"'],
       ['public_url', 'string', 'the address each request reached', 'Address download and upload links are built on, e.g. https://kafka.example.com, when a reverse proxy hides it'],
       ['cors.allow_origins', 'string[]', '[]', 'Origins a browser client may call from. Requests from any other origin get 403. ["*"] allows every page. Env: KAFKA_MCP_HTTP_CORS_ALLOW_ORIGINS, comma-separated'],
       ['cors.allow_methods', 'string[]', 'GET POST DELETE OPTIONS', 'All four are needed by the MCP transport'],
