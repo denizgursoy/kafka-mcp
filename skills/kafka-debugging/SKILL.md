@@ -95,7 +95,7 @@ single-target form, so one operation is an array of length one and several are
 the same call with more entries. Never make one call per topic when one call
 can carry them all. The exceptions are tools whose one call is already a scan
 or a filter: `search_messages` and `transform_messages` take `topic` at the top
-level, `produce_message` can take an `input_file` instead of `items`, and
+level, `produce_message` can take an `upload` instead of `items`, and
 `list_consumer_groups` takes an optional `topic` filter. Check a tool's schema
 rather than assuming.
 

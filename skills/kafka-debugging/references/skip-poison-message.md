@@ -117,9 +117,11 @@ to choose**:
   dead letter topic is on a cluster with a different Schema Registry, the
   preview warns about the schema id; set `translate_schema` so the copy stays
   decodable there.
-- **`search_messages` with `output_file`** — writes the messages as JSON lines
-  on the server. Best for several messages at once, or for inspecting them
-  outside Kafka. Nothing needs to exist first.
+- **`search_messages` with `download`** — saves the messages to a file on the
+  user's machine as JSON lines, or CSV with `format: "csv"`, through a
+  one-time link the agent fetches there. Best for several messages at once, or
+  for inspecting them outside Kafka. Nothing needs to exist first, and nothing
+  is stored on the server.
 - **Show it in the conversation** — best for a single small message the user
   will handle themselves. It is lost when the session ends.
 

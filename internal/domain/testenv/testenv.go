@@ -24,7 +24,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"sort"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -43,6 +47,7 @@ import (
 	"github.com/denizgursoy/kafka-mcp/internal/domain/kafkaclient"
 	"github.com/denizgursoy/kafka-mcp/internal/domain/records"
 	"github.com/denizgursoy/kafka-mcp/internal/domain/serde"
+	"github.com/denizgursoy/kafka-mcp/internal/domain/transfer"
 )
 
 const (
@@ -1064,4 +1069,71 @@ func (e *Environment) TruncateBefore(t *testing.T, topic string, partition int32
 	if err := responses.Error(); err != nil {
 		t.Fatalf("delete records in %s/%d before %d: %v", topic, partition, offset, err)
 	}
+}
+
+// Files serves a transfer hub the way the HTTP server does, so a test fetches
+// a download or sends an upload as the caller's curl would. It returns the hub
+// and the base address to pass as a tool's base; the server stops when t ends.
+func Files(t *testing.T) (*transfer.Hub, string) {
+	t.Helper()
+
+	hub := transfer.NewHub("/mcp/test/files")
+	mux := http.NewServeMux()
+	mux.Handle(hub.Path()+"/", hub.Handler())
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	return hub, server.URL
+}
+
+// Fetch downloads a link and returns its body. A download that fails part way
+// aborts the connection, and Fetch fails the test then, as curl -f would.
+func Fetch(t *testing.T, ticket transfer.Ticket) []byte {
+	t.Helper()
+
+	request, err := http.NewRequestWithContext(t.Context(), ticket.Method, ticket.URL, nil)
+	if err != nil {
+		t.Fatalf("build the download request: %v", err)
+	}
+
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatalf("fetch %s: %v", ticket.URL, err)
+	}
+	defer response.Body.Close()
+
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatalf("read the download from %s: %v", ticket.URL, err)
+	}
+
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("fetch %s: %s: %s", ticket.URL, response.Status, body)
+	}
+
+	return body
+}
+
+// Send uploads body to a link the way curl -T does and returns the status and
+// the response.
+func Send(t *testing.T, ticket transfer.Ticket, body string) (int, []byte) {
+	t.Helper()
+
+	request, err := http.NewRequestWithContext(t.Context(), ticket.Method, ticket.URL, strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("build the upload request: %v", err)
+	}
+
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatalf("upload to %s: %v", ticket.URL, err)
+	}
+	defer response.Body.Close()
+
+	reply, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatalf("read the upload response from %s: %v", ticket.URL, err)
+	}
+
+	return response.StatusCode, reply
 }

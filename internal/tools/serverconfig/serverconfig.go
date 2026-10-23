@@ -33,7 +33,6 @@ type Output struct {
 	TLS            bool                  `json:"tls"`
 	ReadOnly       bool                  `json:"read_only"`
 	Destinations   []string              `json:"destinations"`
-	OutputDir      string                `json:"output_dir"`
 	ConfigFile     string                `json:"config_file,omitempty"`
 	HTTPAddress    string                `json:"http_address,omitempty"`
 	SchemaRegistry []string              `json:"schema_registry,omitempty"`
@@ -129,7 +128,6 @@ func Run(kafka *kafkaclient.Client, server *config.Config, endpoint *config.Endp
 	}
 
 	if server != nil {
-		out.OutputDir = server.OutputDir
 		out.ConfigFile = server.Path
 		out.HTTPAddress = server.HTTP.Address
 		out.Path = server.HTTP.BasePath + endpoint.Path

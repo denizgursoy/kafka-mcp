@@ -5,8 +5,8 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
-	"os"
-	"path/filepath"
+	"net/http"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/suite"
@@ -18,6 +18,7 @@ import (
 	"github.com/denizgursoy/kafka-mcp/internal/domain/kafkaclient"
 	"github.com/denizgursoy/kafka-mcp/internal/domain/records"
 	"github.com/denizgursoy/kafka-mcp/internal/domain/testenv"
+	"github.com/denizgursoy/kafka-mcp/internal/domain/transfer"
 	"github.com/denizgursoy/kafka-mcp/internal/tools/producemessage"
 	"github.com/denizgursoy/kafka-mcp/internal/tools/transformmessages"
 )
@@ -68,10 +69,12 @@ func (s *TransformMessagesSuite) clusters(readOnly bool, otherReadOnly bool) *ka
 	return registry
 }
 
-func (s *TransformMessagesSuite) run(registry *kafkaclient.Registry, dir string, input transformmessages.Input) (transformmessages.Output, error) {
+func (s *TransformMessagesSuite) run(registry *kafkaclient.Registry, input transformmessages.Input) (transformmessages.Output, error) {
 	s.T().Helper()
 
-	return transformmessages.Run(s.T().Context(), registry, "here", dir, input)
+	files, base := testenv.Files(s.T())
+
+	return transformmessages.Run(s.T().Context(), registry, "here", files, base, input)
 }
 
 func (s *TransformMessagesSuite) endOffsetOn(env *testenv.Environment, topic string) int64 {
@@ -139,7 +142,7 @@ func (s *TransformMessagesSuite) TestUnwrapsThePayloadIntoAnotherTopic() {
 	destination := s.env.CreateTopic(s.T(), "transform-dst")
 	s.wrapped(source)
 
-	out, err := s.run(s.clusters(false, false), "", transformmessages.Input{
+	out, err := s.run(s.clusters(false, false), transformmessages.Input{
 		Topic:            source,
 		Transform:        `return { value: value.payload }`,
 		DestinationTopic: destination,
@@ -188,7 +191,7 @@ func (s *TransformMessagesSuite) TestPreviewWritesNothing() {
 	destination := s.env.CreateTopic(s.T(), "transform-preview-dst")
 	s.wrapped(source)
 
-	out, err := s.run(s.clusters(false, false), "", transformmessages.Input{
+	out, err := s.run(s.clusters(false, false), transformmessages.Input{
 		Topic:            source,
 		Transform:        `return { value: value.payload }`,
 		DestinationTopic: destination,
@@ -217,7 +220,7 @@ func (s *TransformMessagesSuite) TestScriptSelectsWhichMessagesAreTransformed() 
 		testenv.Message{Key: "c", Value: `{"payload":{"id":"c"}}`},
 	)
 
-	out, err := s.run(s.clusters(false, false), "", transformmessages.Input{
+	out, err := s.run(s.clusters(false, false), transformmessages.Input{
 		Topic:            source,
 		Script:           `return value.payload !== undefined`,
 		Transform:        `return { value: value.payload }`,
@@ -240,7 +243,7 @@ func (s *TransformMessagesSuite) TestReturningNullSkipsAMessage() {
 	destination := s.env.CreateTopic(s.T(), "transform-skip-dst")
 	s.wrapped(source)
 
-	out, err := s.run(s.clusters(false, false), "", transformmessages.Input{
+	out, err := s.run(s.clusters(false, false), transformmessages.Input{
 		Topic:            source,
 		Transform:        `if (key === 'o-2') return null; return { value: value.payload }`,
 		DestinationTopic: destination,
@@ -262,7 +265,7 @@ func (s *TransformMessagesSuite) TestTransformErrorsAreReportedWithTheirAddresse
 		testenv.Message{Key: "c", Value: `{"payload":{"id":"c"}}`},
 	)
 
-	out, err := s.run(s.clusters(false, false), "", transformmessages.Input{
+	out, err := s.run(s.clusters(false, false), transformmessages.Input{
 		Topic:            source,
 		Transform:        `return { value: { id: value.payload.id } }`,
 		DestinationTopic: destination,
@@ -288,7 +291,7 @@ func (s *TransformMessagesSuite) TestRewritesInPlaceWithoutReadingItsOwnOutput()
 	topic := s.env.CreateTopic(s.T(), "transform-inplace")
 	s.wrapped(topic)
 
-	out, err := s.run(s.clusters(false, false), "", transformmessages.Input{
+	out, err := s.run(s.clusters(false, false), transformmessages.Input{
 		Topic:     topic,
 		Transform: `return { value: value.payload }`,
 		Confirm:   true,
@@ -309,7 +312,7 @@ func (s *TransformMessagesSuite) TestChangesKeyAndHeaders() {
 	destination := s.env.CreateTopic(s.T(), "transform-key-dst")
 	s.wrapped(source)
 
-	_, err := s.run(s.clusters(false, false), "", transformmessages.Input{
+	_, err := s.run(s.clusters(false, false), transformmessages.Input{
 		Topic:            source,
 		Transform:        `return { key: value.payload.id.toUpperCase(), headers: { fixed: 'yes' } }`,
 		DestinationTopic: destination,
@@ -343,7 +346,7 @@ func (s *TransformMessagesSuite) TestReencodesAvroWithTheOriginalSchema() {
 	s.Require().NoError(err, "the fixture record must encode")
 	s.env.Produce(s.T(), source, testenv.Message{Key: "o-1", Value: testenv.WireFormat(s.T(), id, nil, payload)})
 
-	_, err = s.run(s.clusters(false, false), "", transformmessages.Input{
+	_, err = s.run(s.clusters(false, false), transformmessages.Input{
 		Topic:            source,
 		Transform:        `return { value: { id: value.id, amount: value.amount * 10 } }`,
 		DestinationTopic: destination,
@@ -369,7 +372,7 @@ func (s *TransformMessagesSuite) TestWritesToAnotherCluster() {
 	destination := s.other.CreateTopic(s.T(), "transform-cross-dst")
 	s.wrapped(source)
 
-	_, err := s.run(s.clusters(true, false), "", transformmessages.Input{
+	_, err := s.run(s.clusters(true, false), transformmessages.Input{
 		Topic:              source,
 		Transform:          `return { value: value.payload }`,
 		DestinationTopic:   destination,
@@ -386,7 +389,7 @@ func (s *TransformMessagesSuite) TestRefusesToWriteToAReadOnlyCluster() {
 	topic := s.env.CreateTopic(s.T(), "transform-readonly")
 	s.wrapped(topic)
 
-	_, err := s.run(s.clusters(true, false), "", transformmessages.Input{
+	_, err := s.run(s.clusters(true, false), transformmessages.Input{
 		Topic:     topic,
 		Transform: `return { value: value.payload }`,
 		Confirm:   true,
@@ -395,47 +398,49 @@ func (s *TransformMessagesSuite) TestRefusesToWriteToAReadOnlyCluster() {
 	s.Require().Equal(int64(3), s.endOffsetOn(s.env, topic), "a refused transform must leave the topic untouched")
 }
 
-func (s *TransformMessagesSuite) TestPreviewsAndSavesOnAReadOnlyCluster() {
+func (s *TransformMessagesSuite) TestPreviewsAndDownloadsOnAReadOnlyCluster() {
 	topic := s.env.CreateTopic(s.T(), "transform-readonly-save")
 	s.wrapped(topic)
-	dir := s.T().TempDir()
 
-	out, err := s.run(s.clusters(true, false), dir, transformmessages.Input{
-		Topic:      topic,
-		Transform:  `return { value: value.payload }`,
-		OutputFile: "repaired.jsonl",
+	out, err := s.run(s.clusters(true, false), transformmessages.Input{
+		Topic:     topic,
+		Transform: `return { value: value.payload }`,
+		Download:  &transformmessages.Download{},
 	})
 	s.Require().NoError(err,
-		"previewing and saving to a file write nothing to the cluster, so read_only must not stop them")
-	s.Require().Equal(3, out.FileWritten, "every transformed message must be saved")
-	s.Require().Equal(int64(3), s.endOffsetOn(s.env, topic), "saving must not write to Kafka")
+		"previewing and downloading write nothing to the cluster, so read_only must not stop them")
+	s.Require().NotNil(out.Download, "a download must return its link")
+
+	lines := strings.Split(strings.TrimSpace(string(testenv.Fetch(s.T(), *out.Download))), "\n")
+	s.Require().Len(lines, 3, "every transformed message must be in the download")
+	s.Require().Equal(int64(3), s.endOffsetOn(s.env, topic), "downloading must not write to Kafka")
 }
 
-func (s *TransformMessagesSuite) TestSavedFileIsSentWithProduceMessage() {
+func (s *TransformMessagesSuite) TestDownloadIsSentWithAProduceMessageUpload() {
 	source := s.env.CreateTopic(s.T(), "transform-file-src")
 	destination := s.env.CreateTopic(s.T(), "transform-file-dst")
 	s.wrapped(source)
-	dir := s.T().TempDir()
 	registry := s.clusters(false, false)
 
-	out, err := s.run(registry, dir, transformmessages.Input{
+	out, err := s.run(registry, transformmessages.Input{
 		Topic:            source,
 		Transform:        `return { value: value.payload }`,
 		DestinationTopic: destination,
-		OutputFile:       "repaired.jsonl",
+		Download:         &transformmessages.Download{Filename: "repaired.jsonl"},
 	})
-	s.Require().NoError(err, "saving the transformed messages must succeed")
-	s.Require().Equal(filepath.Join(dir, "repaired.jsonl"), out.OutputFile,
-		"the response must say where the file is, so the user can inspect it")
-	s.Require().Zero(s.endOffsetOn(s.env, destination), "saving without confirm must not write to Kafka")
+	s.Require().NoError(err, "asking for the transformed messages as a download must succeed")
+	s.Require().NotNil(out.Download, "the response must carry the link")
+	s.Require().Equal("not_started", out.StoppedReason,
+		"nothing runs until the link is fetched, and the response must say so rather than report an empty run")
+	s.Require().Contains(out.Download.Command, "'repaired.jsonl'",
+		"the command must save under the name asked for, on the user's machine")
+	s.Require().Zero(s.endOffsetOn(s.env, destination), "a download must not write to Kafka")
+
+	file := testenv.Fetch(s.T(), *out.Download)
 
 	s.Run("each line is a produce_message item", func() {
-		file, err := os.Open(out.OutputFile)
-		s.Require().NoError(err, "the saved file must be readable")
-		defer file.Close()
-
 		lines := 0
-		scanner := bufio.NewScanner(file)
+		scanner := bufio.NewScanner(strings.NewReader(string(file)))
 
 		for scanner.Scan() {
 			var item producemessage.Item
@@ -448,14 +453,31 @@ func (s *TransformMessagesSuite) TestSavedFileIsSentWithProduceMessage() {
 		s.Require().Equal(3, lines, "every transformed message must be one line")
 	})
 
-	s.Run("produce_message sends the file", func() {
-		sent, err := producemessage.Run(s.T().Context(), registry, "here", dir, producemessage.Input{
-			InputFile: "repaired.jsonl",
-			Confirm:   true,
+	s.Run("the link works once", func() {
+		_, status := s.status(*out.Download)
+		s.Require().Equal("done", status["state"], "a finished download must report done at its status link")
+
+		code, _ := testenv.Send(s.T(), transfer.Ticket{Method: http.MethodGet, URL: out.Download.URL}, "")
+		s.Require().Equal(http.StatusNotFound, code,
+			"a link is a one-time credential, so a second fetch must be refused")
+	})
+
+	s.Run("produce_message sends the file from an upload", func() {
+		files, base := testenv.Files(s.T())
+		offered, err := producemessage.Run(s.T().Context(), registry, "here", files, base, producemessage.Input{
+			Upload:  &producemessage.Upload{Filename: "repaired.jsonl"},
+			Confirm: true,
 		})
-		s.Require().NoError(err, "sending a saved file must succeed")
-		s.Require().NotNil(sent.File, "a file send must report its own summary")
-		s.Require().Equal(3, sent.File.Written, "every line must be written")
+		s.Require().NoError(err, "asking for an upload link must succeed")
+		s.Require().NotNil(offered.Upload, "the response must carry the upload link")
+		s.Require().Zero(s.endOffsetOn(s.env, destination), "nothing may be written before the file arrives")
+
+		code, reply := testenv.Send(s.T(), *offered.Upload, string(file))
+		s.Require().Equal(http.StatusOK, code, "the upload must be accepted: %s", reply)
+
+		var sent producemessage.FileOutput
+		s.Require().NoError(json.Unmarshal(reply, &sent), "the upload must answer with its summary")
+		s.Require().Equal(3, sent.Written, "every line must be written")
 
 		written := s.readAllOn(s.env, destination)
 		s.Require().Len(written, 3, "the destination must hold exactly the saved messages")
@@ -469,12 +491,54 @@ func (s *TransformMessagesSuite) TestSavedFileIsSentWithProduceMessage() {
 	})
 }
 
+func (s *TransformMessagesSuite) TestDownloadRefusesConfirmAndReportsMistakesAtOnce() {
+	topic := s.env.CreateTopic(s.T(), "transform-download-checks")
+	s.wrapped(topic)
+	registry := s.clusters(false, false)
+
+	s.Run("confirm is refused", func() {
+		_, err := s.run(registry, transformmessages.Input{
+			Topic: topic, Transform: `return { value: value.payload }`,
+			Download: &transformmessages.Download{}, Confirm: true,
+		})
+		s.Require().ErrorContains(err, "cannot be combined",
+			"a download saves a set for inspection; writing it too would do two things nobody reviewed")
+	})
+
+	s.Run("a failing transform is reported before the link is handed out", func() {
+		_, err := s.run(registry, transformmessages.Input{
+			Topic: topic, Transform: `return { value: value.missing.field }`,
+			Download: &transformmessages.Download{},
+		})
+		s.Require().Error(err,
+			"a transform that fails on the first message must be refused now, not discovered as a failed curl")
+	})
+
+	s.Run("a path is refused as the file name", func() {
+		_, err := s.run(registry, transformmessages.Input{
+			Topic: topic, Transform: `return { value: value.payload }`,
+			Download: &transformmessages.Download{Filename: "../x.jsonl"},
+		})
+		s.Require().ErrorContains(err, "not a path", "the suggested command must save where the user is working")
+	})
+}
+
+func (s *TransformMessagesSuite) status(ticket transfer.Ticket) (int, map[string]any) {
+	s.T().Helper()
+
+	code, body := testenv.Send(s.T(), transfer.Ticket{Method: http.MethodGet, URL: ticket.StatusURL}, "")
+	var status map[string]any
+	s.Require().NoError(json.Unmarshal(body, &status), "the status link must answer JSON: %s", body)
+
+	return code, status
+}
+
 func (s *TransformMessagesSuite) TestStopsAtMaxMessages() {
 	source := s.env.CreateTopic(s.T(), "transform-limit-src")
 	destination := s.env.CreateTopic(s.T(), "transform-limit-dst")
 	s.wrapped(source)
 
-	out, err := s.run(s.clusters(false, false), "", transformmessages.Input{
+	out, err := s.run(s.clusters(false, false), transformmessages.Input{
 		Topic:            source,
 		Transform:        `return { value: value.payload }`,
 		DestinationTopic: destination,
@@ -494,26 +558,26 @@ func (s *TransformMessagesSuite) TestRefusesInvalidInput() {
 	registry := s.clusters(false, false)
 
 	s.Run("a missing transform", func() {
-		_, err := s.run(registry, "", transformmessages.Input{Topic: topic})
+		_, err := s.run(registry, transformmessages.Input{Topic: topic})
 		s.Require().ErrorContains(err, "transform",
 			"a call without a transform has nothing to do, and must say which parameter is missing")
 	})
 
 	s.Run("a transform that does not compile", func() {
-		_, err := s.run(registry, "", transformmessages.Input{Topic: topic, Transform: `return {`})
+		_, err := s.run(registry, transformmessages.Input{Topic: topic, Transform: `return {`})
 		s.Require().ErrorContains(err, "compile",
 			"a malformed transform must be refused before any message is read")
 	})
 
 	s.Run("a source topic that does not exist", func() {
-		_, err := s.run(registry, "", transformmessages.Input{
+		_, err := s.run(registry, transformmessages.Input{
 			Topic: s.env.UniqueName("missing"), Transform: `return {}`,
 		})
 		s.Require().ErrorContains(err, "does not exist", "a missing topic must fail, not look like an empty one")
 	})
 
 	s.Run("a destination topic that does not exist", func() {
-		_, err := s.run(registry, "", transformmessages.Input{
+		_, err := s.run(registry, transformmessages.Input{
 			Topic: topic, Transform: `return {}`, DestinationTopic: s.env.UniqueName("missing"),
 		})
 		s.Require().ErrorContains(err, "does not exist",
@@ -521,7 +585,7 @@ func (s *TransformMessagesSuite) TestRefusesInvalidInput() {
 	})
 
 	s.Run("a transform that returns something other than an object", func() {
-		out, err := s.run(registry, "", transformmessages.Input{Topic: topic, Transform: `return 42`})
+		out, err := s.run(registry, transformmessages.Input{Topic: topic, Transform: `return 42`})
 		s.Require().NoError(err, "a bad return value is a per-message failure, not a failure of the call")
 		s.Require().Equal(3, out.Failed, "every message must fail when the transform returns a number")
 		s.Require().Contains(out.Errors[0].Reason, "object",
@@ -529,7 +593,7 @@ func (s *TransformMessagesSuite) TestRefusesInvalidInput() {
 	})
 
 	s.Run("an unknown field in the returned object", func() {
-		out, err := s.run(registry, "", transformmessages.Input{Topic: topic, Transform: `return { valeu: 1 }`})
+		out, err := s.run(registry, transformmessages.Input{Topic: topic, Transform: `return { valeu: 1 }`})
 		s.Require().NoError(err, "an unknown field is a per-message failure")
 		s.Require().Contains(out.Errors[0].Reason, "valeu",
 			"a misspelt field must be named, because silently ignoring it would write the original unchanged")
@@ -545,7 +609,7 @@ func (s *TransformMessagesSuite) TestKeepsLargeIntegersExact() {
 	registry := s.clusters(false, false)
 
 	s.Run("a number the transform passes through is written exactly", func() {
-		_, err := s.run(registry, "", transformmessages.Input{
+		_, err := s.run(registry, transformmessages.Input{
 			Topic:            source,
 			Transform:        `return { value: value.payload }`,
 			DestinationTopic: destination,
@@ -560,7 +624,7 @@ func (s *TransformMessagesSuite) TestKeepsLargeIntegersExact() {
 	})
 
 	s.Run("a number the transform rounds is refused rather than written", func() {
-		out, err := s.run(registry, "", transformmessages.Input{
+		out, err := s.run(registry, transformmessages.Input{
 			Topic:            source,
 			Transform:        `return { value: { id: Number(value.payload.id) } }`,
 			DestinationTopic: destination,
@@ -582,7 +646,7 @@ func (s *TransformMessagesSuite) TestKeepsALargeAvroLongExact() {
 	s.Require().NoError(err, "the fixture record must encode")
 	s.env.Produce(s.T(), source, testenv.Message{Value: testenv.WireFormat(s.T(), id, nil, payload)})
 
-	_, err = s.run(s.clusters(false, false), "", transformmessages.Input{
+	_, err = s.run(s.clusters(false, false), transformmessages.Input{
 		Topic:            source,
 		Transform:        `return { value: { ...value, id: value.id.toUpperCase() } }`,
 		DestinationTopic: destination,
@@ -609,7 +673,7 @@ func (s *TransformMessagesSuite) TestNullHeaderRemovesIt() {
 		Headers: map[string]string{"error-reason": "boom", "trace": "t-1"},
 	})
 
-	_, err := s.run(s.clusters(false, false), "", transformmessages.Input{
+	_, err := s.run(s.clusters(false, false), transformmessages.Input{
 		Topic:            source,
 		Transform:        `return { value: value.payload, headers: { ...headers, 'error-reason': null } }`,
 		DestinationTopic: destination,
@@ -634,7 +698,7 @@ func (s *TransformMessagesSuite) TestTimeoutDoesNotSkipTheInterruptedMessage() {
 		testenv.Message{Value: `{"n":2}`},
 	)
 
-	out, err := s.run(s.clusters(false, false), "", transformmessages.Input{
+	out, err := s.run(s.clusters(false, false), transformmessages.Input{
 		Topic:          topic,
 		Transform:      `if (value.n === 2) { while (true) {} } return { value: value }`,
 		TimeoutSeconds: 2,
@@ -666,7 +730,7 @@ func (s *TransformMessagesSuite) TestAFailedWriteStopsAtTheMessageThatFailed() {
 		testenv.Message{Value: `{"payload":{"n":3}}`},
 	)
 
-	out, err := s.run(s.clusters(false, false), "", transformmessages.Input{
+	out, err := s.run(s.clusters(false, false), transformmessages.Input{
 		Topic:            source,
 		Transform:        `return { value: value.payload }`,
 		DestinationTopic: destination,

@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"net/http"
 	"slices"
+	"strings"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/twmb/franz-go/pkg/kadm"
@@ -22,6 +23,7 @@ import (
 
 	"github.com/denizgursoy/kafka-mcp/internal/domain/config"
 	"github.com/denizgursoy/kafka-mcp/internal/domain/kafkaclient"
+	"github.com/denizgursoy/kafka-mcp/internal/domain/transfer"
 	"github.com/denizgursoy/kafka-mcp/internal/tools"
 )
 
@@ -53,7 +55,7 @@ type Connection struct {
 	// Record.Partition. Without it, writes that name a partition fail.
 	ManualProducer func() (*kgo.Client, error)
 	// BulkProducer is optional and returns the producer for batch writes
-	// (produce_message input_file, transform_messages), with manual
+	// (produce_message upload, transform_messages), with manual
 	// partitioning when manual is set. Without it they use Kafka and
 	// ManualProducer, where single writes queue behind their batches.
 	BulkProducer func(manual bool) (*kgo.Client, error)
@@ -86,9 +88,11 @@ type Options struct {
 	Tools map[string]bool
 	// Path is reported by server_config as where the host serves the server.
 	Path string
-	// OutputDir is where search_messages and transform_messages write
-	// output_file, and where produce_message reads input_file.
-	OutputDir string
+	// Files hands out the links search_messages and transform_messages
+	// download through and produce_message uploads through. Nil leaves
+	// those modes refusing, as over stdio. Create it with NewFiles and serve
+	// its Handler.
+	Files *Files
 	// Logger receives the audit records of tool calls. Nil means
 	// slog.Default.
 	Logger *slog.Logger
@@ -96,6 +100,34 @@ type Options struct {
 	// for audit records, as established by something the host trusts (an
 	// authenticating proxy). Nil or an empty name records none.
 	User func(header http.Header) string
+}
+
+// Files is where one endpoint's download and upload links are served. Files
+// pass straight between the caller and Kafka and are never stored.
+type Files struct{ hub *transfer.Hub }
+
+// FilesPath is where an endpoint at path serves its links, e.g. /mcp/prod
+// serves them below /mcp/prod/files.
+func FilesPath(path string) string { return strings.TrimRight(path, "/") + tools.FilesPath }
+
+// NewFiles returns the links for an endpoint served at path, the path the
+// host routes, including any base path.
+func NewFiles(path string) *Files { return &Files{hub: transfer.NewHub(FilesPath(path))} }
+
+// Path is where Handler must be mounted, with everything below it.
+func (f *Files) Path() string { return f.hub.Path() }
+
+// Handler serves the links. Mount it at Path() and below, behind the same
+// authentication and origin checks as the MCP endpoint. A link carries its
+// own one-time token; the agent's command fetching it does not carry the MCP
+// client's headers.
+func (f *Files) Handler() http.Handler { return f.hub.Handler() }
+
+// Middleware must wrap the MCP endpoint's handler: it records the address
+// each call arrived at, which links are built on. publicURL, when set, is
+// used instead, for a host behind a proxy that changes the address.
+func Middleware(publicURL string) func(http.Handler) http.Handler {
+	return transfer.Middleware(publicURL)
 }
 
 // Clusters holds the lent connections. Tools registered for one cluster can
@@ -177,7 +209,6 @@ func (c *Clusters) Register(server *mcp.Server, name string, opts Options) error
 	}
 
 	cfg := &config.Config{
-		OutputDir: opts.OutputDir,
 		Clusters:  c.clusters,
 		Endpoints: make(map[string]*config.Endpoint, len(c.clusters)),
 	}
@@ -203,5 +234,10 @@ func (c *Clusters) Register(server *mcp.Server, name string, opts Options) error
 		auditing.User = opts.User
 	}
 
-	return tools.Register(server, cfg, kafkaclient.BorrowRegistry(cfg, c.clients), name, auditing)
+	var files *transfer.Hub
+	if opts.Files != nil {
+		files = opts.Files.hub
+	}
+
+	return tools.Register(server, cfg, kafkaclient.BorrowRegistry(cfg, c.clients), name, auditing, files)
 }

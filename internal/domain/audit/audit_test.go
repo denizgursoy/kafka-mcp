@@ -299,15 +299,15 @@ func (s *AuditSuite) TestRecordsTopLevelTargets() {
 			"a tool that takes its topics at the top level must still say which topics it touched")
 	})
 
-	s.Run("a file send names its file", func() {
+	s.Run("an upload says so", func() {
 		s.records.entries = nil
 
 		s.call(s.endpoint(), "p", "produce_message",
-			`{"confirm":true,"input_file":"orders-fixed.jsonl"}`,
+			`{"confirm":true,"upload":{"filename":"orders-fixed.jsonl"}}`,
 			&mcp.CallToolResult{}, nil)
 
-		s.Require().Equal("file=orders-fixed.jsonl", s.records.only().attrs["targets"].String(),
-			"a send from a file carries no items, so the file is the only record of what was written")
+		s.Require().Equal("upload", s.records.only().attrs["targets"].String(),
+			"an upload carries no items, so the record must say the messages came from the caller's file")
 	})
 }
 

@@ -3,9 +3,12 @@ package transformmessages
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -13,10 +16,10 @@ import (
 
 	"github.com/denizgursoy/kafka-mcp/internal/domain/batch"
 	"github.com/denizgursoy/kafka-mcp/internal/domain/kafkaclient"
-	"github.com/denizgursoy/kafka-mcp/internal/domain/outputfile"
 	"github.com/denizgursoy/kafka-mcp/internal/domain/records"
 	"github.com/denizgursoy/kafka-mcp/internal/domain/script"
 	"github.com/denizgursoy/kafka-mcp/internal/domain/serde"
+	"github.com/denizgursoy/kafka-mcp/internal/domain/transfer"
 )
 
 const toolName = "transform_messages"
@@ -36,7 +39,10 @@ const (
 
 // Stop reasons reported back to the caller.
 const (
-	reasonExhausted   = "range_exhausted"
+	reasonExhausted = "range_exhausted"
+	// reasonNotStarted is a download's: the transform runs when its link
+	// is fetched.
+	reasonNotStarted  = "not_started"
 	reasonMaxMessages = "max_messages"
 	reasonTimeout     = "timeout"
 	reasonWriteFailed = "write_failed"
@@ -77,8 +83,14 @@ type Input struct {
 	MaxMessages        int        `json:"max_messages,omitempty" jsonschema:"Optional maximum number of messages to transform, counting only those the script selects. Defaults to 100000, at most 10000000. complete is false when the limit stops the run."`
 	TimeoutSeconds     int        `json:"timeout_seconds,omitempty" jsonschema:"Optional wall-clock limit in seconds. Defaults to 300, at most 3600. Messages already written when it fires stay written; scanned_ranges says how far each partition got."`
 	MaxValueBytes      int        `json:"max_value_bytes,omitempty" jsonschema:"Optional maximum number of value bytes to show in each example. Defaults to 4096. Affects the response only."`
-	OutputFile         string     `json:"output_file,omitempty" jsonschema:"Optional new file name to save every transformed message to, one produce_message item per line, so the set can be inspected and later sent with produce_message input_file. A name only, not a path: the server chooses the directory and refuses a name that already exists. Saving writes nothing to Kafka and works on a read-only cluster."`
+	Download           *Download  `json:"download,omitempty" jsonschema:"Optional. Instead of running now, return a one-time link that runs the transform when fetched and streams every new message to a file on the user's own machine, one produce_message item per line, so the set can be inspected and later sent with produce_message upload. Nothing is stored on the server and nothing is written to Kafka, so it works on a read-only cluster; it cannot be combined with confirm. Run the returned command, e.g. curl, on the user's machine."`
 	Confirm            bool       `json:"confirm,omitempty" jsonschema:"Optional. When false or omitted, nothing is written to Kafka: the response counts what would be written, shows examples and groups the failures. Must be true to produce the new messages."`
+}
+
+// Download asks for the transformed messages as a file on the caller's
+// machine.
+type Download struct {
+	Filename string `json:"filename,omitempty" jsonschema:"Optional name to save the file as on the user's machine, in the suggested command. Defaults to <destination_topic>.jsonl."`
 }
 
 // SchemaRef names the registry schema to encode against. Every field is
@@ -113,8 +125,8 @@ type Output struct {
 	Errors          []ErrorGroup `json:"errors"`
 	ErrorsTruncated bool         `json:"errors_truncated,omitempty"`
 
-	OutputFile  string `json:"output_file,omitempty"`
-	FileWritten int    `json:"file_written,omitempty"`
+	Download    *transfer.Ticket `json:"download,omitempty"`
+	FileWritten int              `json:"file_written,omitempty"`
 
 	Warnings []string `json:"warnings,omitempty"`
 	Note     string   `json:"note,omitempty"`
@@ -169,9 +181,11 @@ offset.
 
 Nothing is written to Kafka unless confirm is true. Without it the response
 counts what would be written, shows before/after examples and groups failures
-by reason with example addresses. output_file saves the transformed messages as
-produce_message items, one per line, so the set can be inspected and later sent
-with produce_message input_file; saving works on a read-only cluster.
+by reason with example addresses. download returns a one-time link instead: the
+transform runs when the link is fetched and streams the new messages to the
+user's machine as produce_message items, one per line, so the set can be
+inspected and later sent with produce_message upload. Nothing is stored on the
+server, and downloading works on a read-only cluster.
 
 Partitions are processed in ascending order and writing is not atomic:
 messages written before a timeout or failure stay. complete, stopped_reason and
@@ -183,7 +197,7 @@ func Register(
 	server *mcp.Server,
 	clusters *kafkaclient.Registry,
 	own string,
-	outputDir string,
+	files *transfer.Hub,
 ) {
 	mcp.AddTool(
 		server,
@@ -203,7 +217,7 @@ func Register(
 				client = info.Name
 			}
 
-			out, err := run(ctx, clusters, own, outputDir, input, client)
+			out, err := run(ctx, clusters, own, files, transfer.Base(req), input, client)
 			if err != nil {
 				return nil, Output{}, fmt.Errorf("transform messages: %w", err)
 			}
@@ -214,25 +228,108 @@ func Register(
 }
 
 // Run transforms the messages of a topic and, with confirm, writes the
-// results. outputDir is where output_file is created.
+// results. With download it runs nothing yet and returns a link from files
+// whose fetch runs it; base is the address the caller reached the server at.
 func Run(
 	ctx context.Context,
 	clusters *kafkaclient.Registry,
 	own string,
-	outputDir string,
+	files *transfer.Hub,
+	base string,
 	input Input,
 ) (Output, error) {
 
-	return run(ctx, clusters, own, outputDir, input, "")
+	return run(ctx, clusters, own, files, base, input, "")
 }
 
 func run(
 	ctx context.Context,
 	clusters *kafkaclient.Registry,
 	own string,
-	outputDir string,
+	files *transfer.Hub,
+	base string,
 	input Input,
 	client string,
+) (Output, error) {
+
+	if input.Download == nil {
+		return transform(ctx, clusters, own, input, client, nil)
+	}
+
+	if input.Confirm {
+		return Output{}, fmt.Errorf(
+			"download and confirm cannot be combined: a download saves the new messages to a file for the user to inspect, and sending them is a separate produce_message upload")
+	}
+
+	// A dry run of one message checks everything the download would need,
+	// so a mistake is reported now rather than as a failed curl.
+	check := input
+	check.MaxMessages = 1
+	check.TimeoutSeconds = 0
+	tried, err := transform(ctx, clusters, own, check, client, io.Discard)
+	if err != nil {
+		return Output{}, err
+	}
+	if len(tried.Errors) > 0 {
+		return Output{}, fmt.Errorf("the first message to transform fails: %s; fix the transform before downloading", tried.Errors[0].Reason)
+	}
+
+	filename := strings.TrimSpace(input.Download.Filename)
+	if filename == "" {
+		destination := input.DestinationTopic
+		if destination == "" {
+			destination = input.Topic
+		}
+		filename = destination + ".jsonl"
+	}
+	if strings.ContainsAny(filename, "/\\\x00") || filename == "." || filename == ".." {
+		return Output{}, fmt.Errorf("download filename %q must be a file name, not a path", input.Download.Filename)
+	}
+
+	ticket, err := files.Offer(base, filename, "application/x-ndjson", func(ctx context.Context, w io.Writer) (any, error) {
+		out, err := transform(ctx, clusters, own, input, client, w)
+		if err != nil {
+			return nil, err
+		}
+
+		// A saved set is meant to be sent as a whole, so one cut short is a
+		// failure rather than a smaller file that looks complete.
+		if !out.Complete || out.Failed > 0 {
+			return out, fmt.Errorf(
+				"the transform did not finish cleanly (%s, %d failed) after saving %d messages, so the file is incomplete: "+
+					"fix the failures or raise the limits, and ask for a new link",
+				out.StoppedReason, out.Failed, out.FileWritten)
+		}
+
+		return out, nil
+	})
+	if err != nil {
+		return Output{}, err
+	}
+
+	return Output{
+		Topic:              input.Topic,
+		DestinationTopic:   input.DestinationTopic,
+		DestinationCluster: input.DestinationCluster,
+		ScannedRanges:      []ScannedRange{},
+		Examples:           []Example{},
+		Errors:             []ErrorGroup{},
+		Warnings:           []string{},
+		StoppedReason:      reasonNotStarted,
+		Download:           &ticket,
+		Note:               "nothing has run yet: the transform runs when the download link is fetched, and writes nothing to Kafka.",
+	}, nil
+}
+
+// transform reads, transforms and, with confirm, writes. file, when set,
+// receives every new message as a produce_message item.
+func transform(
+	ctx context.Context,
+	clusters *kafkaclient.Registry,
+	own string,
+	input Input,
+	client string,
+	file io.Writer,
 ) (Output, error) {
 
 	if input.Topic == "" {
@@ -352,14 +449,9 @@ func run(
 		StoppedReason:      reasonExhausted,
 	}
 
-	var file *outputfile.Writer
-
-	if input.OutputFile != "" {
-		file, err = outputfile.Create(outputDir, "output_file", input.OutputFile)
-		if err != nil {
-			return Output{}, err
-		}
-		defer file.Close()
+	var lines *json.Encoder
+	if file != nil {
+		lines = json.NewEncoder(file)
 	}
 
 	timeout := defaultTimeout
@@ -383,7 +475,7 @@ func run(
 		destTopic:   destinationTopic,
 		filter:      filter,
 		transform:   transform,
-		file:        file,
+		file:        lines,
 		out:         &out,
 		maxMessages: maxMessages,
 		writeCtx:    ctx,
@@ -401,15 +493,6 @@ func run(
 
 	if err != nil {
 		return Output{}, err
-	}
-
-	if file != nil {
-		if err := file.Close(); err != nil {
-			return Output{}, fmt.Errorf("close output file: %w", err)
-		}
-
-		out.OutputFile = file.Path()
-		out.FileWritten = file.Written()
 	}
 
 	finish(&out, state)

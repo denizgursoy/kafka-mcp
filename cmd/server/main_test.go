@@ -113,6 +113,7 @@ func (s *HTTPRoutesSuite) TestConfiguredBasePathPrefixesEveryEndpoint() {
 			},
 		},
 		map[string]*mcp.Server{},
+		nil,
 	)
 
 	s.Run("health is served below the base path", func() {
@@ -154,6 +155,7 @@ func (s *HTTPRoutesSuite) TestEmptyBasePathKeepsExistingRoutes() {
 	server := newHTTPServer(
 		&config.Config{HTTP: config.HTTP{}},
 		map[string]*mcp.Server{},
+		nil,
 	)
 	request := httptest.NewRequestWithContext(s.T().Context(), http.MethodGet, "/healthz", nil)
 	response := httptest.NewRecorder()
@@ -177,7 +179,7 @@ func (s *HTTPRoutesSuite) TestConfiguredEndpointPathsAreExact() {
 	server := newHTTPServer(cfg, map[string]*mcp.Server{
 		"read":  readServer,
 		"write": writeServer,
-	})
+	}, nil)
 
 	for _, endpointPath := range []string{"/mcp", "/mcp/rw"} {
 		request := httptest.NewRequestWithContext(s.T().Context(), http.MethodPost, endpointPath, nil)
@@ -228,6 +230,7 @@ func (s *HTTPRoutesSuite) secured(cfg config.HTTP) http.Handler {
 			Endpoints: map[string]*config.Endpoint{"local": {Name: "local", Cluster: "local", Path: "/mcp/local"}},
 		},
 		map[string]*mcp.Server{"local": mcp.NewServer(&mcp.Implementation{Name: "local", Version: "test"}, nil)},
+		nil,
 	)
 }
 

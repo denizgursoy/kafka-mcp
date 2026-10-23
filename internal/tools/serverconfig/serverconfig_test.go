@@ -69,7 +69,7 @@ func (s *ServerConfigSuite) TestReportsTheConnectionAndPermissions() {
 
 	out, err := serverconfig.Run(
 		client,
-		&config.Config{OutputDir: "/var/tmp/exports", HTTP: config.HTTP{Address: ":8090"}},
+		&config.Config{HTTP: config.HTTP{Address: ":8090"}},
 		&config.Endpoint{Name: "prod-read", Cluster: "production", Path: "/mcp", Description: "Production investigation", ReadOnly: true, Destinations: []string{"preprod"}},
 		[]string{"list_topics", "describe_topic"},
 	)

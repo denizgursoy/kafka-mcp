@@ -23,8 +23,8 @@ they are until retention removes them. Everything below follows from that.
 | `search_messages`      | Counting the broken messages and finding the range        |
 | `describe_topic`       | Partition counts, and whether the destination is compacted |
 | `list_consumer_groups` | Who reads the destination, before writing into it         |
-| `transform_messages`   | Previewing, saving and writing the repair                 |
-| `produce_message`      | Sending a saved repair from its file with `input_file`    |
+| `transform_messages`   | Previewing, downloading and writing the repair            |
+| `produce_message`      | Sending a downloaded repair with `upload`                 |
 | `get_message`          | Reading a message the transform failed on                 |
 | `create_topic`         | Creating a separate destination topic                     |
 
@@ -140,17 +140,21 @@ Call `transform_messages` with the `script` from step 2 and **without**
 ### 6. Optionally save and inspect first
 
 When the user wants to look at the whole repaired set before it reaches Kafka,
-or the repair needs a sign-off from someone else, add `output_file`. Each line
-is a `produce_message` item, so it can be checked and then sent later:
+or the repair needs a sign-off from someone else, call it with
+`download: {"filename": "orders-fixed.jsonl"}` instead of `confirm`, and run the
+returned command on the user's machine. The file lands there, never on the
+server, and each line is a `produce_message` item, so it can be checked and
+then sent later from that machine:
 
 ```json
-{"name": "produce_message", "arguments": {"input_file": "orders-fixed.jsonl"}}
+{"name": "produce_message", "arguments": {"upload": {"filename": "orders-fixed.jsonl"}}}
 ```
 
-Previewing the file validates every line and reports the bad ones by line
-number. With `confirm: true` it sends the valid lines in file order. Saving
-works on a read-only endpoint, so the repair can be prepared there and sent from
-a session that may write.
+Run the returned `curl -T` command where the file is. Without `confirm` the
+upload validates every line and reports the bad ones by line number; ask for a
+new link with `confirm: true` to send the valid lines in file order.
+Downloading works on a read-only endpoint, so the repair can be prepared there
+and sent from a session that may write.
 
 ### 7. Write
 

@@ -53,7 +53,7 @@ How releases reach the registry and the other catalogs is in
 http:
   address: ":8090"
   base_path: /kafka-mcp # optional; prefixes every endpoint and /healthz
-output_dir: /var/tmp/kafka-mcp
+  # public_url: https://kafka.example.com # optional; the address download links use
 clusters:
   prod:
     brokers:
@@ -179,11 +179,39 @@ file, HTTP, then environment; environment overrides use the `KAFKA_MCP_` prefix 
 `LOG_LEVEL` and `LOG_PRETTY`.
 
 At least one cluster with a broker is required. `http.address` defaults to
-`:8090`, `http.base_path` defaults to the HTTP root, and `output_dir` defaults
-to the system temp directory. `search_messages` and `transform_messages` write
-their `output_file` there, and `produce_message` reads its `input_file` from
-there. Both take a file name, never a path; an existing `output_file` name is
-refused rather than overwritten, and a symlinked `input_file` is refused.
+`:8090` and `http.base_path` to the HTTP root.
+
+The server never stores files. `search_messages` and `transform_messages` with
+`download`, and `produce_message` with `upload`, return a one-time link and a
+`curl` command that the agent runs on the user's own machine; the data streams
+between that machine and Kafka while the command runs. See
+[Files on the user's machine](#files-on-the-users-machine). Links are built on
+the address each request reached, honouring `X-Forwarded-Proto` and
+`X-Forwarded-Host`; set `http.public_url` when a proxy hides the real address.
+The old `output_dir` setting is refused at startup.
+
+### Files on the user's machine
+
+Tools that save or send many messages work with files on the user's own
+machine, never on the server. A tool cannot write there itself: its result goes
+to the model, not to disk. So `search_messages` and `transform_messages` with
+`download`, and `produce_message` with `upload`, return a one-time link and a
+`curl` command, and the agent runs the command on the user's machine:
+
+```sh
+curl -fsS -o 'orders.csv.part' 'https://kafka.example.com/mcp/prod/files/Q2x…' && mv 'orders.csv.part' 'orders.csv'
+curl -fsS -T 'orders-fixed.jsonl' 'https://kafka.example.com/mcp/prod/files/Zk9…'
+```
+
+Nothing is prepared ahead and nothing is stored: the data streams between that
+machine and Kafka while the command runs, so the message bodies never pass
+through the model either. A link works once and expires after 10 minutes; a
+download's `status_url` reports how it ended. Links are served below the
+endpoint at `<endpoint path>/files/` and checked for origin like the endpoint.
+They need no bearer token, because the agent's `curl` does not carry the MCP
+client's headers: each link is its own 256-bit, single-use credential, like a
+presigned URL, so treat it as a secret until it is used. Over stdio there is no
+address to link to, and these modes are refused.
 
 `brokers` accepts either one address as a scalar or several addresses as a YAML
 list. Each address is passed to Kafka as a separate seed broker.
@@ -484,7 +512,7 @@ http.Handle("/mcp/stage", mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.
   skipped, and without them a scan ending on a transaction marker waits for
   data that never comes.
 - `BulkProducer` is optional and writes the batches of `produce_message`
-  `input_file` and `transform_messages`, so single writes on `Kafka` do not
+  `upload` and `transform_messages`, so single writes on `Kafka` do not
   queue behind them.
 - `ProtoMessage` is optional and names the protobuf message a topic's key or
   value holds when written without Schema Registry framing, for hosts that
@@ -656,7 +684,7 @@ Two fields carry most of the weight. `confirm` separates a real write from a
 preview, and `targets` names the topic, group, partition and offset each item
 pointed at, so a record says which topic was touched rather than only that some
 topic was. Tools without items record their top-level topic and destination, and
-a `produce_message` send from `input_file` records the file name.
+a `produce_message` upload records `upload`. A `download` records `download`.
 
 **Message content is never logged.** `produce_message`, `copy_message` and
 `transform_messages` carry
@@ -702,8 +730,8 @@ the top level, which in practice means `confirm`.
 
 The message-heavy tools accept at most 500 items; lag, schema and administrative
 tools accept at most 1000. For more messages than that, `transform_messages`
-scans a topic in one call and `produce_message` sends any number from
-`input_file`.
+scans a topic in one call and `produce_message` sends any number from an
+`upload`.
 
 Every response is the same envelope. Results stay in input order, each entry
 carrying `index` and either `result` or `error`, followed by `succeeded`,
@@ -940,7 +968,7 @@ them client-side; the result reports what was covered.
 | `max_value_bytes` | int | no | Value bytes per match. Default 512, at most 1 MiB |
 | `timeout_seconds` | int | no | Wall-clock limit. Default 30, at most 3600 |
 | `count_only` | bool | no | Return counts only, no message bodies |
-| `output_file` | string | no | Write every match to this new file as JSONL |
+| `download` | object | no | `{format, filename}`: a one-time link that streams every match to the user's machine as `jsonl` (default) or `csv` |
 | `group_by` | string | no | Expression returning a bucket per match; counts per bucket |
 | `max_groups` | int | no | Largest buckets returned with `group_by`. Default 20, at most 1000 |
 
@@ -1013,7 +1041,7 @@ multi-partition topic is already read in parallel across its partitions, so the
 setting does not apply there, and a range too small to divide is read by one
 reader.
 
-It pays off for `count_only`, `group_by`, `output_file` and full scans of a
+It pays off for `count_only`, `group_by`, `download` and full scans of a
 single partition.
 
 #### Result
@@ -1030,7 +1058,49 @@ means "not there" only if `complete` is true; otherwise check `stopped_reason`
 and narrow the search.
 
 For large result sets, use `count_only` to learn how many matches exist, then
-`output_file` to write them out instead of returning them.
+`download` to save them instead of returning them.
+
+#### Downloads
+
+`download` scans nothing yet. It checks the topic, the window and the script,
+then returns a one-time link and the command to run on the user's machine (see
+[Files on the user's machine](#files-on-the-users-machine)). The search runs
+while the link is fetched and streams every match into the file; a search cut
+short by `max_messages_scanned` or `timeout_seconds` breaks the transfer
+instead of leaving a file that looks complete.
+
+```json
+{"name": "search_messages", "arguments": {"topic": "orders-dlq",
+  "script": "return value.amount >= 500", "max_messages_scanned": 10000000,
+  "download": {"format": "csv", "filename": "orders.csv"}}}
+```
+
+```json
+{"topic": "orders-dlq", "matches": [], "stopped_reason": "not_started",
+ "download": {"url": "https://kafka.example.com/mcp/prod/files/Q2x…", "method": "GET",
+   "command": "curl -fsS -o 'orders.csv.part' 'https://…/files/Q2x…' && mv 'orders.csv.part' 'orders.csv'",
+   "status_url": "https://…/files/Q2x…/status", "expires_at": "2026-10-23T10:10:00Z", "note": "…"}}
+```
+
+The file is JSON lines, or CSV with `format: "csv"`. Both use
+[kafka-console](https://github.com/rakunlabs/kafka-console)'s export layout,
+so the file can be imported there as it is. The file is a copy rather than a
+view of the data:
+
+- values are never cut; `max_value_bytes` does not apply;
+- a null key, value or header stays null (`key_null` and `value_null` columns
+  in CSV), distinct from an empty one;
+- a payload is either its exact bytes, with `key_encoding` and
+  `value_encoding` set to `utf8` or `base64`, or, when it carries a Schema
+  Registry schema id, the decoded document with `value_format`,
+  `value_schema_id` and `value_schema_message`, so an import encodes it to the
+  same schema again.
+
+```json
+{"partition":0,"offset":3,"timestamp":"2026-10-23T09:00:00Z","key":"o-1","key_encoding":"utf8","key_format":"text",
+ "value":"{\"amount\":900,\"id\":\"o-1\"}","value_encoding":"utf8","value_format":"avro","value_schema_id":1,
+ "value_schema_message":"shop.Order","headers":[],"key_bytes":3,"value_bytes":11,"truncated":false}
+```
 
 #### Grouping
 
@@ -1054,7 +1124,7 @@ counted per bucket, as with `count_only`, and no bodies are returned. `null` and
 Buckets are sorted by count. `groups_truncated` is true when more than
 `max_groups` existed. A message the expression throws on is counted in
 `script_errors` and not bucketed. `group_by` cannot be combined with
-`output_file`.
+`download`.
 
 ### `get_message`
 
@@ -1648,7 +1718,7 @@ ever sent.
 | Parameter    | Type     | Required | Meaning                                                  |
 | ------------ | -------- | -------- | -------------------------------------------------------- |
 | `items`      | object[] | one of   | 1 to 500 messages to write                               |
-| `input_file` | string   | one of   | File name in `output_dir`, one item per line as JSON     |
+| `upload`     | object   | one of   | `{filename}`: a one-time link for a file on the user's machine |
 | `confirm`    | bool     | no       | Default false: preview only, nothing is written          |
 
 Item fields:
@@ -1688,18 +1758,20 @@ key decides placement, and naming a partition puts a keyed message where its
 key does not hash to, which breaks ordering for that key. The response warns
 whenever an explicit partition is used.
 
-`input_file` sends any number of messages from a file in `output_dir`, such as
-the one `transform_messages` saves with `output_file`. Each line is one item as
-JSON with the item fields above; a misspelt field is refused rather than
-ignored. Every line is validated before anything is written, and the response
-carries a `file` summary instead of one result per line: `lines`, `valid`,
-`invalid`, `written`, the first three messages, and up to 50 failing lines by
-line number. With `confirm` the valid lines are written in file order and
-invalid ones are skipped. The name must be a file name, not a path, and a
-symlink is refused.
+`upload` sends any number of messages from a file on the user's machine, such
+as the one a `transform_messages` download saves. The call returns a one-time
+link and a `curl -T` command to run there (see
+[Files on the user's machine](#files-on-the-users-machine)). Each line is one
+item as JSON with the item fields above; a misspelt field is refused rather
+than ignored. The file is read as it uploads and never stored, and the command
+prints a summary instead of one result per line: `lines`, `valid`, `invalid`,
+`written`, the first three messages, and up to 50 failing lines by line number.
+Without `confirm` the upload checks the file and writes nothing; ask for a new
+link with `confirm` to send it, and the valid lines are written in file order
+while invalid ones are skipped.
 
 ```json
-{"name": "produce_message", "arguments": {"input_file": "orders-fixed.jsonl", "confirm": true}}
+{"name": "produce_message", "arguments": {"upload": {"filename": "orders-fixed.jsonl"}, "confirm": true}}
 ```
 
 `read_only` protects the cluster being written to, so a read-only endpoint may
@@ -1741,7 +1813,7 @@ such as a document that was wrapped in a field it should not be in:
 | `max_messages`        | int      | no       | Selected messages to process. Default 100000, at most 10000000       |
 | `timeout_seconds`     | int      | no       | Default 300, at most 3600                                            |
 | `max_value_bytes`     | int      | no       | Example value limit. The whole value is always written               |
-| `output_file`         | string   | no       | Save the new messages as `produce_message` items, one per line       |
+| `download`            | object   | no       | `{filename}`: a one-time link that saves the new messages on the user's machine as `produce_message` items |
 | `confirm`             | bool     | no       | Default false: nothing is written to Kafka                           |
 
 The transform is JavaScript (ES2020: arrow functions, spread, destructuring,
@@ -1780,10 +1852,14 @@ ascending order. A run cut short by `max_messages` or the timeout reports
 `partitions` and `from_offset`. Writing is not atomic, and what was written
 before a stop stays.
 
-`output_file` saves the transformed messages so the set can be inspected and
-then sent with `produce_message` `input_file`. Saving and previewing write
-nothing to Kafka, so they work on a read-only endpoint; `confirm` needs a
-writable destination. Like `copy_message`, the tool stays registered on a
+`download` returns a one-time link instead of running: the transform runs while
+the link is fetched and streams the new messages to the user's machine as
+`produce_message` items, so the set can be inspected and then sent with a
+`produce_message` `upload`. The first message is transformed before the link is
+handed out, so a broken transform is reported at once, and a run that fails or
+is cut short breaks the transfer. Downloading and previewing write nothing to
+Kafka, so they work on a read-only endpoint; `download` cannot be combined with
+`confirm`, which needs a writable destination. Like `copy_message`, the tool stays registered on a
 read-only endpoint, because the destination is chosen per call.
 
 ## Skills

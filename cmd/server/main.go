@@ -30,6 +30,7 @@ import (
 
 	"github.com/denizgursoy/kafka-mcp/internal/domain/config"
 	"github.com/denizgursoy/kafka-mcp/internal/domain/kafkaclient"
+	"github.com/denizgursoy/kafka-mcp/internal/domain/transfer"
 	"github.com/denizgursoy/kafka-mcp/internal/tools"
 )
 
@@ -118,7 +119,9 @@ func run(ctx context.Context, opts options) error {
 	defer clusters.Close()
 
 	if !opts.server {
-		server, err := newServer(cfg, clusters, endpointName)
+		// Over stdio there is no address a link could point at, so the
+		// download and upload modes refuse.
+		server, err := newServer(cfg, clusters, endpointName, nil)
 		if err != nil {
 			return fmt.Errorf("initialize stdio endpoint %q: %w", endpointName, err)
 		}
@@ -147,16 +150,23 @@ func run(ctx context.Context, opts options) error {
 }
 
 func runHTTP(ctx context.Context, cfg *config.Config, clusters *kafkaclient.Registry) error {
+	if err := checkFilePaths(cfg); err != nil {
+		return err
+	}
+
 	servers := make(map[string]*mcp.Server, len(cfg.Endpoints))
+	files := make(map[string]*transfer.Hub, len(cfg.Endpoints))
 
 	for _, name := range cfg.EndpointNames() {
-		server, err := newServer(cfg, clusters, name)
+		endpoint := cfg.Endpoints[name]
+		files[name] = transfer.NewHub(cfg.HTTP.BasePath + endpoint.Path + tools.FilesPath)
+
+		server, err := newServer(cfg, clusters, name, files[name])
 		if err != nil {
 			return fmt.Errorf("serve endpoint %q: %w", name, err)
 		}
 
 		servers[name] = server
-		endpoint := cfg.Endpoints[name]
 
 		slog.Info("serving endpoint",
 			"endpoint", name,
@@ -168,15 +178,34 @@ func runHTTP(ctx context.Context, cfg *config.Config, clusters *kafkaclient.Regi
 		)
 	}
 
-	server := newHTTPServer(cfg, servers)
+	server := newHTTPServer(cfg, servers, files)
 
 	return server.StartWithContext(ctx, cfg.HTTP.Address)
+}
+
+// checkFilePaths refuses an endpoint whose path is another endpoint's link
+// path, so /mcp/files is never both an MCP endpoint and /mcp's downloads.
+func checkFilePaths(cfg *config.Config) error {
+	endpoints := make(map[string]string, len(cfg.Endpoints))
+	for name, endpoint := range cfg.Endpoints {
+		endpoints[cfg.HTTP.BasePath+endpoint.Path] = name
+	}
+	for name, endpoint := range cfg.Endpoints {
+		files := cfg.HTTP.BasePath + endpoint.Path + tools.FilesPath
+		for path, other := range endpoints {
+			if path == files || strings.HasPrefix(path, files+"/") {
+				return fmt.Errorf("endpoint %q path %q is below endpoint %q's file links at %q: choose another path", other, path, name, files)
+			}
+		}
+	}
+
+	return nil
 }
 
 // newHTTPServer mounts every public endpoint below the configured base path.
 // cfg.Load canonicalizes that path to either empty or a leading-slash path
 // without a trailing slash.
-func newHTTPServer(cfg *config.Config, servers map[string]*mcp.Server) *ada.Server {
+func newHTTPServer(cfg *config.Config, servers map[string]*mcp.Server, files map[string]*transfer.Hub) *ada.Server {
 	byPath := make(map[string]*mcp.Server, len(cfg.Endpoints))
 	for name, endpoint := range cfg.Endpoints {
 		byPath[cfg.HTTP.BasePath+endpoint.Path] = servers[name]
@@ -208,9 +237,19 @@ func newHTTPServer(cfg *config.Config, servers map[string]*mcp.Server) *ada.Serv
 	server.Use(middlewares...)
 	// Routes are exact. In particular /mcp and /mcp/rw may safely describe
 	// different permissions without the shorter path capturing the longer one.
-	protected := guard(cfg.HTTP, handler)
+	protected := guard(cfg.HTTP, transfer.Middleware(cfg.HTTP.PublicURL)(handler))
 	for endpointPath := range byPath {
 		server.Handle(endpointPath, protected)
+	}
+
+	// Download and upload links sit below each endpoint and behind the same
+	// origin check. They take no bearer token: the agent's curl does not
+	// carry the MCP client's headers, and each link is its own one-time
+	// 256-bit credential, like a presigned URL.
+	for name, hub := range files {
+		if servers[name] != nil {
+			server.HandleWildcard(hub.Path()+"/", guard(config.HTTP{CORS: cfg.HTTP.CORS}, hub.Handler()))
+		}
 	}
 
 	// A liveness endpoint that needs no MCP session, so a container
@@ -232,6 +271,7 @@ func newServer(
 	cfg *config.Config,
 	clusters *kafkaclient.Registry,
 	name string,
+	files *transfer.Hub,
 ) (*mcp.Server, error) {
 
 	server := mcp.NewServer(
@@ -250,7 +290,7 @@ func newServer(
 		nil,
 	)
 
-	if err := tools.Register(server, cfg, clusters, name, tools.Audit{}); err != nil {
+	if err := tools.Register(server, cfg, clusters, name, tools.Audit{}, files); err != nil {
 		return nil, err
 	}
 

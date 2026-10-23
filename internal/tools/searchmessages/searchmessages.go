@@ -4,6 +4,7 @@ package searchmessages
 import (
 	"context"
 	"fmt"
+	"io"
 	"sort"
 	"sync"
 	"time"
@@ -13,30 +14,36 @@ import (
 	"github.com/twmb/franz-go/pkg/kgo"
 
 	"github.com/denizgursoy/kafka-mcp/internal/domain/batch"
-	"github.com/denizgursoy/kafka-mcp/internal/domain/outputfile"
 	"github.com/denizgursoy/kafka-mcp/internal/domain/records"
 	"github.com/denizgursoy/kafka-mcp/internal/domain/serde"
+	"github.com/denizgursoy/kafka-mcp/internal/domain/transfer"
 )
 
 // Input is the argument set accepted by the search_messages tool.
 type Input struct {
 	Topic         string     `json:"topic" jsonschema:"Topic to search. Matched exactly and case-sensitively."`
 	Script        string     `json:"script,omitempty" jsonschema:"Optional JavaScript that decides whether a message matches. Return true to keep it. In scope: value (the parsed document for JSON, and the decoded record for Avro, Protobuf, JSON Schema or a configured format; the raw text otherwise), key (string, decoded document when the key has a schema, or null), headers (object of header name to string), partition, offset, timestamp (a Date), value_bytes and key_bytes (raw sizes, before decoding), format (json, avro, protobuf, json_schema, msgpack, text, binary or null), schema_id (number or null) and decode_error (string or null). Examples: return key === 'order-123'; return value.eventType === 'NEW' && value.payload.amount >= 500; return value.payload.cancelledAt === null. Omit to match every message."`
-	Parallelism   int        `json:"parallelism,omitempty" jsonschema:"Optional number of concurrent readers, from 1 to 16. Defaults to 1. It splits a single-partition topic's offsets between readers, which makes a full scan of one large partition faster. A multi-partition topic is already read across its partitions together, so this does not apply there. Worth using for count_only, output_file or a full scan of one partition."`
+	Parallelism   int        `json:"parallelism,omitempty" jsonschema:"Optional number of concurrent readers, from 1 to 16. Defaults to 1. It splits a single-partition topic's offsets between readers, which makes a full scan of one large partition faster. A multi-partition topic is already read across its partitions together, so this does not apply there. Worth using for count_only, download or a full scan of one partition."`
 	Partitions    []int32    `json:"partitions,omitempty" jsonschema:"Optional partitions to restrict the search to. Defaults to every partition. Do not guess a partition from a message key: producers may set the partition explicitly, so the key does not determine it."`
 	FromOffset    *int64     `json:"from_offset,omitempty" jsonschema:"Optional inclusive offset to start scanning from, applied to every searched partition."`
 	ToOffset      *int64     `json:"to_offset,omitempty" jsonschema:"Optional exclusive offset to stop scanning at, applied to every searched partition."`
 	FromTimestamp *time.Time `json:"from_timestamp,omitempty" jsonschema:"Optional inclusive start time (RFC3339). Resolved to the first offset at or after this time; messages whose own timestamp is earlier are skipped and not counted as scanned."`
 	ToTimestamp   *time.Time `json:"to_timestamp,omitempty" jsonschema:"Optional exclusive end time (RFC3339). Resolved to the first offset at or after this time; messages whose own timestamp is at or after it are skipped and not counted as scanned."`
 	Direction     string     `json:"direction,omitempty" jsonschema:"Optional scan direction: newest_first (default) or oldest_first. Decides which matches are kept when max_matches cuts the search short. Every partition is read together, so newest_first means newest in the topic, ordered by timestamp, rather than newest in one partition."`
-	MaxMatches    int        `json:"max_matches,omitempty" jsonschema:"Optional maximum number of matches to return. Defaults to 10, at most 1000. Use output_file to export more."`
+	MaxMatches    int        `json:"max_matches,omitempty" jsonschema:"Optional maximum number of matches to return. Defaults to 10, at most 1000. Use download to export more."`
 	MaxScanned    int        `json:"max_messages_scanned,omitempty" jsonschema:"Optional maximum number of messages to read before giving up. Defaults to 10000, at most 100000000."`
 	MaxValueBytes int        `json:"max_value_bytes,omitempty" jsonschema:"Optional maximum value bytes to return per match. Defaults to 512, at most 1048576. Longer values are cut and flagged with truncated=true."`
 	TimeoutSecond int        `json:"timeout_seconds,omitempty" jsonschema:"Optional wall-clock limit for the scan in seconds. Defaults to 30, at most 3600."`
 	CountOnly     bool       `json:"count_only,omitempty" jsonschema:"Optional. When true, scan the whole range and return only how many messages matched, with a per-partition breakdown and no message bodies. Use this first when a query may match a great many messages, then ask the user how they want them before fetching any."`
-	GroupBy       string     `json:"group_by,omitempty" jsonschema:"Optional JavaScript expression, with the same variables as script, that returns a bucket name for each matching message, e.g. return headers['error-reason'] or return key or return schema_id. Every match in the range is counted per bucket, like count_only, and no message bodies are returned. null and undefined form the bucket null. Cannot be combined with output_file."`
+	GroupBy       string     `json:"group_by,omitempty" jsonschema:"Optional JavaScript expression, with the same variables as script, that returns a bucket name for each matching message, e.g. return headers['error-reason'] or return key or return schema_id. Every match in the range is counted per bucket, like count_only, and no message bodies are returned. null and undefined form the bucket null. Cannot be combined with download."`
 	MaxGroups     int        `json:"max_groups,omitempty" jsonschema:"Optional number of largest buckets to return with group_by. Defaults to 20, at most 1000. groups_truncated says whether more existed."`
-	OutputFile    string     `json:"output_file,omitempty" jsonschema:"Optional file name to write every match to, as one JSON message per line. Use this instead of returning thousands of messages. A new name only, not a path: the server chooses the directory and refuses a name that already exists. The response reports the path, the number written and a short preview."`
+	Download      *Download  `json:"download,omitempty" jsonschema:"Optional. Instead of returning matches, return a one-time link that streams every match to a file on the user's own machine. Nothing is written on the server: the search runs when the link is fetched. Run the returned command, e.g. curl, on the user's machine. Use it instead of returning thousands of messages, or whenever the user wants the messages in a file."`
+}
+
+// Download asks for the matches as a file on the caller's machine.
+type Download struct {
+	Format   string `json:"format,omitempty" jsonschema:"Optional file format: jsonl (default, one JSON message per line) or csv. Both are kafka-console's export layout, so the file can be imported there: values are never cut (max_value_bytes does not apply), null keys and values stay null, and payloads are exact bytes (key_encoding, value_encoding utf8 or base64) or, with a Schema Registry schema id, the decoded document with that id."`
+	Filename string `json:"filename,omitempty" jsonschema:"Optional name to save the file as on the user's machine, in the suggested command. Defaults to <topic>.jsonl or <topic>.csv."`
 }
 
 // ScannedRange reports the offsets actually covered in one partition.
@@ -76,7 +83,7 @@ type Output struct {
 	StoppedReason   string            `json:"stopped_reason"`
 	Complete        bool              `json:"complete"`
 	ScriptErrors    int               `json:"script_errors,omitempty"`
-	OutputFile      string            `json:"output_file,omitempty"`
+	Download        *transfer.Ticket  `json:"download,omitempty"`
 	WrittenMessages int               `json:"written_messages,omitempty"`
 	Groups          []Group           `json:"groups,omitempty"`
 	GroupsTruncated bool              `json:"groups_truncated,omitempty"`
@@ -88,6 +95,9 @@ const (
 	reasonMaxMatches = "max_matches"
 	reasonMaxScanned = "max_scanned"
 	reasonTimeout    = "timeout"
+	// reasonNotStarted is a download's: the search runs when its link is
+	// fetched.
+	reasonNotStarted = "not_started"
 )
 
 // Defaults chosen to keep a scan cheap and its result small enough for an MCP
@@ -135,7 +145,9 @@ the topic uses LogAppendTime.
 
 Kafka has no server-side search, so scans are bounded. Check complete,
 stopped_reason and scanned_ranges before treating no matches as conclusive.
-Use count_only or output_file for large result sets. A script that runs past
+Use count_only for large result sets, and download to save them: the response
+is then a one-time link, and the search runs and streams every match to the
+user's machine when the link is fetched, without storing anything on the server. A script that runs past
 timeout_seconds is interrupted and counted in script_errors; scripts are not
 memory-sandboxed, so keep predicates simple.
 `
@@ -145,7 +157,7 @@ func Register(
 	server *mcp.Server,
 	admin *kadm.Client,
 	reader *records.Reader,
-	outputDir string,
+	files *transfer.Hub,
 ) {
 	mcp.AddTool(
 		server,
@@ -159,7 +171,7 @@ func Register(
 			input Input,
 		) (*mcp.CallToolResult, Output, error) {
 
-			out, err := Run(ctx, admin, reader, outputDir, input)
+			out, err := Run(ctx, admin, reader, files, transfer.Base(req), input)
 			if err != nil {
 				return nil, Output{}, fmt.Errorf("search messages: %w", err)
 			}
@@ -170,11 +182,16 @@ func Register(
 }
 
 // Run scans a bounded part of a topic and returns the messages that match.
+//
+// With download it scans nothing yet: it checks the search would start, then
+// returns a link from files whose fetch runs the search and streams every
+// match. base is the address the caller reached the server at.
 func Run(
 	ctx context.Context,
 	admin *kadm.Client,
 	reader *records.Reader,
-	outputDir string,
+	files *transfer.Hub,
+	base string,
 	input Input,
 ) (Output, error) {
 
@@ -182,6 +199,94 @@ func Run(
 	if err != nil {
 		return Output{}, err
 	}
+
+	if options.download != nil {
+		return offer(ctx, admin, reader, files, base, input, options)
+	}
+
+	return search(ctx, admin, reader, input, options, nil)
+}
+
+// offer validates a download now, so a mistake is reported to the caller
+// rather than as a failed curl, and returns its link.
+func offer(
+	ctx context.Context,
+	admin *kadm.Client,
+	reader *records.Reader,
+	files *transfer.Hub,
+	base string,
+	input Input,
+	options *options,
+) (Output, error) {
+
+	if _, err := options.newScripts(); err != nil {
+		return Output{}, err
+	}
+
+	window := records.Window{
+		Partitions:    input.Partitions,
+		FromOffset:    input.FromOffset,
+		ToOffset:      input.ToOffset,
+		FromTimestamp: input.FromTimestamp,
+		ToTimestamp:   input.ToTimestamp,
+	}
+	if _, err := records.ResolveWindows(ctx, admin, input.Topic, window); err != nil {
+		return Output{}, err
+	}
+
+	contentType := "application/x-ndjson"
+	if options.download.format == formatCSV {
+		contentType = "text/csv; charset=utf-8"
+	}
+
+	ticket, err := files.Offer(base, options.download.filename, contentType, func(ctx context.Context, w io.Writer) (any, error) {
+		export, err := newExporter(w, options.download.format)
+		if err != nil {
+			return nil, err
+		}
+
+		out, err := search(ctx, admin, reader, input, options, export)
+		if err != nil {
+			return nil, err
+		}
+		if err := export.flush(); err != nil {
+			return nil, err
+		}
+
+		// A file is a copy of the range asked for, so one cut short by a
+		// limit is a failure rather than a smaller file that looks whole.
+		if !out.Complete {
+			return out, fmt.Errorf(
+				"the search stopped early (%s) after writing %d matches, so the file is incomplete: "+
+					"raise max_messages_scanned or timeout_seconds, or narrow the range, and ask for a new link",
+				out.StoppedReason, out.WrittenMessages)
+		}
+
+		return out, nil
+	})
+	if err != nil {
+		return Output{}, err
+	}
+
+	return Output{
+		Topic:         input.Topic,
+		Matches:       []records.Message{},
+		ScannedRanges: []ScannedRange{},
+		StoppedReason: reasonNotStarted,
+		Download:      &ticket,
+	}, nil
+}
+
+// search runs the scan, writing matches to export when it is set instead of
+// collecting them.
+func search(
+	ctx context.Context,
+	admin *kadm.Client,
+	reader *records.Reader,
+	input Input,
+	options *options,
+	export *exporter,
+) (Output, error) {
 
 	window := records.Window{
 		Partitions:    input.Partitions,
@@ -204,17 +309,6 @@ func Run(
 		Matches:       []records.Message{},
 		ScannedRanges: []ScannedRange{},
 		StoppedReason: reasonExhausted,
-	}
-
-	var export *outputfile.Writer
-
-	if options.outputFile != "" {
-		export, err = outputfile.Create(outputDir, "output_file", options.outputFile)
-		if err != nil {
-			return Output{}, err
-		}
-
-		defer export.Close()
 	}
 
 	state := &scanState{
@@ -246,12 +340,7 @@ func Run(
 	}
 
 	if export != nil {
-		if err := export.Close(); err != nil {
-			return Output{}, fmt.Errorf("close output file: %w", err)
-		}
-
-		out.OutputFile = export.Path()
-		out.WrittenMessages = export.Written()
+		out.WrittenMessages = export.written
 	}
 
 	finish(&out, state.scanned, state.split, state.matches, options)
@@ -264,7 +353,7 @@ func Run(
 type scanState struct {
 	window     records.Window
 	options    *options
-	export     *outputfile.Writer
+	export     *exporter
 	out        *Output
 	collecting bool
 	// ordered is true when a round reads a single range, so records arrive in
@@ -449,9 +538,7 @@ func (s *scanState) visit(
 
 		switch {
 		case s.export != nil:
-			if err := s.export.Write(
-				records.RenderDecoded(record, key, value, s.options.maxValueBytes),
-			); err != nil {
+			if err := s.export.write(record, key, value); err != nil {
 				return false, err
 			}
 
@@ -658,7 +745,7 @@ func finish(
 	// When bodies are returned, the count reports what the caller received.
 	// Counting and exporting instead report every match seen, which is the
 	// whole point of asking for them.
-	if !options.countOnly && out.OutputFile == "" {
+	if !options.countOnly && options.download == nil {
 		out.MatchCount = len(out.Matches)
 	}
 
@@ -669,7 +756,7 @@ func finish(
 type options struct {
 	newestFirst   bool
 	countOnly     bool
-	outputFile    string
+	download      *downloadOptions
 	maxMatches    int
 	maxScanned    int
 	maxValueBytes int
@@ -714,14 +801,19 @@ func newOptions(input Input) (*options, error) {
 		}
 	}
 
-	if input.GroupBy != "" && input.OutputFile != "" {
+	if input.GroupBy != "" && input.Download != nil {
 		return nil, fmt.Errorf(
-			"group_by and output_file cannot be combined: grouping returns counts, not messages to write")
+			"group_by and download cannot be combined: grouping returns counts, not messages to save")
 	}
 
-	if input.CountOnly && input.OutputFile != "" {
+	if input.CountOnly && input.Download != nil {
 		return nil, fmt.Errorf(
-			"count_only and output_file cannot be combined: counting returns no messages to write")
+			"count_only and download cannot be combined: counting returns no messages to save")
+	}
+
+	download, err := newDownload(input.Topic, input.Download)
+	if err != nil {
+		return nil, err
 	}
 
 	o := &options{
@@ -729,7 +821,7 @@ func newOptions(input Input) (*options, error) {
 		groupBy:       input.GroupBy,
 		maxGroups:     input.MaxGroups,
 		countOnly:     input.CountOnly || input.GroupBy != "",
-		outputFile:    input.OutputFile,
+		download:      download,
 		maxMatches:    input.MaxMatches,
 		maxScanned:    input.MaxScanned,
 		maxValueBytes: input.MaxValueBytes,

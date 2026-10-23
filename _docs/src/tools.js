@@ -142,7 +142,7 @@ export const tools = [
       ['max_messages_scanned', 'int', false, 'Read at most this many. Default 10000, at most 100000000'],
       ['parallelism', 'int', false, 'Readers for one partition, 1 to 16. Default 1'],
       ['count_only', 'bool', false, 'Counts only, no bodies'],
-      ['output_file', 'string', false, 'Write every match to this new file as JSONL. An existing name is refused'],
+      ['download', 'object', false, '{format, filename}: a one-time link that streams every match to the user\u2019s machine as jsonl or csv, in kafka-console\u2019s import layout. Nothing is stored on the server. Values are never cut'],
       ['timeout_seconds', 'int', false, 'Wall-clock limit. Default 30, at most 3600'],
       ['group_by', 'string', false, 'Expression returning a bucket per match. Counts per bucket, no bodies'],
       ['max_groups', 'int', false, 'Largest buckets returned with group_by. Default 20, at most 1000'],
@@ -498,7 +498,7 @@ export const tools = [
     write: 'destination',
     summary: 'Writes a new message into an existing topic, marked so it is never mistaken for a real one.',
     detail:
-      'Omit partition unless the exact partition is the point: the key decides placement, and a named partition breaks ordering for that key. For a schema-encoded topic give the value as JSON with value_schema; it is validated and encoded before anything is written. For more than 500 messages, or a set saved by transform_messages, pass input_file instead of items: a file in output_dir with one item per line. Every line is validated first and failures are reported by line number. A produced message cannot be deleted.',
+      'Omit partition unless the exact partition is the point: the key decides placement, and a named partition breaks ordering for that key. For a schema-encoded topic give the value as JSON with value_schema; it is validated and encoded before anything is written. For more than 500 messages, or a set saved by transform_messages, pass upload instead of items: a one-time link for a file on the user\u2019s machine, one item per line, read as it uploads and never stored. Without confirm the upload only checks the file; failures are reported by line number. A produced message cannot be deleted.',
     params: [
       ['topic', 'string', true, 'Existing topic'],
       ['value', 'string', true, 'The message body'],
@@ -509,6 +509,7 @@ export const tools = [
       ['value_schema', 'object', false, 'Encode value to a registry schema. {} = latest <topic>-value'],
       ['key_schema', 'object', false, 'Encode key to a registry schema. {} = latest <topic>-key'],
       ['destination_cluster', 'string', false, 'Defaults to this endpoint\u2019s cluster. Another must be in this endpoint\u2019s destinations'],
+      ['upload', 'object', false, 'Top level, instead of items. {filename}: a one-time link for a file on the user\u2019s machine'],
     ],
     call: { items: [{ topic: 'orders', key: 'ORD-12345', value: '{"status":"NEW"}', value_schema: {} }], confirm: false },
     result: {
@@ -526,7 +527,7 @@ export const tools = [
     write: 'destination',
     summary: 'Rewrites messages with JavaScript and writes the results as new messages, keeping the originals.',
     detail:
-      'For repairs such as a document wrapped in a payload field. The transform is JavaScript run once per message, with the same variables as search_messages, and returns any of value, key and headers; what it leaves out is kept, null skips the message, a header set to null is removed, and an unknown field is refused. Integers beyond 2^53 arrive as BigInt, so 64-bit ids are written back exactly. Schema-encoded values are decoded for it and re-encoded with the same schema. Writing back to the source topic stops at the end offset the call started with. Without confirm nothing reaches Kafka: it counts, shows before/after examples and groups failures. output_file saves the set for produce_message input_file.',
+      'For repairs such as a document wrapped in a payload field. The transform is JavaScript run once per message, with the same variables as search_messages, and returns any of value, key and headers; what it leaves out is kept, null skips the message, a header set to null is removed, and an unknown field is refused. Integers beyond 2^53 arrive as BigInt, so 64-bit ids are written back exactly. Schema-encoded values are decoded for it and re-encoded with the same schema. Writing back to the source topic stops at the end offset the call started with. Without confirm nothing reaches Kafka: it counts, shows before/after examples and groups failures. download streams the set to the user\u2019s machine for a later produce_message upload, without storing anything on the server.',
     params: [
       ['topic', 'string', true, 'Topic to read from'],
       ['transform', 'string', true, 'Returns { value, key, headers }, any subset, or null to skip'],
@@ -540,7 +541,7 @@ export const tools = [
       ['value_schema / key_schema', 'object', false, 'Encode to this registry schema instead of the one read'],
       ['max_messages', 'int', false, 'Selected messages to process. Default 100000, at most 10000000'],
       ['timeout_seconds', 'int', false, 'Wall-clock limit. Default 300, at most 3600'],
-      ['output_file', 'string', false, 'Save the new messages as produce_message items, one per line'],
+      ['download', 'object', false, '{filename}: a one-time link that saves the new messages on the user\u2019s machine as produce_message items. Not with confirm'],
       ['confirm', 'bool', false, 'Default false: nothing is written to Kafka'],
     ],
     call: {

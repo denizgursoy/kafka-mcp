@@ -18,7 +18,7 @@ data back. Treat every step below as load-bearing.
 | `list_topics`          | Finding the exact names, and what the siblings are     |
 | `describe_topic`       | How much data and how many partitions are at stake     |
 | `list_consumer_groups` | Who reads the topic today                              |
-| `search_messages`      | Preserving anything worth keeping, with `output_file`  |
+| `search_messages`      | Preserving anything worth keeping, with `download`     |
 | `copy_message`         | Preserving individual messages elsewhere first         |
 | `delete_topic`         | Previewing and deleting                                |
 
@@ -65,8 +65,12 @@ is reading this topic today, and someone owns it.
 If `message_count` is not zero, ask what should happen to the data **before**
 asking whether to delete:
 
-- **`search_messages` with `output_file`** — writes every message to a file on
-  the server as JSON lines. The practical option for a whole topic.
+- **`search_messages` with `download`** — saves every message to a file on
+  the user's machine as JSON lines, or CSV with `format: "csv"`: run the
+  returned command there. The practical option for a whole topic; nothing is
+  stored on the server, and kafka-console can import the file back. Raise
+  `max_messages_scanned` to cover the whole topic, or the download fails as
+  incomplete.
 - **`copy_message` to another topic** — for a handful of messages worth keeping
   inside Kafka, possibly on another cluster.
 - **Nothing** — legitimate for a scratch topic, but say plainly that the

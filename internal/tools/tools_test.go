@@ -34,7 +34,6 @@ func TestRegistrationSuite(t *testing.T) {
 
 func (s *RegistrationSuite) SetupSuite() {
 	s.cfg = &config.Config{
-		OutputDir: s.T().TempDir(),
 		Clusters: map[string]*config.Cluster{
 			"readonly": {
 				Name:     "readonly",
@@ -115,7 +114,7 @@ func (s *RegistrationSuite) exposed(cluster string) (listed, reported []string) 
 	// test. The implementation name and version are main's business and bear
 	// on nothing here.
 	server := mcp.NewServer(&mcp.Implementation{Name: "kafka-mcp-" + cluster, Version: "test"}, nil)
-	s.Require().NoError(Register(server, s.cfg, s.clusters, cluster, Audit{}),
+	s.Require().NoError(Register(server, s.cfg, s.clusters, cluster, Audit{}, nil),
 		"registration must accept a valid configuration for cluster %q, or the endpoint serves nothing", cluster)
 
 	serverSession, err := server.Connect(ctx, serverTransport, nil)
@@ -185,7 +184,7 @@ func (s *RegistrationSuite) TestExposedTools() {
 		s.Require().Contains(listed, "list_topics",
 			"read-only is the reason this server exists for a protected cluster, so reading must be untouched")
 		s.Require().Contains(listed, "search_messages",
-			"searching writes only to output_dir, never to the cluster, so read_only does not bear on it")
+			"searching only reads the cluster, and its download streams to the caller, so read_only does not bear on it")
 		s.Require().Contains(listed, "server_config",
 			"server_config is how a session learns the cluster is read-only, so hiding it would remove the explanation")
 		s.Require().Contains(listed, "cluster_health",
@@ -272,7 +271,7 @@ func (s *RegistrationSuite) TestRejectsAnUnusableToolConfiguration() {
 	s.Run("an unknown tool name stops the server", func() {
 		server := mcp.NewServer(&mcp.Implementation{Name: "kafka-mcp-typo", Version: "test"}, nil)
 
-		err := Register(server, s.cfg, s.clusters, "typo", Audit{})
+		err := Register(server, s.cfg, s.clusters, "typo", Audit{}, nil)
 
 		s.Require().Error(err,
 			"a misspelled tool name switches nothing off, so the tool it was meant to withhold would stay exposed: that must fail at startup rather than at the call that discovers it")
@@ -283,7 +282,7 @@ func (s *RegistrationSuite) TestRejectsAnUnusableToolConfiguration() {
 	s.Run("disabling server_config stops the server", func() {
 		server := mcp.NewServer(&mcp.Implementation{Name: "kafka-mcp-silent", Version: "test"}, nil)
 
-		err := Register(server, s.cfg, s.clusters, "silent", Audit{})
+		err := Register(server, s.cfg, s.clusters, "silent", Audit{}, nil)
 
 		s.Require().Error(err,
 			"without server_config a session cannot tell a withheld tool from a missing feature, or learn the cluster is read-only, so the configuration is refused rather than honoured")

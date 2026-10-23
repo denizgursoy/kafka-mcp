@@ -12,7 +12,6 @@ import (
 	"github.com/twmb/franz-go/pkg/kgo"
 
 	"github.com/denizgursoy/kafka-mcp/internal/domain/kafkaclient"
-	"github.com/denizgursoy/kafka-mcp/internal/domain/outputfile"
 )
 
 // flushSize is how many records are produced together when sending a file.
@@ -20,122 +19,102 @@ import (
 // million repaired messages would take hours.
 const flushSize = 1000
 
-// runFile writes the items held in a file, one JSON item per line.
+// runUpload reads items from an uploaded file, one JSON item per line, and
+// with confirm produces the valid ones as it reads.
 //
-// The file is read twice. The first pass validates every line, so the preview
-// reports every line that would fail before anything is written, and a file of
-// any size never has to be held in memory. With confirm, the second pass writes
-// the lines that were valid, in file order.
-func runFile(
+// The file is never stored, so it is read once: validating every line before
+// writing any, as a preview does, would need it twice. A send therefore
+// writes each valid line in file order and reports the invalid ones by line
+// number, exactly as a confirmed file always has; a preview upload first
+// shows what a send would do.
+func runUpload(
 	ctx context.Context,
 	clusters *kafkaclient.Registry,
 	own string,
-	dir string,
-	name string,
+	r io.Reader,
 	confirm bool,
 	client string,
-) (BatchOutput, error) {
-
-	file, err := outputfile.Open(dir, "input_file", name)
-	if err != nil {
-		return BatchOutput{}, err
-	}
-	defer file.Close()
+) (*FileOutput, error) {
 
 	out := &FileOutput{
-		Path:     file.Name(),
 		Examples: []Output{},
 		Errors:   []LineError{},
 	}
 	topics := &topicCache{}
-	invalid := make(map[int]bool)
-
-	err = eachLine(file, func(line int, item Item, parseErr error) error {
-		out.Lines++
-
-		if parseErr == nil {
-			var ready *prepared
-
-			ready, parseErr = prepare(ctx, clusters, own, item, client, topics)
-			if parseErr == nil {
-				out.Valid++
-
-				if len(out.Examples) < maxFileExamples {
-					out.Examples = append(out.Examples, ready.out)
-				}
-
-				return nil
-			}
-		}
-
-		// A read-only destination refuses every line for the same reason, so
-		// it is a refusal of the call rather than a million line errors.
-		var refused readOnlyError
-		if errors.As(parseErr, &refused) {
-			return parseErr
-		}
-
-		out.Invalid++
-		invalid[line] = true
-		out.addError(line, parseErr)
-
-		return nil
-	})
-	if err != nil {
-		return BatchOutput{}, err
-	}
-
-	if out.Lines == 0 {
-		return BatchOutput{}, fmt.Errorf("input_file %q holds no messages", name)
-	}
-
-	if !confirm || out.Valid == 0 {
-		out.Note = fmt.Sprintf(
-			"nothing was written. %d of %d lines are valid. Call again with confirm true to produce them.",
-			out.Valid, out.Lines)
-
-		return BatchOutput{File: out}, nil
-	}
-
-	if _, err := file.Seek(0, io.SeekStart); err != nil {
-		return BatchOutput{}, fmt.Errorf("rewind input_file: %w", err)
-	}
-
 	sender := &fileSender{ctx: ctx, out: out}
 
-	err = eachLine(file, func(line int, item Item, parseErr error) error {
-		if invalid[line] || parseErr != nil {
+	err := eachLine(r, func(line int, item Item, parseErr error) error {
+		out.Lines++
+
+		var ready *prepared
+		if parseErr == nil {
+			ready, parseErr = prepare(ctx, clusters, own, item, client, topics)
+		}
+
+		if parseErr != nil {
+			// A read-only destination refuses every line for the same reason,
+			// so it is a refusal of the call rather than a million line errors.
+			var refused readOnlyError
+			if errors.As(parseErr, &refused) {
+				return parseErr
+			}
+
+			out.Invalid++
+			out.addError(line, parseErr)
+
 			return nil
 		}
 
-		ready, err := prepare(ctx, clusters, own, item, client, topics)
-		if err != nil {
-			// The file changed between the passes, or the topic did.
-			out.Failed++
-			out.addError(line, err)
+		out.Valid++
+		if len(out.Examples) < maxFileExamples {
+			example := ready.out
+			// The summary's own note says what was written; the per-message
+			// preview note would claim nothing was.
+			if confirm {
+				example.Note = ""
+			}
+			out.Examples = append(out.Examples, example)
+		}
 
+		if !confirm {
 			return nil
 		}
 
 		return sender.add(line, ready)
 	})
-	if err == nil {
+
+	var refused readOnlyError
+	if errors.As(err, &refused) {
+		return nil, err
+	}
+
+	if err == nil && confirm {
 		err = sender.flush()
 	}
 
-	out.Applied = out.Written > 0
-	out.Note = fmt.Sprintf(
-		"produced %d of %d lines. Writing is not atomic: messages written before a failure stay, and a produced message cannot be deleted until retention removes it.",
-		out.Written, out.Lines)
-
-	if err != nil {
-		// Context cancellation or a broken file mid-send: what was written
-		// stays, and the caller must see how far it got.
-		out.Note = fmt.Sprintf("stopped after producing %d of %d lines: %v. Messages already written stay.",
-			out.Written, out.Lines, err)
+	if err == nil && out.Lines == 0 {
+		return nil, fmt.Errorf("the uploaded file holds no messages")
 	}
 
-	return BatchOutput{File: out}, nil
+	out.Applied = out.Written > 0
+
+	switch {
+	case err != nil:
+		// Context cancellation or a broken upload mid-send: what was written
+		// stays, and the caller must see how far it got.
+		out.Note = fmt.Sprintf("stopped after producing %d of %d lines read: %v. Messages already written stay.",
+			out.Written, out.Lines, err)
+	case !confirm:
+		out.Note = fmt.Sprintf(
+			"nothing was written. %d of %d lines are valid. Call produce_message again with upload and confirm true for a link that writes them.",
+			out.Valid, out.Lines)
+	default:
+		out.Note = fmt.Sprintf(
+			"produced %d of %d lines. Writing is not atomic: messages written before a failure stay, and a produced message cannot be deleted until retention removes it.",
+			out.Written, out.Lines)
+	}
+
+	return out, nil
 }
 
 // eachLine calls fn with every non-blank line of r decoded as an Item. A line
@@ -156,7 +135,7 @@ func eachLine(r io.Reader, fn func(line int, item Item, err error) error) error 
 		}
 
 		if line > maxFileLines {
-			return fmt.Errorf("input_file has more than %d lines", maxFileLines)
+			return fmt.Errorf("the file has more than %d lines", maxFileLines)
 		}
 
 		var item Item
@@ -178,10 +157,10 @@ func eachLine(r io.Reader, fn func(line int, item Item, err error) error) error 
 
 	if err := scanner.Err(); err != nil {
 		if errors.Is(err, bufio.ErrTooLong) {
-			return fmt.Errorf("input_file line %d is longer than %d bytes", line+1, maxLineBytes)
+			return fmt.Errorf("line %d is longer than %d bytes", line+1, maxLineBytes)
 		}
 
-		return fmt.Errorf("read input_file: %w", err)
+		return fmt.Errorf("read the file: %w", err)
 	}
 
 	return nil

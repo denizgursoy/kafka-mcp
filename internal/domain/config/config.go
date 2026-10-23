@@ -113,6 +113,12 @@ type HTTP struct {
 	// the listener.
 	AuthToken string `cfg:"auth_token" log:"false"`
 
+	// PublicURL is the address callers reach the server at, such as
+	// https://kafka.example.com, when a reverse proxy hides it. Download and
+	// upload links are built on it. Empty means the address each request
+	// arrived at.
+	PublicURL string `cfg:"public_url"`
+
 	// CORS is ada's own CORS configuration, filled straight from the config
 	// file. Its `cfg` tags are the config keys, so the middleware gains an
 	// option and this server gains it with it, without a mapping in between
@@ -199,7 +205,10 @@ type endpoint struct {
 
 // file mirrors the whole config file.
 type file struct {
-	HTTP      HTTP                 `cfg:"http"`
+	HTTP HTTP `cfg:"http"`
+	// OutputDir is read only to refuse it: files no longer touch the
+	// server, and a setting that silently does nothing would let an
+	// operator believe exports still land there.
 	OutputDir string               `cfg:"output_dir"`
 	Clusters  map[string]*cluster  `cfg:"clusters"`
 	Endpoints map[string]*endpoint `cfg:"endpoints"`
@@ -313,8 +322,7 @@ func (c *Cluster) DisabledTools() []string {
 
 // Config is the effective configuration the server runs with.
 type Config struct {
-	HTTP      HTTP
-	OutputDir string
+	HTTP HTTP
 
 	// Clusters is keyed by cluster name.
 	Clusters map[string]*Cluster
@@ -383,7 +391,6 @@ func Load(ctx context.Context) (*Config, error) {
 
 	cfg := &Config{
 		HTTP:      parsed.HTTP,
-		OutputDir: parsed.OutputDir,
 		Clusters:  make(map[string]*Cluster, len(parsed.Clusters)),
 		Endpoints: make(map[string]*Endpoint),
 	}
@@ -400,10 +407,9 @@ func Load(ctx context.Context) (*Config, error) {
 	}
 	cfg.HTTP.BasePath = basePath
 
-	// Exports still need somewhere to go, and the temp directory needs no
-	// configuration to be usable.
-	if cfg.OutputDir == "" {
-		cfg.OutputDir = os.TempDir()
+	if parsed.OutputDir != "" {
+		return nil, fmt.Errorf(
+			"config: output_dir is no longer supported: search_messages and transform_messages download, and produce_message uploads, straight to and from the user's machine through one-time links, and nothing is stored on the server. Remove output_dir")
 	}
 
 	for name, parsedCluster := range parsed.Clusters {

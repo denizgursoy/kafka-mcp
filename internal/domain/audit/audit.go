@@ -88,7 +88,8 @@ type arguments struct {
 	// target at the top level, with the same field names an item uses.
 	item
 
-	InputFile string `json:"input_file"`
+	Upload   *struct{} `json:"upload"`
+	Download *struct{} `json:"download"`
 }
 
 // Principal names the identity the broker sees for a cluster, which is the only
@@ -298,8 +299,12 @@ func targets(parsed arguments) string {
 		named = append(named, described)
 	}
 
-	if parsed.InputFile != "" {
-		named = append(named, "file="+parsed.InputFile)
+	if parsed.Upload != nil {
+		named = append(named, "upload")
+	}
+
+	if parsed.Download != nil {
+		named = append(named, "download")
 	}
 
 	for index, item := range parsed.Items {

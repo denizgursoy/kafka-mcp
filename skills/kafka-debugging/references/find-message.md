@@ -146,7 +146,7 @@ investigation goes wrong.
 `parallelism` reads a **single-partition** topic with that many concurrent
 readers, which is what makes a full scan of one large partition fast. The
 matches returned are the same as a sequential search would return. It is worth
-setting for `count_only`, `group_by`, `output_file` or a full-range search on
+setting for `count_only`, `group_by`, `download` or a full-range search on
 such a topic.
 
 A multi-partition topic is already read across its partitions together, so the
@@ -166,8 +166,11 @@ example address each, largest first. Then **ask the user how they want them**:
 - the newest few (`direction: "newest_first"`, small `max_matches`)
 - the oldest few (`direction: "oldest_first"`)
 - a narrower filter to cut the number down
-- everything written to a file (`output_file: "matches.jsonl"`), which returns
-  a path instead of flooding the conversation
+- everything saved to a file on their machine (`download: {}`, or
+  `download: {"format": "csv"}` for a spreadsheet), which returns a one-time
+  link and a `curl` command to run there instead of flooding the conversation.
+  Run the command in the directory the user wants the file in; nothing is
+  stored on the server
 
 Never print thousands of messages into the chat.
 

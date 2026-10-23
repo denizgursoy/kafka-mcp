@@ -6,7 +6,9 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"io"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -17,6 +19,7 @@ import (
 	"github.com/denizgursoy/kafka-mcp/internal/domain/kafkaclient"
 	"github.com/denizgursoy/kafka-mcp/internal/domain/records"
 	"github.com/denizgursoy/kafka-mcp/internal/domain/serde"
+	"github.com/denizgursoy/kafka-mcp/internal/domain/transfer"
 )
 
 // Provenance headers added to every produced message, so a record this server
@@ -66,9 +69,14 @@ type SchemaRef struct {
 // therefore not optional: they are what keeps a fabricated message
 // distinguishable from a genuine one.
 type Input struct {
-	Items     []Item `json:"items,omitempty" jsonschema:"The messages to write, 1 to 500 of them. Writing one message is an array of length one. Two identical items mean two messages, which is allowed: appending the same payload twice is a real request. Give either items or input_file, not both."`
-	InputFile string `json:"input_file,omitempty" jsonschema:"Optional name of a file in the server's output directory holding one item per line as JSON, with the same fields as an entry of items, such as the file transform_messages writes with output_file. A file name only, not a path. Use it to send more messages than items allows, or to send a set that was saved and inspected first. Every line is validated before anything is written; without confirm nothing is written and the response counts the valid lines and reports the invalid ones by line number. Give either items or input_file, not both."`
-	Confirm   bool   `json:"confirm,omitempty" jsonschema:"Optional. When false or omitted, nothing is written and the response shows the messages that would be produced. Must be true to actually write them. One confirm covers the whole batch."`
+	Items   []Item  `json:"items,omitempty" jsonschema:"The messages to write, 1 to 500 of them. Writing one message is an array of length one. Two identical items mean two messages, which is allowed: appending the same payload twice is a real request. Give either items or upload, not both."`
+	Upload  *Upload `json:"upload,omitempty" jsonschema:"Optional. Instead of items, send messages from a file on the user's own machine: the response is a one-time link and a command, e.g. curl -T, to run there. The file holds one item per line as JSON, with the same fields as an entry of items, such as the file transform_messages download saves. It is read as it uploads and never stored on the server. Use it for more messages than items allows, or for a set saved and inspected first. Without confirm the upload writes nothing and its response counts the valid lines and reports the invalid ones by line number; upload again with a new link and confirm to send. Give either items or upload, not both."`
+	Confirm bool    `json:"confirm,omitempty" jsonschema:"Optional. When false or omitted, nothing is written and the response shows the messages that would be produced. Must be true to actually write them. One confirm covers the whole batch."`
+}
+
+// Upload asks for a link that takes a file from the caller's machine.
+type Upload struct {
+	Filename string `json:"filename,omitempty" jsonschema:"Optional name of the file on the user's machine, used in the suggested command. Defaults to messages.jsonl."`
 }
 
 // Output is the result returned by the produce_message tool.
@@ -86,19 +94,20 @@ type Output struct {
 	Note               string          `json:"note,omitempty"`
 }
 
-// BatchOutput is the response: the batch envelope for items, plus File when
-// the messages came from input_file.
+// BatchOutput is the response: the batch envelope for items, or the link an
+// upload is sent to.
 type BatchOutput struct {
 	batch.Output[Output]
 
-	File *FileOutput `json:"file,omitempty"`
+	Upload *transfer.Ticket `json:"upload,omitempty"`
 }
 
-// FileOutput summarises a send from input_file. A file may hold far more
-// messages than a response can list, so it reports counts, the first few
-// messages and the lines that failed rather than one result per line.
+// FileOutput summarises an upload, returned to the command that sent it. A
+// file may hold far more messages than a response can list, so it reports
+// counts, the first few messages and the lines that failed rather than one
+// result per line.
 type FileOutput struct {
-	Path     string      `json:"path"`
+	Confirm  bool        `json:"confirm"`
 	Lines    int         `json:"lines"`
 	Valid    int         `json:"valid"`
 	Invalid  int         `json:"invalid"`
@@ -112,13 +121,13 @@ type FileOutput struct {
 	Note            string `json:"note,omitempty"`
 }
 
-// LineError is one line of input_file that could not be written.
+// LineError is one line of an upload that could not be written.
 type LineError struct {
 	Line  int    `json:"line"`
 	Error string `json:"error"`
 }
 
-// Bounds on a send from input_file.
+// Bounds on an upload.
 const (
 	maxFileLines    = 10_000_000
 	maxLineBytes    = 16 << 20
@@ -128,17 +137,18 @@ const (
 
 const description = `
 Write 1 to 500 new messages in one call through items, or any number from
-input_file, to existing topics on this or another configured cluster. The caller supplies the key, value and headers,
+an upload, to existing topics on this or another configured cluster. The caller supplies the key, value and headers,
 so unlike copy_message this can write content no producer ever sent. Writing one
 message is an items array of length one.
 
 Every message carries provenance headers naming this tool, the time and the
 principal, so a fabricated message stays distinguishable from a genuine one.
 
-input_file names a file in the server's output directory holding one item per
-line as JSON, such as the file transform_messages saves with output_file. Every
-line is validated before any is written, and the response reports counts, a few
-examples and the failing lines by number instead of one result per line.
+upload returns a one-time link for a file on the user's own machine, one item
+per line as JSON, such as the file a transform_messages download saves. Run the
+returned command there; the file is read as it uploads and never stored on the
+server, and the command prints counts, a few examples and the failing lines by
+number. Without confirm the upload only checks the file.
 
 Nothing is written unless confirm is true; one confirm covers the whole batch,
 and writing is not atomic because Kafka cannot retract a record produced before
@@ -167,7 +177,7 @@ func Register(
 	server *mcp.Server,
 	clusters *kafkaclient.Registry,
 	own string,
-	inputDir string,
+	files *transfer.Hub,
 ) {
 	mcp.AddTool(
 		server,
@@ -187,7 +197,7 @@ func Register(
 				client = info.Name
 			}
 
-			out, err := run(ctx, clusters, own, inputDir, input, client)
+			out, err := run(ctx, clusters, own, files, transfer.Base(req), input, client)
 			if err != nil {
 				return nil, BatchOutput{}, fmt.Errorf("produce messages: %w", err)
 			}
@@ -201,34 +211,38 @@ func Register(
 // non-atomic because Kafka cannot retract a record produced before a later item
 // failed.
 //
-// inputDir is the directory input_file is read from.
+// An upload writes nothing now: files hands out a link, and the file is
+// checked or sent when the caller uploads it there. base is the address the
+// caller reached the server at.
 func Run(
 	ctx context.Context,
 	clusters *kafkaclient.Registry,
 	own string,
-	inputDir string,
+	files *transfer.Hub,
+	base string,
 	input Input,
 ) (BatchOutput, error) {
 
-	return run(ctx, clusters, own, inputDir, input, "")
+	return run(ctx, clusters, own, files, base, input, "")
 }
 
 func run(
 	ctx context.Context,
 	clusters *kafkaclient.Registry,
 	own string,
-	inputDir string,
+	files *transfer.Hub,
+	base string,
 	input Input,
 	client string,
 ) (BatchOutput, error) {
 
-	if input.InputFile != "" {
+	if input.Upload != nil {
 		if len(input.Items) > 0 {
 			return BatchOutput{}, fmt.Errorf(
-				"give either items or input_file, not both: which messages to write must be unambiguous")
+				"give either items or upload, not both: which messages to write must be unambiguous")
 		}
 
-		return runFile(ctx, clusters, own, inputDir, input.InputFile, input.Confirm, client)
+		return offerUpload(clusters, own, files, base, input.Upload, input.Confirm, client)
 	}
 
 	out, err := runBatch(ctx, clusters, own, input.Items, input.Confirm, client)
@@ -288,6 +302,41 @@ func runBatch(
 	}
 
 	return out, nil
+}
+
+// offerUpload returns the link an upload is sent to.
+func offerUpload(
+	clusters *kafkaclient.Registry,
+	own string,
+	files *transfer.Hub,
+	base string,
+	upload *Upload,
+	confirm bool,
+	client string,
+) (BatchOutput, error) {
+
+	filename := strings.TrimSpace(upload.Filename)
+	if filename == "" {
+		filename = "messages.jsonl"
+	}
+
+	ticket, err := files.Accept(base, filename, func(ctx context.Context, r io.Reader) (any, error) {
+		out, err := runUpload(ctx, clusters, own, r, confirm, client)
+		if out != nil {
+			out.Confirm = confirm
+		}
+
+		return out, err
+	})
+	if err != nil {
+		return BatchOutput{}, err
+	}
+
+	if !confirm {
+		ticket.Note += " This link only checks the file and writes nothing; ask for one with confirm true to send it."
+	}
+
+	return BatchOutput{Output: batch.Output[Output]{Results: []batch.Result[Output]{}}, Upload: &ticket}, nil
 }
 
 // runItem previews or performs one write.

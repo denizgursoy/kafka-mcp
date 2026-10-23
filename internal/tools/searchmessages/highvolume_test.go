@@ -3,8 +3,6 @@ package searchmessages_test
 import (
 	"encoding/json"
 	"fmt"
-	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 
@@ -105,7 +103,7 @@ func (s *HighVolumeSuite) TestFindsEveryMatchAcrossAThousandMessages() {
 		s.T().Context(),
 		s.env.Admin(),
 		s.env.Reader(),
-		"",
+		nil, "",
 		searchmessages.Input{
 			Topic:      s.topic,
 			Script:     `return value.eventType === "NEW"`,
@@ -130,7 +128,7 @@ func (s *HighVolumeSuite) TestNewestFirstStopsAfterTheNewestChunk() {
 		s.T().Context(),
 		s.env.Admin(),
 		s.env.Reader(),
-		"",
+		nil, "",
 		searchmessages.Input{
 			Topic:      s.topic,
 			Script:     `return value.eventType === "NEW"`,
@@ -157,7 +155,7 @@ func (s *HighVolumeSuite) TestOldestFirstStopsAtTheSecondMatch() {
 		s.T().Context(),
 		s.env.Admin(),
 		s.env.Reader(),
-		"",
+		nil, "",
 		searchmessages.Input{
 			Topic:      s.topic,
 			Script:     `return value.eventType === "NEW"`,
@@ -181,7 +179,7 @@ func (s *HighVolumeSuite) TestMatchExactlyOnTheChunkBoundary() {
 		s.T().Context(),
 		s.env.Admin(),
 		s.env.Reader(),
-		"",
+		nil, "",
 		searchmessages.Input{
 			Topic:  s.topic,
 			Script: `return key === "order-500"`,
@@ -201,7 +199,7 @@ func (s *HighVolumeSuite) TestExactKeySearchIgnoresSubstringsInValues() {
 		s.T().Context(),
 		s.env.Admin(),
 		s.env.Reader(),
-		"",
+		nil, "",
 		searchmessages.Input{
 			Topic:  s.topic,
 			Script: `return key === "order-7"`,
@@ -221,7 +219,7 @@ func (s *HighVolumeSuite) TestCountOnlyReportsTotalsWithoutBodies() {
 		s.T().Context(),
 		s.env.Admin(),
 		s.env.Reader(),
-		"",
+		nil, "",
 		searchmessages.Input{
 			Topic:     s.topic,
 			Script:    `return value.eventType === "NEW"`,
@@ -247,7 +245,7 @@ func (s *HighVolumeSuite) TestJSONFilterSelectsByFieldValue() {
 		s.T().Context(),
 		s.env.Admin(),
 		s.env.Reader(),
-		"",
+		nil, "",
 		searchmessages.Input{
 			Topic:      s.topic,
 			Script:     `return value.eventType === "NEW" && value.payload.amount >= 500`,
@@ -270,7 +268,7 @@ func (s *HighVolumeSuite) TestFilterOnNullField() {
 		s.T().Context(),
 		s.env.Admin(),
 		s.env.Reader(),
-		"",
+		nil, "",
 		searchmessages.Input{
 			Topic:      s.topic,
 			Script:     `return value.payload.cancelledAt === null`,
@@ -291,7 +289,7 @@ func (s *HighVolumeSuite) TestQueryAndFilterMustBothHold() {
 		s.T().Context(),
 		s.env.Admin(),
 		s.env.Reader(),
-		"",
+		nil, "",
 		searchmessages.Input{
 			Topic:      s.topic,
 			Script:     `return key === "order-493" && value.payload.amount >= 500`,
@@ -312,7 +310,7 @@ func (s *HighVolumeSuite) TestScanCeilingReportsAnIncompleteSearch() {
 		s.T().Context(),
 		s.env.Admin(),
 		s.env.Reader(),
-		"",
+		nil, "",
 		searchmessages.Input{
 			Topic:      s.topic,
 			Script:     `return value.eventType === "NEW"`,
@@ -335,91 +333,37 @@ func (s *HighVolumeSuite) TestScanCeilingReportsAnIncompleteSearch() {
 	}
 }
 
-func (s *HighVolumeSuite) TestWritesEveryMatchToFile() {
-	dir := s.T().TempDir()
+func (s *HighVolumeSuite) TestDownloadsEveryMatch() {
+	files, base := testenv.Files(s.T())
 
 	out, err := searchmessages.Run(
 		s.T().Context(),
 		s.env.Admin(),
 		s.env.Reader(),
-		dir,
+		files, base,
 		searchmessages.Input{
-			Topic:      s.topic,
-			Script:     `return value.eventType === "NEW"`,
-			OutputFile: "matches.jsonl",
+			Topic:    s.topic,
+			Script:   `return value.eventType === "NEW"`,
+			Download: &searchmessages.Download{},
 		},
 	)
 
-	s.Require().NoError(err, "exporting matches to a file must succeed")
-	s.Require().Equal(len(matchOffsets), out.WrittenMessages,
-		"every match must be written, not only the ones that would have fitted in max_matches")
-	s.Require().Equal(filepath.Join(dir, "matches.jsonl"), out.OutputFile,
-		"the file must be written inside the configured output directory")
+	s.Require().NoError(err, "asking for every match as a download must succeed")
 	s.Require().Empty(out.Matches,
-		"an exported search returns a path instead of bodies, so the caller's context is not flooded")
+		"a download returns a link instead of bodies, so the caller's context is not flooded")
 
-	content, err := os.ReadFile(out.OutputFile)
-	s.Require().NoError(err, "the reported path must exist and be readable")
-
-	lines := strings.Split(strings.TrimSpace(string(content)), "\n")
+	lines := strings.Split(strings.TrimSpace(string(testenv.Fetch(s.T(), *out.Download))), "\n")
 	s.Require().Len(lines, len(matchOffsets),
-		"the file must hold one JSON message per line, one line per match")
+		"every match must be downloaded, not only the ones that would have fitted in max_matches")
 
 	for _, line := range lines {
-		var message records.Message
+		var message searchmessages.ExportedMessage
 
 		s.Require().NoError(json.Unmarshal([]byte(line), &message),
 			"each line must be a complete message that the caller can parse back")
 		s.Require().Contains(matchOffsets, message.Offset,
-			"only planted matches may be written to the file")
+			"only planted matches may be in the download")
 	}
-}
-
-func (s *HighVolumeSuite) TestRejectsWritingOutsideTheOutputDirectory() {
-	dir := s.T().TempDir()
-
-	_, err := searchmessages.Run(
-		s.T().Context(),
-		s.env.Admin(),
-		s.env.Reader(),
-		dir,
-		searchmessages.Input{
-			Topic:      s.topic,
-			Script:     `return value.eventType === "NEW"`,
-			OutputFile: "../escaped.jsonl",
-		},
-	)
-
-	s.Require().Error(err,
-		"a file name that escapes the output directory must be refused, because the server must not write wherever a caller asks")
-}
-
-func (s *HighVolumeSuite) TestRefusesToWriteThroughASymlink() {
-	dir := s.T().TempDir()
-	outside := filepath.Join(s.T().TempDir(), "victim.txt")
-	s.Require().NoError(os.WriteFile(outside, []byte("precious"), 0o600), "the file outside the output directory must exist")
-	s.Require().NoError(os.Symlink(outside, filepath.Join(dir, "planted.jsonl")), "the planted symlink must exist")
-
-	_, err := searchmessages.Run(s.T().Context(), s.env.Admin(), s.env.Reader(), dir, searchmessages.Input{
-		Topic: s.topic, Script: `return value.eventType === "NEW"`, OutputFile: "planted.jsonl",
-	})
-
-	s.Require().Error(err, "a symlink in the output directory must not redirect the export elsewhere")
-	content, readErr := os.ReadFile(outside)
-	s.Require().NoError(readErr, "the target must still be readable")
-	s.Require().Equal("precious", string(content), "the file the link pointed at must be untouched")
-}
-
-func (s *HighVolumeSuite) TestRefusesToOverwriteAnExport() {
-	dir := s.T().TempDir()
-	s.Require().NoError(os.WriteFile(filepath.Join(dir, "earlier.jsonl"), []byte("earlier"), 0o600), "the earlier export must exist")
-
-	_, err := searchmessages.Run(s.T().Context(), s.env.Admin(), s.env.Reader(), dir, searchmessages.Input{
-		Topic: s.topic, Script: `return value.eventType === "NEW"`, OutputFile: "earlier.jsonl",
-	})
-
-	s.Require().ErrorContains(err, "already exists",
-		"silently replacing an earlier export loses the evidence a previous search produced")
 }
 
 func (s *HighVolumeSuite) TestParallelScanFindsTheSameMatches() {
@@ -427,7 +371,7 @@ func (s *HighVolumeSuite) TestParallelScanFindsTheSameMatches() {
 		s.T().Context(),
 		s.env.Admin(),
 		s.env.Reader(),
-		"",
+		nil, "",
 		searchmessages.Input{
 			Topic:       s.topic,
 			Script:      `return value.eventType === "NEW"`,
@@ -451,7 +395,7 @@ func (s *HighVolumeSuite) TestParallelNewestFirstReturnsTheNewestMatches() {
 		s.T().Context(),
 		s.env.Admin(),
 		s.env.Reader(),
-		"",
+		nil, "",
 		searchmessages.Input{
 			Topic:       s.topic,
 			Script:      `return value.eventType === "NEW"`,
@@ -470,7 +414,7 @@ func (s *HighVolumeSuite) TestParallelOldestFirstReturnsTheOldestMatches() {
 		s.T().Context(),
 		s.env.Admin(),
 		s.env.Reader(),
-		"",
+		nil, "",
 		searchmessages.Input{
 			Topic:       s.topic,
 			Script:      `return value.eventType === "NEW"`,
@@ -490,7 +434,7 @@ func (s *HighVolumeSuite) TestParallelScanSplitsASinglePartition() {
 		s.T().Context(),
 		s.env.Admin(),
 		s.env.Reader(),
-		"",
+		nil, "",
 		searchmessages.Input{
 			Topic:       s.topic,
 			Script:      `return value.eventType === "NEW"`,
@@ -513,7 +457,7 @@ func (s *HighVolumeSuite) TestParallelCountMatchesSequentialCount() {
 		s.T().Context(),
 		s.env.Admin(),
 		s.env.Reader(),
-		"",
+		nil, "",
 		searchmessages.Input{
 			Topic:     s.topic,
 			Script:    `return value.payload.amount >= 500`,
@@ -526,7 +470,7 @@ func (s *HighVolumeSuite) TestParallelCountMatchesSequentialCount() {
 		s.T().Context(),
 		s.env.Admin(),
 		s.env.Reader(),
-		"",
+		nil, "",
 		searchmessages.Input{
 			Topic:       s.topic,
 			Script:      `return value.payload.amount >= 500`,
@@ -554,7 +498,7 @@ func (s *HighVolumeSuite) TestSmallPartitionIsNotSplit() {
 		s.T().Context(),
 		s.env.Admin(),
 		s.env.Reader(),
-		"",
+		nil, "",
 		searchmessages.Input{
 			Topic:       topic,
 			Script:      `return value.eventType === "NEW"`,

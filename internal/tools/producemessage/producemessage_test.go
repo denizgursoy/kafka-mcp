@@ -2,9 +2,12 @@ package producemessage_test
 
 import (
 	"encoding/base64"
+	"encoding/json"
 	"errors"
+	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/suite"
@@ -157,7 +160,7 @@ func (s *ProduceMessageSuite) produceOne(
 ) (producemessage.Output, error) {
 	s.T().Helper()
 
-	out, err := producemessage.Run(s.T().Context(), clusters, own, "", producemessage.Input{
+	out, err := producemessage.Run(s.T().Context(), clusters, own, nil, "", producemessage.Input{
 		Items:   []producemessage.Item{item},
 		Confirm: confirm,
 	})
@@ -627,6 +630,7 @@ func (s *ProduceMessageSuite) TestBatchProducesInInputOrder() {
 		s.T().Context(),
 		s.client(false),
 		"here",
+		nil,
 		"",
 		producemessage.Input{
 			Items: []producemessage.Item{
@@ -668,6 +672,7 @@ func (s *ProduceMessageSuite) TestBatchReportsItemErrorsWithoutHidingSuccesses()
 		s.T().Context(),
 		s.client(false),
 		"here",
+		nil,
 		"",
 		producemessage.Input{
 			Items: []producemessage.Item{
@@ -700,6 +705,7 @@ func (s *ProduceMessageSuite) TestBatchPreviewWritesNothing() {
 		s.T().Context(),
 		s.client(false),
 		"here",
+		nil,
 		"",
 		producemessage.Input{
 			Items: []producemessage.Item{
@@ -723,7 +729,7 @@ func (s *ProduceMessageSuite) TestBatchRejectsTooManyItems() {
 		items[index] = producemessage.Item{Topic: topic, Value: "x"}
 	}
 
-	_, err := producemessage.Run(s.T().Context(), s.client(false), "here", "",
+	_, err := producemessage.Run(s.T().Context(), s.client(false), "here", nil, "",
 		producemessage.Input{Items: items, Confirm: true})
 
 	s.Require().Error(err,
@@ -733,7 +739,7 @@ func (s *ProduceMessageSuite) TestBatchRejectsTooManyItems() {
 }
 
 func (s *ProduceMessageSuite) TestBatchRejectsAnEmptyItemList() {
-	_, err := producemessage.Run(s.T().Context(), s.client(false), "here", "",
+	_, err := producemessage.Run(s.T().Context(), s.client(false), "here", nil, "",
 		producemessage.Input{Items: []producemessage.Item{}, Confirm: true})
 
 	s.Require().Error(err,
@@ -744,44 +750,47 @@ func intPointer(value int32) *int32 {
 	return &value
 }
 
-// writeInput writes lines to a new file in a fresh directory and returns the
-// directory, so a case reads back exactly what it put there.
-func (s *ProduceMessageSuite) writeInput(name string, lines ...string) string {
+// upload asks for an upload link and sends lines to it, the way the user's
+// curl -T does, and returns the summary the upload answers with.
+func (s *ProduceMessageSuite) upload(clusters *kafkaclient.Registry, confirm bool, lines ...string) (int, producemessage.FileOutput, string) {
 	s.T().Helper()
 
-	dir := s.T().TempDir()
-	content := ""
+	files, base := testenv.Files(s.T())
+	offered, err := producemessage.Run(s.T().Context(), clusters, "here", files, base, producemessage.Input{
+		Upload:  &producemessage.Upload{Filename: "send.jsonl"},
+		Confirm: confirm,
+	})
+	s.Require().NoError(err, "asking for an upload link must succeed")
+	s.Require().NotNil(offered.Upload, "the response must carry the upload link")
+	s.Require().Contains(offered.Upload.Command, "curl -fsS -T 'send.jsonl'",
+		"the command must send the user's file from their machine")
 
-	for _, line := range lines {
-		content += line + "\n"
+	code, reply := testenv.Send(s.T(), *offered.Upload, strings.Join(lines, "\n")+"\n")
+
+	var out producemessage.FileOutput
+	if code == http.StatusOK {
+		s.Require().NoError(json.Unmarshal(reply, &out), "an accepted upload must answer with its summary: %s", reply)
 	}
 
-	s.Require().NoError(os.WriteFile(filepath.Join(dir, name), []byte(content), 0o600),
-		"the input file must be written")
-
-	return dir
+	return code, out, string(reply)
 }
 
-func (s *ProduceMessageSuite) TestInputFileProducesEveryLineInOrder() {
+func (s *ProduceMessageSuite) TestUploadProducesEveryLineInOrder() {
 	topic := s.env.CreateTopic(s.T(), "produce-file")
-	dir := s.writeInput("send.jsonl",
+
+	code, out, reply := s.upload(s.client(false), true,
 		`{"topic":"`+topic+`","key":"a","value":"first"}`,
 		``,
 		`{"topic":"`+topic+`","key":"b","value":"second","headers":{"trace":"t-2"}}`,
 		`{"topic":"`+topic+`","value":"third"}`,
 	)
-
-	out, err := producemessage.Run(s.T().Context(), s.client(false), "here", dir, producemessage.Input{
-		InputFile: "send.jsonl",
-		Confirm:   true,
-	})
-	s.Require().NoError(err, "sending a valid file must succeed")
-	s.Require().NotNil(out.File, "a file send must report a file summary")
+	s.Require().Equal(http.StatusOK, code, "sending a valid file must succeed: %s", reply)
 
 	s.Run("every line is written and counted", func() {
-		s.Require().Equal(3, out.File.Lines, "blank lines are not messages and must not be counted")
-		s.Require().Equal(3, out.File.Written, "every valid line must be written")
-		s.Require().True(out.File.Applied, "a file send that wrote messages must say it applied")
+		s.Require().Equal(3, out.Lines, "blank lines are not messages and must not be counted")
+		s.Require().Equal(3, out.Written, "every valid line must be written")
+		s.Require().True(out.Applied, "an upload that wrote messages must say it applied")
+		s.Require().True(out.Confirm, "the summary must say the upload was a send, not a check")
 		s.Require().Equal(int64(3), s.endOffset(topic), "the topic must hold exactly the file's messages")
 	})
 
@@ -801,95 +810,72 @@ func (s *ProduceMessageSuite) TestInputFileProducesEveryLineInOrder() {
 	})
 }
 
-func (s *ProduceMessageSuite) TestInputFilePreviewWritesNothingAndReportsBadLines() {
+func (s *ProduceMessageSuite) TestUploadWithoutConfirmWritesNothingAndReportsBadLines() {
 	topic := s.env.CreateTopic(s.T(), "produce-file-preview")
-	dir := s.writeInput("send.jsonl",
+
+	code, out, reply := s.upload(s.client(false), false,
 		`{"topic":"`+topic+`","value":"good"}`,
 		`not json`,
 		`{"topic":"`+topic+`","valeu":"misspelt"}`,
 		`{"topic":"`+topic+`","value":"also good"}`,
 	)
+	s.Require().Equal(http.StatusOK, code, "checking a file with bad lines must succeed, so every bad line is reported at once: %s", reply)
 
-	out, err := producemessage.Run(s.T().Context(), s.client(false), "here", dir, producemessage.Input{
-		InputFile: "send.jsonl",
-	})
-	s.Require().NoError(err, "previewing a file with bad lines must succeed, so every bad line is reported at once")
-
-	s.Require().Zero(s.endOffset(topic), "a preview must write nothing")
-	s.Require().Equal(2, out.File.Valid, "the two well-formed lines must count as valid")
-	s.Require().Equal(2, out.File.Invalid, "both broken lines must be counted")
-	s.Require().Len(out.File.Errors, 2, "each broken line must be reported")
-	s.Require().Equal(2, out.File.Errors[0].Line, "an error must name its line, so the user can find it in the file")
-	s.Require().Contains(out.File.Errors[1].Error, "valeu",
+	s.Require().Zero(s.endOffset(topic), "an upload without confirm must write nothing")
+	s.Require().Equal(2, out.Valid, "the two well-formed lines must count as valid")
+	s.Require().Equal(2, out.Invalid, "both broken lines must be counted")
+	s.Require().Len(out.Errors, 2, "each broken line must be reported")
+	s.Require().Equal(2, out.Errors[0].Line, "an error must name its line, so the user can find it in the file")
+	s.Require().Contains(out.Errors[1].Error, "valeu",
 		"a misspelt field must be named, because ignoring it would write a message without its value")
 }
 
-func (s *ProduceMessageSuite) TestInputFileSkipsBadLinesOnConfirm() {
+func (s *ProduceMessageSuite) TestUploadSkipsBadLinesOnConfirm() {
 	topic := s.env.CreateTopic(s.T(), "produce-file-partial")
-	dir := s.writeInput("send.jsonl",
+
+	code, out, reply := s.upload(s.client(false), true,
 		`{"topic":"`+topic+`","value":"good"}`,
 		`{"topic":"`+topic+`","value":""}`,
 		`{"topic":"`+topic+`","value":"also good"}`,
 	)
+	s.Require().Equal(http.StatusOK, code, "a file with one invalid line must still send the valid ones: %s", reply)
 
-	out, err := producemessage.Run(s.T().Context(), s.client(false), "here", dir, producemessage.Input{
-		InputFile: "send.jsonl",
-		Confirm:   true,
-	})
-	s.Require().NoError(err, "a file with one invalid line must still send the valid ones, as a batch does")
-
-	s.Require().Equal(2, out.File.Written, "only the valid lines may be written")
+	s.Require().Equal(2, out.Written, "only the valid lines may be written")
 	s.Require().Equal(int64(2), s.endOffset(topic), "the invalid line must not reach the topic")
 }
 
-func (s *ProduceMessageSuite) TestInputFileRefusesAReadOnlyDestination() {
+func (s *ProduceMessageSuite) TestUploadRefusesAReadOnlyDestination() {
 	topic := s.env.CreateTopic(s.T(), "produce-file-read-only")
-	dir := s.writeInput("send.jsonl", `{"topic":"`+topic+`","value":"x"}`)
 
-	_, err := producemessage.Run(s.T().Context(), s.client(true), "here", dir, producemessage.Input{
-		InputFile: "send.jsonl",
-		Confirm:   true,
-	})
-	s.Require().ErrorContains(err, "read-only",
-		"a read-only destination refuses every line alike, so it must refuse the call rather than report it per line")
-	s.Require().Zero(s.endOffset(topic), "a refused file must leave the topic untouched")
+	code, _, reply := s.upload(s.client(true), true, `{"topic":"`+topic+`","value":"x"}`)
+	s.Require().Equal(http.StatusUnprocessableEntity, code,
+		"a read-only destination refuses every line alike, so the upload must be refused as a whole")
+	s.Require().Contains(reply, "read-only", "the refusal must say why")
+	s.Require().Zero(s.endOffset(topic), "a refused upload must leave the topic untouched")
 }
 
-func (s *ProduceMessageSuite) TestInputFileRefusesUnsafeNames() {
-	dir := s.T().TempDir()
-
-	s.Run("a path", func() {
-		_, err := producemessage.Run(s.T().Context(), s.client(false), "here", dir, producemessage.Input{
-			InputFile: "../etc/passwd",
+func (s *ProduceMessageSuite) TestUploadRefusals() {
+	s.Run("items and upload together", func() {
+		files, base := testenv.Files(s.T())
+		_, err := producemessage.Run(s.T().Context(), s.client(false), "here", files, base, producemessage.Input{
+			Upload: &producemessage.Upload{},
+			Items:  []producemessage.Item{{Topic: "x", Value: "y"}},
 		})
-		s.Require().ErrorContains(err, "file name",
-			"input_file must be confined to the output directory, or a caller could make the server read any file")
-	})
-
-	s.Run("a symlink", func() {
-		outside := filepath.Join(s.T().TempDir(), "secret.jsonl")
-		s.Require().NoError(os.WriteFile(outside, []byte(`{"topic":"x","value":"y"}`), 0o600), "the target must exist")
-		s.Require().NoError(os.Symlink(outside, filepath.Join(dir, "link.jsonl")), "the link must exist")
-
-		_, err := producemessage.Run(s.T().Context(), s.client(false), "here", dir, producemessage.Input{
-			InputFile: "link.jsonl",
-		})
-		s.Require().Error(err, "a symlink in the directory must not let the server read a file outside it")
-	})
-
-	s.Run("a missing file", func() {
-		_, err := producemessage.Run(s.T().Context(), s.client(false), "here", dir, producemessage.Input{
-			InputFile: "nope.jsonl",
-		})
-		s.Require().ErrorContains(err, "does not exist", "a missing file must be named as missing")
-	})
-
-	s.Run("items and input_file together", func() {
-		_, err := producemessage.Run(s.T().Context(), s.client(false), "here", dir, producemessage.Input{
-			InputFile: "nope.jsonl",
-			Items:     []producemessage.Item{{Topic: "x", Value: "y"}},
-		})
-		s.Require().ErrorContains(err, "either items or input_file",
+		s.Require().ErrorContains(err, "either items or upload",
 			"giving both leaves which messages to write ambiguous, so it must be refused")
+	})
+
+	s.Run("no HTTP transport", func() {
+		_, err := producemessage.Run(s.T().Context(), s.client(false), "here", nil, "", producemessage.Input{
+			Upload: &producemessage.Upload{},
+		})
+		s.Require().ErrorContains(err, "HTTP transport",
+			"over stdio there is no address for a link, so an upload must be refused with the reason")
+	})
+
+	s.Run("an empty file", func() {
+		code, _, reply := s.upload(s.client(false), true)
+		s.Require().Equal(http.StatusUnprocessableEntity, code, "an empty upload holds no messages to send")
+		s.Require().Contains(reply, "no messages", "the refusal must say why")
 	})
 }

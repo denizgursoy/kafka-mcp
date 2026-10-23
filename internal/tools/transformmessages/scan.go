@@ -13,14 +13,13 @@ import (
 	"github.com/twmb/franz-go/pkg/kgo"
 
 	"github.com/denizgursoy/kafka-mcp/internal/domain/kafkaclient"
-	"github.com/denizgursoy/kafka-mcp/internal/domain/outputfile"
 	"github.com/denizgursoy/kafka-mcp/internal/domain/records"
 	"github.com/denizgursoy/kafka-mcp/internal/domain/script"
 	"github.com/denizgursoy/kafka-mcp/internal/domain/serde"
 )
 
-// fileItem is one line of output_file. Its fields and tags are produce_message's
-// item, so the file can be sent with produce_message input_file; the test suite
+// fileItem is one line of a download. Its fields and tags are produce_message's
+// item, so the file can be sent with produce_message upload; the test suite
 // sends one to prove the two still agree.
 type fileItem struct {
 	Topic              string            `json:"topic"`
@@ -41,7 +40,7 @@ type runState struct {
 	destTopic   string
 	filter      *script.Script
 	transform   *script.Script
-	file        *outputfile.Writer
+	file        *json.Encoder
 	out         *Output
 	maxMessages int
 	provenance  []kgo.RecordHeader
@@ -238,7 +237,7 @@ func (s *runState) visit(ctx context.Context, record *kgo.Record) bool {
 			return true
 		}
 
-		if err := s.file.Write(line); err != nil {
+		if err := s.file.Encode(line); err != nil {
 			// A file that cannot be written cannot be trusted to hold the
 			// set, so the run stops here rather than saving half of it.
 			s.fail(err.Error(), address)
@@ -246,6 +245,8 @@ func (s *runState) visit(ctx context.Context, record *kgo.Record) bool {
 
 			return false
 		}
+
+		s.out.FileWritten++
 	}
 
 	s.out.Transformed++
@@ -670,7 +671,7 @@ func (s *runState) fileLine(record *kgo.Record, plain bool) (fileItem, error) {
 	}
 
 	if item.Value == "" {
-		return fileItem{}, fmt.Errorf("output_file: an empty value cannot be saved, because produce_message refuses one")
+		return fileItem{}, fmt.Errorf("download: an empty value cannot be saved, because produce_message refuses one")
 	}
 
 	if len(record.Headers) > 0 {
@@ -679,7 +680,7 @@ func (s *runState) fileLine(record *kgo.Record, plain bool) (fileItem, error) {
 		for _, header := range record.Headers {
 			if !utf8.Valid(header.Value) {
 				return fileItem{}, fmt.Errorf(
-					"output_file: header %q is not valid UTF-8, and produce_message headers are text", header.Key)
+					"download: header %q is not valid UTF-8, and produce_message headers are text", header.Key)
 			}
 
 			item.Headers[header.Key] = string(header.Value)

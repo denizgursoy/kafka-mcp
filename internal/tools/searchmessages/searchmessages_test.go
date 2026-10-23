@@ -48,7 +48,7 @@ func (s *SearchMessagesSuite) TestFindsMatchInValue() {
 		s.T().Context(),
 		s.env.Admin(),
 		s.env.Reader(),
-		"",
+		nil, "",
 		searchmessages.Input{Topic: topic, Script: `return value.order === "222"`},
 	)
 
@@ -77,7 +77,7 @@ func (s *SearchMessagesSuite) TestMatchesAreCaseInsensitiveByDefault() {
 		s.T().Context(),
 		s.env.Admin(),
 		s.env.Reader(),
-		"",
+		nil, "",
 		searchmessages.Input{Topic: topic, Script: `return value.toLowerCase().indexOf("alice") >= 0`},
 	)
 
@@ -98,7 +98,7 @@ func (s *SearchMessagesSuite) TestSearchesKeyByDefault() {
 		s.T().Context(),
 		s.env.Admin(),
 		s.env.Reader(),
-		"",
+		nil, "",
 		searchmessages.Input{Topic: topic, Script: `return key.indexOf("777") >= 0`},
 	)
 
@@ -129,7 +129,7 @@ func (s *SearchMessagesSuite) TestScriptSeesDecodedSchemaRegistryFields() {
 		s.T().Context(),
 		s.env.Admin(),
 		s.env.Reader(),
-		"",
+		nil, "",
 		searchmessages.Input{Topic: topic, Script: `return value.amount >= 500`},
 	)
 
@@ -160,7 +160,7 @@ func (s *SearchMessagesSuite) TestSearchInHeadersOnly() {
 		s.T().Context(),
 		s.env.Admin(),
 		s.env.Reader(),
-		"",
+		nil, "",
 		searchmessages.Input{
 			Topic:  topic,
 			Script: `return headers["correlation-id"] === "corr-999"`,
@@ -186,7 +186,7 @@ func (s *SearchMessagesSuite) TestExactMatchDoesNotMatchSubstrings() {
 		s.T().Context(),
 		s.env.Admin(),
 		s.env.Reader(),
-		"",
+		nil, "",
 		searchmessages.Input{
 			Topic:  topic,
 			Script: `return key === "42"`,
@@ -212,7 +212,7 @@ func (s *SearchMessagesSuite) TestRegexMatch() {
 		s.T().Context(),
 		s.env.Admin(),
 		s.env.Reader(),
-		"",
+		nil, "",
 		searchmessages.Input{
 			Topic:  topic,
 			Script: `return /ORD-\d{4}-\d{3}/.test(value)`,
@@ -233,7 +233,7 @@ func (s *SearchMessagesSuite) TestMalformedScriptIsRejectedBeforeScanning() {
 		s.T().Context(),
 		s.env.Admin(),
 		s.env.Reader(),
-		"",
+		nil, "",
 		searchmessages.Input{Topic: topic, Script: `return value.order ===`},
 	)
 
@@ -250,7 +250,7 @@ func (s *SearchMessagesSuite) TestNoMatchReturnsEmptyListNotError() {
 		s.T().Context(),
 		s.env.Admin(),
 		s.env.Reader(),
-		"",
+		nil, "",
 		searchmessages.Input{Topic: topic, Script: `return value.indexOf("absent-value") >= 0`},
 	)
 
@@ -277,7 +277,7 @@ func (s *SearchMessagesSuite) TestStopsAtMaxMatches() {
 		s.T().Context(),
 		s.env.Admin(),
 		s.env.Reader(),
-		"",
+		nil, "",
 		searchmessages.Input{
 			Topic:      topic,
 			Script:     hitScript,
@@ -306,7 +306,7 @@ func (s *SearchMessagesSuite) TestNewestFirstReturnsMostRecentMatches() {
 		s.T().Context(),
 		s.env.Admin(),
 		s.env.Reader(),
-		"",
+		nil, "",
 		searchmessages.Input{Topic: topic, Script: hitScript, MaxMatches: 1},
 	)
 
@@ -329,7 +329,7 @@ func (s *SearchMessagesSuite) TestRestrictsToRequestedPartitions() {
 		s.T().Context(),
 		s.env.Admin(),
 		s.env.Reader(),
-		"",
+		nil, "",
 		searchmessages.Input{
 			Topic:      topic,
 			Script:     hitScript,
@@ -363,7 +363,7 @@ func (s *SearchMessagesSuite) TestRestrictsToOffsetRange() {
 		s.T().Context(),
 		s.env.Admin(),
 		s.env.Reader(),
-		"",
+		nil, "",
 		searchmessages.Input{
 			Topic:      topic,
 			Script:     hitScript,
@@ -399,7 +399,7 @@ func (s *SearchMessagesSuite) TestRestrictsToTimeRange() {
 		s.T().Context(),
 		s.env.Admin(),
 		s.env.Reader(),
-		"",
+		nil, "",
 		searchmessages.Input{
 			Topic:         topic,
 			Script:        hitScript,
@@ -426,7 +426,7 @@ func (s *SearchMessagesSuite) TestReportsScannedRange() {
 		s.T().Context(),
 		s.env.Admin(),
 		s.env.Reader(),
-		"",
+		nil, "",
 		searchmessages.Input{Topic: topic, Script: `return value.indexOf("nothing-matches") >= 0`},
 	)
 
@@ -444,7 +444,7 @@ func (s *SearchMessagesSuite) TestErrorsOnUnknownTopic() {
 		s.T().Context(),
 		s.env.Admin(),
 		s.env.Reader(),
-		"",
+		nil, "",
 		searchmessages.Input{Topic: s.env.UniqueName("missing"), Script: `return true`},
 	)
 
@@ -464,7 +464,7 @@ func (s *SearchMessagesSuite) TestOmittingTheScriptMatchesEveryMessage() {
 		s.T().Context(),
 		s.env.Admin(),
 		s.env.Reader(),
-		"",
+		nil, "",
 		searchmessages.Input{Topic: topic},
 	)
 
@@ -490,7 +490,7 @@ func (s *SearchMessagesSuite) groupTopic() string {
 func (s *SearchMessagesSuite) TestGroupsMatchesByAnExpression() {
 	topic := s.groupTopic()
 
-	out, err := searchmessages.Run(s.T().Context(), s.env.Admin(), s.env.Reader(), "", searchmessages.Input{
+	out, err := searchmessages.Run(s.T().Context(), s.env.Admin(), s.env.Reader(), nil, "", searchmessages.Input{
 		Topic:   topic,
 		Script:  `return value.error !== undefined`,
 		GroupBy: `return value.error`,
@@ -518,7 +518,7 @@ func (s *SearchMessagesSuite) TestGroupsMatchesByAnExpression() {
 func (s *SearchMessagesSuite) TestGroupingWithoutAScriptGroupsEveryMessage() {
 	topic := s.groupTopic()
 
-	out, err := searchmessages.Run(s.T().Context(), s.env.Admin(), s.env.Reader(), "", searchmessages.Input{
+	out, err := searchmessages.Run(s.T().Context(), s.env.Admin(), s.env.Reader(), nil, "", searchmessages.Input{
 		Topic:   topic,
 		GroupBy: `return format`,
 	})
@@ -532,7 +532,7 @@ func (s *SearchMessagesSuite) TestGroupingWithoutAScriptGroupsEveryMessage() {
 func (s *SearchMessagesSuite) TestGroupingCapsTheNumberOfBuckets() {
 	topic := s.groupTopic()
 
-	out, err := searchmessages.Run(s.T().Context(), s.env.Admin(), s.env.Reader(), "", searchmessages.Input{
+	out, err := searchmessages.Run(s.T().Context(), s.env.Admin(), s.env.Reader(), nil, "", searchmessages.Input{
 		Topic:     topic,
 		GroupBy:   `return String(offset)`,
 		MaxGroups: 2,
@@ -547,7 +547,7 @@ func (s *SearchMessagesSuite) TestGroupingCapsTheNumberOfBuckets() {
 func (s *SearchMessagesSuite) TestGroupingReportsNonStringKeysAndErrors() {
 	topic := s.groupTopic()
 
-	out, err := searchmessages.Run(s.T().Context(), s.env.Admin(), s.env.Reader(), "", searchmessages.Input{
+	out, err := searchmessages.Run(s.T().Context(), s.env.Admin(), s.env.Reader(), nil, "", searchmessages.Input{
 		Topic:   topic,
 		GroupBy: `if (value.ok) { throw new Error("boom") } return value.error`,
 	})
@@ -564,12 +564,12 @@ func (s *SearchMessagesSuite) TestGroupingReportsNonStringKeysAndErrors() {
 func (s *SearchMessagesSuite) TestGroupingRefusesConflictingOptions() {
 	search := func(input searchmessages.Input) error {
 		input.Topic = "t"
-		_, err := searchmessages.Run(s.T().Context(), s.env.Admin(), s.env.Reader(), "", input)
+		_, err := searchmessages.Run(s.T().Context(), s.env.Admin(), s.env.Reader(), nil, "", input)
 		return err
 	}
 
-	s.Require().ErrorContains(search(searchmessages.Input{GroupBy: `return 1`, OutputFile: "x.jsonl"}), "group_by",
-		"grouping returns counts, so there are no messages to write to a file")
+	s.Require().ErrorContains(search(searchmessages.Input{GroupBy: `return 1`, Download: &searchmessages.Download{}}), "group_by",
+		"grouping returns counts, so there are no messages to download")
 	s.Require().ErrorContains(search(searchmessages.Input{GroupBy: `return 1`, MaxGroups: 5000}), "max_groups",
 		"an unbounded bucket count turns a summary back into a dump")
 	s.Require().ErrorContains(search(searchmessages.Input{GroupBy: `return ===`}), "compile",
@@ -583,7 +583,7 @@ func (s *SearchMessagesSuite) TestRejectsImpossibleParallelism() {
 		s.T().Context(),
 		s.env.Admin(),
 		s.env.Reader(),
-		"",
+		nil, "",
 		searchmessages.Input{Topic: topic, Parallelism: 99},
 	)
 
@@ -594,7 +594,7 @@ func (s *SearchMessagesSuite) TestRejectsImpossibleParallelism() {
 func (s *SearchMessagesSuite) TestRejectsUnboundedInputs() {
 	search := func(input searchmessages.Input) error {
 		input.Topic = "t"
-		_, err := searchmessages.Run(s.T().Context(), s.env.Admin(), s.env.Reader(), "", input)
+		_, err := searchmessages.Run(s.T().Context(), s.env.Admin(), s.env.Reader(), nil, "", input)
 		return err
 	}
 
@@ -625,7 +625,7 @@ func (s *SearchMessagesSuite) TestErrorsWhenBrokerUnreachable() {
 		s.T().Context(),
 		s.env.Admin(),
 		records.NewReader("127.0.0.1:1"),
-		"",
+		nil, "",
 		searchmessages.Input{Topic: "anything", Script: `return true`},
 	)
 
@@ -652,7 +652,7 @@ func (s *SearchMessagesSuite) TestRunawayScriptStopsAtTheTimeout() {
 			s.T().Context(),
 			s.env.Admin(),
 			s.env.Reader(),
-			"",
+			nil, "",
 			searchmessages.Input{
 				Topic:         topic,
 				Script:        `while (true) {} return true`,
@@ -696,7 +696,7 @@ func (s *SearchMessagesSuite) TestNewestFirstSpansEveryPartition() {
 		s.T().Context(),
 		s.env.Admin(),
 		s.env.Reader(),
-		"",
+		nil, "",
 		searchmessages.Input{Topic: topic, Script: hitScript, MaxMatches: 2},
 	)
 
@@ -735,7 +735,7 @@ func (s *SearchMessagesSuite) TestNewestFirstReadsEveryPartitionBeforeStopping()
 		s.T().Context(),
 		s.env.Admin(),
 		s.env.Reader(),
-		"",
+		nil, "",
 		searchmessages.Input{Topic: topic, Script: hitScript, MaxMatches: 1},
 	)
 

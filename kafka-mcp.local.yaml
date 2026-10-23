@@ -6,7 +6,6 @@ http:
   # auth_token: "{env:KAFKA_MCP_TOKEN}"
   # cors:
   #   allow_origins: ["https://mcp-client.example"]
-output_dir: /tmp/kafka-mcp-exports
 clusters:
   local:
     brokers: localhost:19092

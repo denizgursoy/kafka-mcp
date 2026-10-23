@@ -55,7 +55,6 @@ func (s *ConfigSuite) load(path string) (*config.Config, error) {
 func (s *ConfigSuite) TestLoadsSeveralClusters() {
 	path := s.write(`{
 		"http": {"address": ":9000"},
-		"output_dir": "/var/tmp/exports",
 		"clusters": {
 			"prod":    {"brokers": ["kafka-1:9093", "kafka-2:9093"], "read_only": true},
 			"preprod": {"brokers": "kafka-preprod:9093"}
@@ -97,8 +96,6 @@ func (s *ConfigSuite) TestLoadsSeveralClusters() {
 	s.Run("server-wide settings are read", func() {
 		s.Require().Equal(":9000", loaded.HTTP.Address,
 			"the listen address decides where clients connect, so a configured value must not be lost")
-		s.Require().Equal("/var/tmp/exports", loaded.OutputDir,
-			"exports are server-wide and must land where the operator chose")
 	})
 }
 
@@ -513,14 +510,13 @@ func (s *ConfigSuite) TestCORSDefaults() {
 	})
 }
 
-func (s *ConfigSuite) TestOutputDirectoryFallsBackToTheTempDirectory() {
-	path := s.write(`{"clusters": {"local": {"brokers": "localhost:19092"}}}`)
+func (s *ConfigSuite) TestRefusesTheRemovedOutputDirectory() {
+	path := s.write(`{"output_dir": "/var/tmp/exports", "clusters": {"local": {"brokers": "localhost:19092"}}}`)
 
-	loaded, err := s.load(path)
+	_, err := s.load(path)
 
-	s.Require().NoError(err, "omitting the output directory must be allowed")
-	s.Require().Equal(os.TempDir(), loaded.OutputDir,
-		"exports still need somewhere to go, and the temp directory is a safe default that needs no configuration")
+	s.Require().ErrorContains(err, "output_dir is no longer supported",
+		"files no longer touch the server, so an operator who sets a directory must be told rather than believe exports land there")
 }
 
 func (s *ConfigSuite) TestResolvesPasswordPerCluster() {

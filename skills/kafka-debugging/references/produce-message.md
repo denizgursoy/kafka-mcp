@@ -168,8 +168,10 @@ the broker assigned — record both, because that triple is what identifies the
 message for any follow-up call.
 
 Each message is one `items` entry, so several are one call rather than one call
-each. Beyond 500, or for a set saved to a file, pass `input_file` instead of
-`items`; every line is validated first and failures come back by line number. Preview the whole batch first; one top-level `confirm` covers all of them.
+each. Beyond 500, or for a set saved to a file on the user's machine, pass
+`upload` instead of `items` and run the returned `curl -T` command there; an
+upload without `confirm` validates every line and reports failures by line
+number. Preview the whole batch first; one top-level `confirm` covers all of them.
 The batch is **not** atomic: if a later item fails, the messages already written
 stay, because Kafka cannot retract a produced record. Report per-item errors
 exactly as they come back and never imply a partial batch was rolled back.

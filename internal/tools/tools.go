@@ -20,6 +20,7 @@ import (
 	"github.com/denizgursoy/kafka-mcp/internal/domain/audit"
 	"github.com/denizgursoy/kafka-mcp/internal/domain/config"
 	"github.com/denizgursoy/kafka-mcp/internal/domain/kafkaclient"
+	"github.com/denizgursoy/kafka-mcp/internal/domain/transfer"
 	"github.com/denizgursoy/kafka-mcp/internal/tools/addpartitions"
 	"github.com/denizgursoy/kafka-mcp/internal/tools/altertopicconfig"
 	"github.com/denizgursoy/kafka-mcp/internal/tools/clusterhealth"
@@ -93,6 +94,12 @@ func Names() []string {
 	}
 }
 
+// FilesPath is where an endpoint's download and upload links live, relative
+// to the endpoint's own path: /mcp/prod serves its links at /mcp/prod/files.
+// A host mounts transfer.Hub.Handler there, behind the same guard as the
+// endpoint.
+const FilesPath = "/files"
+
 // Audit is how tool calls are recorded. The zero value logs to slog.Default
 // and names no user.
 type Audit struct {
@@ -115,6 +122,7 @@ func Register(
 	clusters *kafkaclient.Registry,
 	name string,
 	auditing Audit,
+	files *transfer.Hub,
 ) error {
 
 	endpointConfig := cfg.Endpoints[name]
@@ -156,7 +164,7 @@ func Register(
 	endpoint.add("describe_topic", func() { describetopic.Register(server, kafka.Admin(), kafka.Reader()) })
 	endpoint.add("sample_messages", func() { samplemessages.Register(server, kafka.Admin(), kafka.Reader()) })
 	endpoint.add("search_messages", func() {
-		searchmessages.Register(server, kafka.Admin(), kafka.Reader(), cfg.OutputDir)
+		searchmessages.Register(server, kafka.Admin(), kafka.Reader(), files)
 	})
 	endpoint.add("get_message", func() { getmessage.Register(server, kafka.Reader()) })
 	endpoint.add("get_schema", func() { getschema.Register(server, kafka.Codec()) })
@@ -194,9 +202,9 @@ func Register(
 	// writable one from a protected session, which is what they exist for.
 	endpoint.add("compare_clusters", func() { compareclusters.Register(server, clusters, name) })
 	endpoint.add("copy_message", func() { copymessage.Register(server, clusters, name) })
-	endpoint.add("produce_message", func() { producemessage.Register(server, clusters, name, cfg.OutputDir) })
+	endpoint.add("produce_message", func() { producemessage.Register(server, clusters, name, files) })
 	endpoint.add("transform_messages", func() {
-		transformmessages.Register(server, clusters, name, cfg.OutputDir)
+		transformmessages.Register(server, clusters, name, files)
 	})
 	endpoint.add("list_clusters", func() { listclusters.Register(server, clusters, name) })
 

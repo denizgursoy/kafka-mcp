@@ -68,8 +68,9 @@ is behind, and this deletes work it still has to do.
 
 ### 4. Offer preservation
 
-Before deleting, offer `search_messages` with `output_file` over the same range,
-which writes every message to the server as JSON lines. Let the user decide;
+Before deleting, offer `search_messages` with `download` over the same range,
+which saves every message to a file on the user's machine, as JSON lines or
+CSV, that kafka-console can import back. Nothing is stored on the server. Let the user decide;
 do not skip the offer because the data looks like test data.
 
 ### 5. Get two acknowledgements, then delete
