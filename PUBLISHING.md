@@ -20,13 +20,8 @@ Pushing `v1.2.3` runs `.github/workflows/tag.yml`, which:
 3. **mcp-publisher** publishes that `server.json` to the
    [official MCP Registry](https://registry.modelcontextprotocol.io). It
    authenticates with GitHub OIDC, so no secret is involved.
-4. **Smithery** gets the Apple Silicon bundle, if `SMITHERY_API_KEY` is set. It
-   gets a copy without the bundle's tool list: Smithery treats those entries as
-   full tool definitions and rejects them for lacking an `inputSchema`, which a
-   bundle manifest may not carry. Smithery lists the tools by scanning the
-   server instead.
 
-Steps 3 and 4 skip prerelease tags such as `v1.2.3-rc1`, so a candidate can be
+Step 3 skips prerelease tags such as `v1.2.3-rc1`, so a candidate can be
 released on GitHub without being listed.
 
 `server.json` in the repository is the template. Its `version` and image tag
@@ -37,9 +32,9 @@ description or how a client runs the image, never the generated copy.
 
 A bundle can name an operating system but not a CPU, and so can a registry
 entry. Each bundle must therefore carry one binary that runs everywhere its OS
-does. A universal macOS binary would do that, but at 33 MB compressed it is
-over Smithery's 25 MB limit, while one architecture is about 16 MB. Intel Macs
-use the release archive or the image.
+does. A universal macOS binary would do that at about twice the size of one
+architecture, so the bundle targets Apple Silicon. Intel Macs use the release
+archive or the image.
 
 ## Before the first release
 
@@ -48,7 +43,6 @@ These are one-time steps that need an account.
 | Where | What to do |
 | ----- | ---------- |
 | MCP Registry | Nothing. The `io.github.denizgursoy/` namespace is proved by the workflow's OIDC token, because the repository is under that account. The registry pulls the image to read its label, so `ghcr.io/denizgursoy/kafka-mcp` must stay public, as it is now. |
-| Smithery | Sign in at [smithery.ai](https://smithery.ai) as `denizgursoy`. Run `npx smithery auth token` and store the token as the repository secret `SMITHERY_API_KEY`. Until then, the Smithery step is skipped. |
 
 ## Catalogs that need a person
 

@@ -14,9 +14,6 @@ permissions:
 jobs:
   release:
     runs-on: ubuntu-latest
-    env:
-      # At job level so a step's `if` can see whether it is set.
-      SMITHERY_API_KEY: ${{ secrets.SMITHERY_API_KEY }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v7
@@ -58,9 +55,3 @@ jobs:
           curl -fsSL "https://github.com/modelcontextprotocol/registry/releases/download/v1.8.1/mcp-publisher_linux_amd64.tar.gz" | tar xz mcp-publisher
           ./mcp-publisher login github-oidc
           ./mcp-publisher publish dist/mcpb/server.json
-
-      - name: Publish to Smithery
-        # Smithery holds one bundle per server, up to 25 MB, so it gets the
-        # Apple Silicon one. Skipped until SMITHERY_API_KEY is set.
-        if: ${{ !contains(github.ref_name, '-') && env.SMITHERY_API_KEY != '' }}
-        run: npx -y smithery@1.2.0 mcp publish dist/mcpb/smithery.mcpb -n denizgursoy/kafka-mcp
