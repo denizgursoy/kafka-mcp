@@ -116,15 +116,14 @@ message</span><span class="caret" aria-hidden="true"></span>
    the archive for this OS and CPU: kafka-mcp_&lt;Os&gt;_&lt;arch&gt;.tar.gz, or .zip
    on Windows. Check it against the checksums file, extract it, and put the
    kafka-mcp binary on my PATH.
-2. From the same release tag, copy the skills/kafka-debugging directory of the
-   repository into your skills directory, so you know how to use the tools.
-3. Ask me for my Kafka brokers, how to authenticate, and whether this should
+2. Ask me for my Kafka brokers, how to authenticate, and whether this should
    be read-only. Then write a kafka-mcp.yaml as described at
    https://denizgursoy.github.io/kafka-mcp/#configure. Never put a password
    in the file: use "{env:VAR}" and tell me which variable to set.
-4. Register kafka-mcp as a local stdio MCP server in your own configuration,
+3. Register kafka-mcp as a local stdio MCP server in your own configuration,
    with CONFIG_FILE pointing at that file.
-5. Tell me to restart you so the tools and the skill load.</code></pre>
+4. Tell me to restart you so the tools load. Read the built-in Kafka debugging
+   skill through skill_reference; no separate skill installation is needed.</code></pre>
                 <p class="hint">
                   Works with any agent that can run shell commands and edit its own
                   config, such as Claude Code or OpenCode. Read what it plans to run
@@ -134,12 +133,8 @@ message</span><span class="caret" aria-hidden="true"></span>
               <div class="tab-panel" data-panel="bin">
                 <pre><code><span class="c"># 1. the binary, from https://github.com/denizgursoy/kafka-mcp/releases</span>
 tar -xzf kafka-mcp_Darwin_arm64.tar.gz
-sudo mv kafka-mcp /usr/local/bin/
-
-<span class="c"># 2. the skill, into your agent's skills directory</span>
-<span class="c">#    Claude Code: ~/.claude/skills   OpenCode: ~/.config/opencode/skills</span>
-curl -sL https://github.com/denizgursoy/kafka-mcp/archive/refs/heads/main.tar.gz \
-  | tar -xz --strip-components=2 -C ~/.claude/skills kafka-mcp-main/skills/kafka-debugging</code></pre>
+sudo mv kafka-mcp /usr/local/bin/</code></pre>
+                <p class="hint">The skill ships inside the binary. The agent reads it with <code>skill_reference</code>, so no separate skill download is needed.</p>
               </div>
               <div class="tab-panel" data-panel="mcpb">
                 <pre><code><span class="c"># from https://github.com/denizgursoy/kafka-mcp/releases/latest</span>
@@ -166,7 +161,7 @@ kafka-mcp_&lt;version&gt;_windows_amd64.mcpb</code></pre>
 cd kafka-mcp
 make env-up   <span class="c"># local Redpanda on :19092, Console on :8080</span>
 make run      <span class="c"># serves kafka-mcp.local.yaml on :8090</span></code></pre>
-                <p class="hint">Requires Go 1.27 or later. Tests need Docker. CI tests and releases use the latest stable Go, checked on every run rather than selected from go.mod; the module's minimum version still applies.</p>
+                <p class="hint">Requires Go 1.27 or later. Tests need Docker. Skill Markdown is included directly with <code>go:embed</code>, including with plain <code>go build</code> and <code>go run</code>; no generator or build hook is needed. The <code>skills/embed.go</code> bridge stays outside installable skill folders, so local skill installation is unchanged. CI tests and releases use the latest stable Go, checked on every run rather than selected from go.mod; the module's minimum version still applies.</p>
               </div>
             </div>
           </li>
@@ -258,8 +253,9 @@ curl -s -X POST http://localhost:8090/mcp/local \
                 <span class="prompt-mark">&gt;</span> is there lag on orders, and when will it clear?
               </div>
               <p class="hint">
-                Copy <code>skills/kafka-debugging</code> into your agent's skills directory.
-                It routes each request to one of <a href="#scenarios">one guide per scenario</a>.
+                The connection instructions point the agent to <code>skill_reference</code>.
+                It reads the bundled <code>SKILL.md</code>, then the <a href="#scenarios">guide for the scenario</a>,
+                without file tools or a separate install. Local skill installation remains optional.
               </p>
             </div>
           </li>

@@ -45,6 +45,7 @@ import (
 	"github.com/denizgursoy/kafka-mcp/internal/tools/samplemessages"
 	"github.com/denizgursoy/kafka-mcp/internal/tools/searchmessages"
 	"github.com/denizgursoy/kafka-mcp/internal/tools/serverconfig"
+	"github.com/denizgursoy/kafka-mcp/internal/tools/skillreference"
 	"github.com/denizgursoy/kafka-mcp/internal/tools/transformmessages"
 )
 
@@ -90,6 +91,7 @@ func Names() []string {
 		"sample_messages",
 		"search_messages",
 		ServerConfig,
+		"skill_reference",
 		"transform_messages",
 	}
 }
@@ -159,6 +161,7 @@ func Register(
 	// offers no way to read back what was registered. Tying the name to the
 	// registration is what stops the two from disagreeing.
 	endpoint.add("list_topics", func() { listtopics.Register(server, kafka.Admin()) })
+	endpoint.add("skill_reference", func() { skillreference.Register(server) })
 	endpoint.add("list_consumer_groups", func() { listconsumergroups.Register(server, kafka.Admin()) })
 	endpoint.add("consumer_lag", func() { consumerlag.Register(server, kafka.Admin(), kafka.Reader()) })
 	endpoint.add("describe_topic", func() { describetopic.Register(server, kafka.Admin(), kafka.Reader()) })

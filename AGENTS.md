@@ -39,7 +39,7 @@ Layout:
 
 ```
 cmd/server/main.go        MCP server entrypoint: config, HTTP, one server per cluster
-pkg/kafkamcp/             The only public package: registers the tools on a
+pkg/kafkamcp/             The host-facing API: registers the tools on a
                           host's MCP server with the host's Kafka clients
 internal/tools/
   tools.go                Which tools an endpoint exposes, and their registration
@@ -49,7 +49,8 @@ internal/domain/          Everything shared by more than one tool
   kafkaclient/            The Kafka connections, one per cluster
   records/                Reading and rendering Kafka records
   testenv/                Test container environment (broker + Console)
-skills/kafka-debugging/   One umbrella skill; scenario guides in references/
+skills/                  Compile-time data bridge for the canonical Markdown
+  kafka-debugging/        One umbrella skill; scenario guides in references/
 _docs/                    Documentation site (Vite, pnpm), published to GitHub Pages
 env/docker-compose.yaml   Local Redpanda + Redpanda Console
 Makefile                  Build, run and compose targets
@@ -57,8 +58,9 @@ Makefile                  Build, run and compose targets
 
 ## Where code lives
 
-There are three places code can go, and which one is decided by how many tools
-use it.
+Runtime logic is placed according to how many tools use it. Compile-time asset
+bridges stay beside the canonical assets so embedding needs no copied sources
+or generation step.
 
 Every directory under `internal/tools` is one MCP tool, so the list of
 directories is the list of tools the server has. The single file at the top of
@@ -73,8 +75,12 @@ exposes and wires each one to its cluster. Nothing else goes there.
   `internal/domain/kafkaclient`).
 
 Nothing else belongs at the top of `internal`: shared code goes in
-`internal/domain` and tools in `internal/tools`. Skills are not code and live
-at the repository root, under `skills/`.
+`internal/domain` and tools in `internal/tools`. Skill documents live at the
+repository root, under `skills/`. A small Go embedding bridge may live in that
+parent directory, outside the installable skill folders. It exposes only the
+embedded, read-only filesystem; document selection, validation and tool logic
+stay in the consuming tool package. `pkg/kafkamcp` remains the supported API
+for hosts, not the asset bridge.
 
 Move a helper out of a tool package the moment a second tool needs it, and move
 it back if it ever drops to one caller again. **Ask the user for approval

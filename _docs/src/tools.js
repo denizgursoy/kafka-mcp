@@ -13,6 +13,26 @@ export const groups = {
 
 export const tools = [
   {
+    name: 'skill_reference',
+    group: 'discover',
+    batch: 1000,
+    summary: 'The Kafka debugging skill and scenario guides built into this release.',
+    detail:
+      'Read the umbrella SKILL.md first, then the chosen references/*.md guide. No local installation, filesystem access or Kafka request is needed. Connection instructions point here without replacing the host instructions; disabling this tool removes the pointer too. Guidance does not grant permissions: check server_config before a change. Results preserve input order, and unknown names list available choices as item errors. Paths and URLs are never opened.',
+    params: [
+      ['skill', 'string', true, 'Exact, case-sensitive skill name: kafka-debugging'],
+      ['file', 'string', false, 'Exact name relative to the skill root. Default SKILL.md; e.g. references/check-lag.md. Resolve guide links relative to the containing guide; no .. segments'],
+    ],
+    call: { items: [{ skill: 'kafka-debugging' }] },
+    result: {
+      results: [{ index: 0, result: {
+        skill: 'kafka-debugging', file: 'SKILL.md', content: '# Kafka debugging\n…',
+        files: ['SKILL.md', 'references/authorization-error.md', '…'],
+      } }],
+      succeeded: 1, failed: 0, applied: 0, atomic: false,
+    },
+  },
+  {
     name: 'server_config',
     group: 'discover',
     summary: 'Which endpoint, cluster and policy this session reached, and which tools it has.',

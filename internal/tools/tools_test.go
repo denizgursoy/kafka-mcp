@@ -48,9 +48,10 @@ func (s *RegistrationSuite) SetupSuite() {
 				Name:    "limited",
 				Brokers: []string{"127.0.0.1:19092"},
 				Tools: map[string]bool{
-					"create_topic": false,
-					"list_topics":  false,
-					"get_message":  true,
+					"create_topic":    false,
+					"list_topics":     false,
+					"get_message":     true,
+					"skill_reference": false,
 				},
 			},
 			"typo": {
@@ -74,9 +75,10 @@ func (s *RegistrationSuite) SetupSuite() {
 			"limited": {
 				Name: "limited", Cluster: "limited", Path: "/mcp/limited",
 				Tools: map[string]bool{
-					"create_topic": false,
-					"list_topics":  false,
-					"get_message":  true,
+					"create_topic":    false,
+					"list_topics":     false,
+					"get_message":     true,
+					"skill_reference": false,
 				},
 			},
 			"typo": {
@@ -131,6 +133,14 @@ func (s *RegistrationSuite) exposed(cluster string) (listed, reported []string) 
 		"the client must complete the initialize handshake before any tool can be listed")
 
 	defer clientSession.Close()
+
+	if s.cfg.Endpoints[cluster].ToolEnabled("skill_reference") {
+		s.Require().Contains(clientSession.InitializeResult().Instructions, "skill_reference",
+			"the tool's bootstrap must also reach clients over in-memory and stdio-style sessions")
+	} else {
+		s.Require().NotContains(clientSession.InitializeResult().Instructions, "skill_reference",
+			"withholding a tool must not leave a connection-time instruction to call it")
+	}
 
 	result, err := clientSession.ListTools(ctx, nil)
 	s.Require().NoError(err,
@@ -195,6 +205,8 @@ func (s *RegistrationSuite) TestExposedTools() {
 			"finding a hung transaction only reads, so read_only must not hide it")
 		s.Require().Contains(listed, "list_acls",
 			"listing ACLs only reads, so read_only must not hide it")
+		s.Require().Contains(listed, "skill_reference",
+			"protected endpoints still need the bundled diagnostic guides")
 	})
 
 	s.Run("a read-only cluster still exposes copy_message", func() {
@@ -246,6 +258,8 @@ func (s *RegistrationSuite) TestDisabledTools() {
 			"a tool switched off in the cluster's configuration must not be registered, which is the whole point of the setting")
 		s.Require().NotContains(listed, "list_topics",
 			"reading is not exempt: the configuration withholds whatever it names, including tools read_only would have allowed")
+		s.Require().NotContains(listed, "skill_reference",
+			"guidance must obey the same per-endpoint tool policy as every other read")
 	})
 
 	s.Run("server_config agrees about what was withheld", func() {

@@ -739,9 +739,9 @@ acted. A shared credential cannot be made to answer it.
 `describe_topic`, `sample_messages`, `get_message`, `get_schema`,
 `consumer_lag`, `describe_consumer_group`, `open_transactions`,
 `add_partitions`, `alter_topic_config`, `create_topic`, `commit_offset`,
-`delete_consumer_group`, `delete_records`, `delete_topic`, `copy_message` and
-`produce_message` take their target **only** as an `items` array. There
-is no single-target form: one operation is an `items` array of length one.
+`delete_consumer_group`, `delete_records`, `delete_topic`, `copy_message`,
+`produce_message` and `skill_reference` take their target **only** as an `items`
+array. There is no single-target form: one operation is an `items` array of length one.
 
 ```json
 {"items": [{"topic": "orders"}]}
@@ -767,6 +767,44 @@ roll back a topic, partition, offset or produced message after a later item
 fails. Duplicate write targets are refused before anything changes, except in
 `produce_message`, where two identical items mean two messages rather than a
 mistake.
+
+### `skill_reference`
+
+Reads the agent skill Markdown built into this release, without a local skill
+installation, filesystem access or a Kafka request. Available on read-only
+endpoints too. Connection instructions point clients to this tool first, for
+both legacy `initialize` and newer `server/discover`; an embedding host's own
+instructions are preserved. Disabling `skill_reference` in the endpoint's
+`tools` map removes the tool and the bootstrap pointer together.
+
+| Parameter | Type | Required | Meaning |
+| --------- | ---- | -------- | ------- |
+| `items` | object[] | yes | 1 to 1000 independent document requests |
+
+Item fields:
+
+| Field | Type | Required | Meaning |
+| ----- | ---- | -------- | ------- |
+| `skill` | string | yes | Exact, case-sensitive skill name: `kafka-debugging` |
+| `file` | string | no | Exact document name relative to the skill root. Default `SKILL.md` |
+
+Start with the umbrella's routing table, then read only the scenario you need:
+
+```json
+{"items":[{"skill":"kafka-debugging"}]}
+{"items":[{"skill":"kafka-debugging","file":"references/check-lag.md"}]}
+```
+
+Each indexed result contains `skill`, `file`, the original Markdown in
+`content`, and a sorted `files` catalog. The shared batch envelope reports
+`succeeded`, `failed`, `applied: 0` and `atomic: false`. An unknown skill or file
+produces an item error listing the available choices without hiding successful
+items. Names are catalog keys, never disk paths or URLs: absolute paths and
+`..` traversal are refused, not normalised. Resolve relative Markdown links
+against the containing guide before requesting another document.
+
+Reading guidance grants no permissions. Check `server_config` for this
+endpoint's actual tools before promising changes.
 
 ### `list_clusters`
 
@@ -1929,6 +1967,16 @@ The umbrella also resolves the overlap between them: "the consumer is behind"
 opens three of these guides, and `consumer_lag`'s `status` is what decides which
 one is right.
 
+The server bundles these same Markdown sources. An MCP client can read them
+through `skill_reference`, including when it has no file tools; a separate
+skill installation is optional. Clients that discover installed skills locally
+can still copy `skills/kafka-debugging` into their skills directory. Use the
+same release as the server.
+
+`skills/embed.go` is a Go build bridge beside the skill folders, not inside
+them. Copy only `skills/kafka-debugging` for a local skill installation, as
+before; its Markdown layout is unchanged.
+
 ## Development
 
 | Command                | Purpose                                  |
@@ -1939,6 +1987,13 @@ one is right.
 | `go test ./...`        | All tests, including container tests     |
 | `go test -short ./...` | Tests that need no containers            |
 | `go vet ./...`         | Vet all packages                         |
+
+Skill Markdown under `skills/` is canonical. `skills/embed.go` uses `go:embed`
+to include it directly in every Go build, including plain `go build`, `go run`
+and applications importing `pkg/kafkamcp`. No generation command, copied Go
+source or build hook is needed. Commit the Markdown changes once; a
+non-container test checks that the embedded catalog includes every source
+document, even in `go test -short ./...`.
 
 The documentation site lives in `_docs` (Vite, pnpm). `pnpm install && pnpm dev`
 there serves it locally; pushing changes under `_docs/` to `main` publishes it to

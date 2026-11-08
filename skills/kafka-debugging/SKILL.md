@@ -6,8 +6,34 @@ description: Use when debugging a Kafka cluster through the kafka-mcp server —
 # Kafka debugging
 
 One guide per scenario. Read the guide for the scenario before calling
-any tool: each one exists because the obvious sequence of calls gets the answer
+any Kafka tool: each one exists because the obvious sequence of calls gets the answer
 wrong in a specific way.
+
+## Read through MCP or local files
+
+When `skill_reference` is available, read this skill from the copy built into
+the server, so the guidance matches the running release. No local skill
+installation or filesystem access is needed:
+
+```json
+{"items":[{"skill":"kafka-debugging"}]}
+```
+
+Then read the chosen guide with the same tool, for example:
+
+```json
+{"items":[{"skill":"kafka-debugging","file":"references/check-lag.md"}]}
+```
+
+The optional `file` defaults to `SKILL.md`. Each result contains the full
+Markdown and a sorted `files` catalog. Names are exact and case-sensitive,
+relative to the skill root. Resolve links inside a guide relative to that
+guide: `replay-messages.md` inside `references/check-lag.md` means
+`references/replay-messages.md`. Do not send `..` path segments.
+
+If the endpoint withholds `skill_reference`, use the installed local skill
+files instead. Reading a guide does not make its tools available: still check
+`server_config` before promising a change.
 
 ## Pick the guide
 
